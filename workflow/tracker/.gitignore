@@ -1,0 +1,10 @@
+node_modules/
+dist/
+coverage/
+.env
+*.log
+*.pid
+.pid
+.DS_Store
+__pycache__/
+*.py[cod]

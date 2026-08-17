@@ -1,0 +1,24 @@
+{
+  "herdr": {
+    "version": "0.8.0",
+    "assets": {
+      "linux-x86_64": {
+        "url": "https://github.com/herdrdev/herdr/releases/download/v0.8.0/herdr-linux-x86_64",
+        "sha256": "b872ea7e40fa2cb17e857ac9b62b1bf26db7b403c622f5d2f3f5b35f6e9acd28"
+      },
+      "linux-aarch64": {
+        "url": "https://github.com/herdrdev/herdr/releases/download/v0.8.0/herdr-linux-aarch64",
+        "sha256": "f647ac66468d9efbc642fe534fb284468f0aea60641606fc008dfc0d82a3ca87"
+      },
+      "macos-x86_64": {
+        "url": "https://github.com/herdrdev/herdr/releases/download/v0.8.0/herdr-macos-x86_64",
+        "sha256": "77cb5afd6c8fcaaaf3bc28e474ec01c209331ad08094e20d7f8aa9b0bb78d649"
+      },
+      "macos-aarch64": {
+        "url": "https://github.com/herdrdev/herdr/releases/download/v0.8.0/herdr-macos-aarch64",
+        "sha256": "d53a9f93fccfdfcc55632927bf51002f5add0aa7990bcdf508ffbd84ac658178"
+      }
+    }
+  },
+  "integrations": ["claude", "codex"]
+}

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Agentic Project Tracker"
+  short_description: "Operate tracker tickets and configuration"
+  default_prompt: "Use $agentic-project-tracker to inspect or update work in the tracker."

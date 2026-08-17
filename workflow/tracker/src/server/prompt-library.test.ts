@@ -1,0 +1,140 @@
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import {
+  BATCH_QUESTION_ASSIGNMENT_DEFAULT,
+  LEGACY_ASSIGNMENT_DEFAULT,
+  PRE_BRANCH_IMPLEMENTATION_DEFAULT,
+  PRE_BRANCH_SPECIFICATION_DEFAULT,
+  PRE_CALLBACK_SCHEMA_REMINDER_DEFAULT,
+  PRE_PROJECT_ROOT_ASSIGNMENT_DEFAULT,
+  PROMPT_NAMES,
+  PromptLibrary,
+} from "./prompt-library.js";
+import { TicketStore } from "./ticket-store.js";
+
+let root: string;
+beforeEach(async () => { root = await mkdtemp(join(tmpdir(), "agentic-prompt-library-")); });
+afterEach(async () => { await rm(root, { recursive: true, force: true }); });
+
+describe("PromptLibrary", () => {
+  it("seeds missing Markdown defaults without replacing operator edits", async () => {
+    const first = new PromptLibrary(root);
+    await first.start();
+    expect((await first.list()).map((prompt) => prompt.name)).toEqual(PROMPT_NAMES);
+
+    const assignment = await first.get("assignment");
+    expect(assignment.content).toContain('{"question":"Which environment should receive the deployment?","options":["Development","Staging","Both"]}');
+    expect(assignment.content).toContain("the human can always give a freeform answer");
+    expect(assignment.content).toContain('"decision":"changes_requested"');
+    expect(assignment.content).toContain("The supervisor started this conversation in {{project_root}}");
+    expect(assignment.tags.map((tag) => tag.name)).toContain("project_root");
+
+    const specification = await first.get("specification");
+    expect(specification.content).toContain("identify the remote default branch (normally main or master)");
+    expect(specification.content).toContain("If this is a feedback, repair, or other resumed iteration");
+    const implementation = await first.get("implementation");
+    expect(implementation.content).toContain("pull or fast-forward it to the latest remote state");
+    const reminder = await first.get("callback-reminder");
+    expect(reminder.content).toContain("The earlier callback instructions may have been lost during context compaction");
+    expect(reminder.content).toContain("POST {{callback_base}}ask");
+    expect(reminder.content).toContain('"decision":"changes_requested"');
+    expect(reminder.tags.map((tag) => tag.name)).toEqual(["ticket_id", "phase", "callback_base"]);
+
+    const guidancePath = join(root, "prompts", "guidance.md");
+    await writeFile(guidancePath, "Custom guidance for {{ticket_id}}: {{message}}\n");
+    await new PromptLibrary(root).start();
+    expect(await readFile(guidancePath, "utf8")).toBe("Custom guidance for {{ticket_id}}: {{message}}\n");
+  });
+
+  it("upgrades only the unchanged legacy assignment default", async () => {
+    const promptDirectory = join(root, "prompts");
+    await mkdir(promptDirectory, { recursive: true });
+    const assignmentPath = join(promptDirectory, "assignment.md");
+    for (const olderDefault of [LEGACY_ASSIGNMENT_DEFAULT, BATCH_QUESTION_ASSIGNMENT_DEFAULT, PRE_PROJECT_ROOT_ASSIGNMENT_DEFAULT]) {
+      await writeFile(assignmentPath, `${olderDefault.trim()}\n`);
+      await new PromptLibrary(root).start();
+      expect(await readFile(assignmentPath, "utf8")).toContain("Options are suggestions only");
+      expect(await readFile(assignmentPath, "utf8")).toContain("{{project_root}}");
+    }
+
+    await writeFile(assignmentPath, "Operator-owned assignment prompt\n");
+    await new PromptLibrary(root).start();
+    expect(await readFile(assignmentPath, "utf8")).toBe("Operator-owned assignment prompt\n");
+  });
+
+  it("upgrades unchanged phase and reminder defaults without replacing operator edits", async () => {
+    const promptDirectory = join(root, "prompts");
+    await mkdir(promptDirectory, { recursive: true });
+    await writeFile(join(promptDirectory, "specification.md"), `${PRE_BRANCH_SPECIFICATION_DEFAULT}\n`);
+    await writeFile(join(promptDirectory, "implementation.md"), `${PRE_BRANCH_IMPLEMENTATION_DEFAULT}\n`);
+    await writeFile(join(promptDirectory, "callback-reminder.md"), `${PRE_CALLBACK_SCHEMA_REMINDER_DEFAULT}\n`);
+
+    await new PromptLibrary(root).start();
+
+    expect(await readFile(join(promptDirectory, "specification.md"), "utf8")).toContain("remote default branch");
+    expect(await readFile(join(promptDirectory, "implementation.md"), "utf8")).toContain("resumed iteration");
+    expect(await readFile(join(promptDirectory, "callback-reminder.md"), "utf8")).toContain("{{callback_base}}complete");
+
+    const custom = "Use the repository's documented preparation process for {{ticket_id}}.\n";
+    await writeFile(join(promptDirectory, "specification.md"), custom);
+    await new PromptLibrary(root).start();
+    expect(await readFile(join(promptDirectory, "specification.md"), "utf8")).toBe(custom);
+  });
+
+  it("publishes trigger, stage, tag, and validation metadata", async () => {
+    const implementation = await new PromptLibrary(root).get("implementation");
+    expect(implementation).toMatchObject({
+      title: "Implementation instructions",
+      stages: ["Implementation", "Review repair", "Reopen", "GitHub follow-up"],
+      valid: true,
+    });
+    expect(implementation.trigger).toContain("GitHub PR follow-up repairs");
+    expect(implementation.tags.map((tag) => tag.name)).toContain("ticket_id");
+  });
+
+  it("previews phase instructions inside the complete assignment envelope", async () => {
+    const rendered = await new PromptLibrary(root).preview(
+      "implementation",
+      "Implement {{ticket_id}} in {{phase}} and report to {{callback_base}}complete.",
+    );
+    expect(rendered).toContain("You are assigned ticket AGENT-0042 for the implementation phase.");
+    expect(rendered).toContain("/srv/agent-workspaces/supervisor-a");
+    expect(rendered).toContain("Implement AGENT-0042 in implementation");
+    expect(rendered).toContain("http://tracker:4310/api/work/dummy-lease/complete");
+    expect(rendered).not.toContain("{{");
+  });
+
+  it("previews a self-contained callback reminder with the dummy lease URL", async () => {
+    const library = new PromptLibrary(root);
+    const reminder = await library.get("callback-reminder");
+    const rendered = await library.preview("callback-reminder", reminder.content, "specification");
+    expect(rendered).toContain("Ticket AGENT-0042 is still leased for specification");
+    expect(rendered).toContain("http://tracker:4310/api/work/dummy-lease/ask");
+    expect(rendered).toContain('"decision":"approved"');
+    expect(rendered).not.toContain("{{");
+  });
+
+  it("revision-fences edits and rejects missing, unknown, or malformed tags", async () => {
+    const library = new PromptLibrary(root);
+    const assignment = await library.get("assignment");
+    const updated = await library.update("assignment", `${assignment.content}\nKeep the response concise.`, assignment.revision);
+    expect(updated.content).toContain("Keep the response concise.");
+    await expect(library.update("assignment", assignment.content, assignment.revision)).rejects.toMatchObject({ status: 409 });
+    await expect(library.update("assignment", "Only {{ticket_id}}", updated.revision)).rejects.toMatchObject({ status: 422 });
+    await expect(library.preview("implementation", "Use {{TicketId}}", "implementation")).rejects.toMatchObject({ status: 422 });
+    await expect(library.preview("implementation", "Use {{ticket_id", "implementation")).rejects.toMatchObject({ status: 422 });
+  });
+
+  it("keeps the reserved prompts directory out of the ticket queue", async () => {
+    const store = new TicketStore(root, { watch: false });
+    await store.start();
+    try {
+      await new PromptLibrary(root).start();
+      expect(await store.summaries()).toEqual([]);
+    } finally {
+      await store.close();
+    }
+  });
+});
