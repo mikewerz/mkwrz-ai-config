@@ -1,10 +1,10 @@
-import { PHASES, PROVIDERS, STATUSES, defaultReviewProvider, type AgentRef, type AttemptCounter, type Execution, type HerdrObservation, type Phase, type PullRequestRef, type TicketFrontmatter, type TicketQuestion } from "./domain.js";
+import { PHASES, PROVIDERS, STATUSES, defaultReviewProvider, type AgentRef, type AttemptCounter, type Execution, type HerdrObservation, type Phase, type PullRequestRef, type TicketFrontmatter, type TicketQuestion, type WorkflowRuntime } from "./domain.js";
 
 const phaseStatuses: Record<Phase, Set<string>> = {
   specification: new Set(["pending", "ready", "running", "blocked", "waiting_approval", "failed", "cancelled"]),
-  implementation: new Set(["pending", "ready", "running", "blocked", "failed", "cancelled"]),
-  review: new Set(["ready", "running", "blocked", "failed", "cancelled"]),
-  done: new Set(["completed", "cancelled"]),
+  implementation: new Set(["pending", "ready", "running", "blocked", "waiting_approval", "failed", "cancelled"]),
+  review: new Set(["ready", "running", "blocked", "waiting_approval", "failed", "cancelled"]),
+  done: new Set(["completed", "failed", "cancelled"]),
 };
 
 const emptyAgent = (): AgentRef => ({ provider: null, herdr_pane_id: null, session_ref: null });
@@ -89,8 +89,8 @@ function herdrObservation(value: unknown, errors: string[]): HerdrObservation | 
 function execution(value: unknown, errors: string[]): Execution | null {
   if (value === null || value === undefined) return null;
   if (!isRecord(value)) { errors.push("execution must be an object or null"); return null; }
-  const provider = PROVIDERS.includes(value.provider as never) ? value.provider as Execution["provider"] : "claude";
-  if (!PROVIDERS.includes(value.provider as never)) errors.push("execution.provider must be claude or codex");
+  const provider = value.provider === null ? null : PROVIDERS.includes(value.provider as never) ? value.provider as Execution["provider"] : null;
+  if (value.provider !== null && !PROVIDERS.includes(value.provider as never)) errors.push("execution.provider must be claude, codex, or null");
   const phase = PHASES.includes(value.phase as never) ? value.phase as Phase : "implementation";
   if (!PHASES.includes(value.phase as never) || phase === "done") errors.push("execution.phase must be an assignable phase");
   const guidance = Array.isArray(value.guidance) ? value.guidance.map((item, index) => {
@@ -113,7 +113,17 @@ function execution(value: unknown, errors: string[]): Execution | null {
       else interruptRequest = {
         target_phase: target as Exclude<Phase, "done">,
         requested_at: timestamp(value.interrupt_request.requested_at, "execution.interrupt_request.requested_at", errors),
+        ...(typeof value.interrupt_request.target_node === "string" ? { target_node: value.interrupt_request.target_node } : {}),
+        ...(typeof value.interrupt_request.target_workflow_id === "string" ? { target_workflow_id: value.interrupt_request.target_workflow_id } : {}),
+        ...(typeof value.interrupt_request.target_workflow_revision === "string" ? { target_workflow_revision: value.interrupt_request.target_workflow_revision } : {}),
+        ...(value.interrupt_request.terminal_status === "failed" || value.interrupt_request.terminal_status === "cancelled"
+          ? { terminal_status: value.interrupt_request.terminal_status } : {}),
+        ...(typeof value.interrupt_request.terminal_reason === "string" ? { terminal_reason: value.interrupt_request.terminal_reason } : {}),
       };
+      if (value.interrupt_request.terminal_status !== undefined
+        && value.interrupt_request.terminal_status !== "failed" && value.interrupt_request.terminal_status !== "cancelled") {
+        errors.push("execution.interrupt_request.terminal_status must be failed or cancelled");
+      }
     }
   }
   return {
@@ -130,6 +140,86 @@ function execution(value: unknown, errors: string[]): Execution | null {
     herdr_observation: herdrObservation(value.herdr_observation, errors),
     guidance,
     interrupt_request: interruptRequest,
+    ...(typeof value.node_run_id === "string" ? { node_run_id: value.node_run_id } : {}),
+    ...(typeof value.node_id === "string" ? { node_id: value.node_id } : {}),
+    ...(value.node_type === "agent" || value.node_type === "script" ? { node_type: value.node_type } : {}),
+    ...(typeof value.conversation_key === "string" ? { conversation_key: value.conversation_key } : {}),
+  };
+}
+
+function workflowRuntime(value: unknown, errors: string[]): WorkflowRuntime | null {
+  if (value === null || value === undefined) return null;
+  if (!isRecord(value)) { errors.push("workflow must be an object or null"); return null; }
+  const visits: Record<string, number> = {};
+  if (isRecord(value.node_visits)) {
+    for (const [key, count] of Object.entries(value.node_visits)) {
+      if (Number.isInteger(count) && Number(count) >= 0) visits[key] = Number(count);
+      else errors.push(`workflow.node_visits.${key} must be a non-negative integer`);
+    }
+  } else errors.push("workflow.node_visits must be an object");
+  const nodeAttempts: Record<string, AttemptCounter> = {};
+  if (isRecord(value.node_attempts)) {
+    for (const [key, counter] of Object.entries(value.node_attempts)) nodeAttempts[key] = attempt(counter);
+  }
+  const promptRevisions: Record<string, string> = {};
+  if (isRecord(value.prompt_revisions)) {
+    for (const [key, revision] of Object.entries(value.prompt_revisions)) {
+      if (typeof revision === "string" && revision) promptRevisions[key] = revision;
+      else errors.push(`workflow.prompt_revisions.${key} must be a string`);
+    }
+  }
+  const nodeRuns = Array.isArray(value.node_runs) ? value.node_runs.filter(isRecord).map((run, index) => ({
+    id: asString(run.id, `workflow.node_runs[${index}].id`, errors),
+    workflow_revision: asString(run.workflow_revision, `workflow.node_runs[${index}].workflow_revision`, errors),
+    node_id: asString(run.node_id, `workflow.node_runs[${index}].node_id`, errors),
+    node_type: (["agent", "script", "verification", "human_gate", "terminal"].includes(String(run.node_type)) ? run.node_type : "agent") as "agent" | "script" | "verification" | "human_gate" | "terminal",
+    visit: Number.isInteger(run.visit) ? Number(run.visit) : 1,
+    attempt: Number.isInteger(run.attempt) ? Number(run.attempt) : 1,
+    status: (["running", "completed", "failed", "interrupted"].includes(String(run.status)) ? run.status : "failed") as "running" | "completed" | "failed" | "interrupted",
+    supervisor_id: optionalString(run.supervisor_id, `workflow.node_runs[${index}].supervisor_id`, errors),
+    provider: PROVIDERS.includes(run.provider as never) ? run.provider as AgentRef["provider"] : null,
+    started_at: timestamp(run.started_at, `workflow.node_runs[${index}].started_at`, errors),
+    completed_at: run.completed_at === null ? null : timestamp(run.completed_at, `workflow.node_runs[${index}].completed_at`, errors),
+    outcome: optionalString(run.outcome, `workflow.node_runs[${index}].outcome`, errors),
+    summary: optionalString(run.summary, `workflow.node_runs[${index}].summary`, errors),
+    handoff: optionalString(run.handoff, `workflow.node_runs[${index}].handoff`, errors),
+    output: optionalString(run.output, `workflow.node_runs[${index}].output`, errors),
+    output_path: optionalString(run.output_path, `workflow.node_runs[${index}].output_path`, errors),
+    output_sha256: optionalString(run.output_sha256, `workflow.node_runs[${index}].output_sha256`, errors),
+    output_bytes: run.output_bytes === null || run.output_bytes === undefined ? null
+      : Number.isInteger(run.output_bytes) && Number(run.output_bytes) >= 0 ? Number(run.output_bytes)
+        : (errors.push(`workflow.node_runs[${index}].output_bytes must be a non-negative integer or null`), null),
+    input_revision: Number.isInteger(run.input_revision) ? Number(run.input_revision) : 0,
+  })) : [];
+  const inputs: Record<string, boolean | string> = {};
+  if (isRecord(value.inputs)) {
+    for (const [key, input] of Object.entries(value.inputs)) {
+      if (typeof input === "boolean" || typeof input === "string") inputs[key] = input;
+      else errors.push(`workflow.inputs.${key} must be a boolean or string`);
+    }
+  }
+  const stageEnabled: Record<string, boolean> = {};
+  if (isRecord(value.stage_enabled)) {
+    for (const [key, enabled] of Object.entries(value.stage_enabled)) {
+      if (typeof enabled === "boolean") stageEnabled[key] = enabled;
+      else errors.push(`workflow.stage_enabled.${key} must be a boolean`);
+    }
+  }
+  let incoming: WorkflowRuntime["incoming"] = null;
+  if (isRecord(value.incoming)) incoming = {
+    source_node: asString(value.incoming.source_node, "workflow.incoming.source_node", errors),
+    target_node: asString(value.incoming.target_node, "workflow.incoming.target_node", errors),
+    outcome: asString(value.incoming.outcome, "workflow.incoming.outcome", errors),
+    summary: optionalString(value.incoming.summary, "workflow.incoming.summary", errors),
+    handoff: optionalString(value.incoming.handoff, "workflow.incoming.handoff", errors),
+    actor: asString(value.incoming.actor, "workflow.incoming.actor", errors),
+    created_at: timestamp(value.incoming.created_at, "workflow.incoming.created_at", errors),
+  };
+  return {
+    id: asString(value.id, "workflow.id", errors), revision: asString(value.revision, "workflow.revision", errors),
+    current_node: asString(value.current_node, "workflow.current_node", errors),
+    transition_count: Number.isInteger(value.transition_count) && Number(value.transition_count) >= 0 ? Number(value.transition_count) : (errors.push("workflow.transition_count must be a non-negative integer"), 0),
+    node_visits: visits, node_attempts: nodeAttempts, node_runs: nodeRuns, prompt_revisions: promptRevisions, inputs, stage_enabled: stageEnabled, incoming,
   };
 }
 
@@ -174,6 +264,8 @@ export function normalizeTicket(raw: Record<string, unknown>, now = new Date().t
 
   const rawAttempts = isRecord(raw.attempts) ? raw.attempts : {};
   const currentExecution = execution(raw.execution, errors);
+  const workflow = workflowRuntime(raw.workflow, errors);
+  if (workflow && !/^[a-f0-9]{64}$/.test(workflow.revision)) errors.push("workflow.revision must be a SHA-256 digest");
   if (status === "running" && !currentExecution) errors.push("running tickets require execution");
   if (currentExecution && currentExecution.phase !== phase) errors.push("execution does not match ticket phase/provider");
 
@@ -257,12 +349,22 @@ export function normalizeTicket(raw: Record<string, unknown>, now = new Date().t
     created_at: typeof raw.created_at === "string" ? raw.created_at : now,
     updated_at: typeof raw.updated_at === "string" ? raw.updated_at : now,
     last_callback: isRecord(raw.last_callback) ? raw.last_callback as unknown as TicketFrontmatter["last_callback"] : null,
+    workflow,
+    conversations: isRecord(raw.conversations)
+      ? Object.fromEntries(Object.entries(raw.conversations).map(([key, value]) => [key, agent(value)]))
+      : {},
   };
   return { ticket, errors, admitted };
 }
 
 export function validateSessionInvariant(ticket: TicketFrontmatter): string[] {
   const errors: string[] = [];
+  if (ticket.workflow) {
+    if (ticket.execution && ticket.assigned_supervisor !== ticket.execution.supervisor_id) {
+      errors.push("execution supervisor must match assigned_supervisor");
+    }
+    return errors;
+  }
   const specification = ticket.agents.specification;
   const implementation = ticket.agents.implementation;
   if (specification.session_ref && implementation.session_ref && specification.session_ref !== implementation.session_ref) {

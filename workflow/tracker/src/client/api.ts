@@ -14,6 +14,10 @@ export interface TicketSummary {
   path: string;
   claim_blockers: RepositoryClaimBlocker[];
   archived_at: string | null;
+  workflow_id: string | null;
+  workflow_node_id: string | null;
+  workflow_node_name: string | null;
+  workflow_stage_name: string | null;
 }
 
 export interface RepositoryClaimBlocker {
@@ -53,7 +57,7 @@ export interface GuidanceItem {
 }
 
 export interface Execution {
-  provider: string;
+  provider: string | null;
   phase: string;
   attempt: number;
   supervisor_id: string;
@@ -64,7 +68,14 @@ export interface Execution {
   observed_herdr_state: string | null;
   herdr_observation: HerdrObservation | null;
   guidance: GuidanceItem[];
-  interrupt_request: null | { target_phase: "specification" | "implementation" | "review"; requested_at: string };
+  interrupt_request: null | {
+    target_phase: "specification" | "implementation" | "review"; requested_at: string;
+    terminal_status?: "failed" | "cancelled"; terminal_reason?: string;
+  };
+  node_id?: string;
+  node_type?: "agent" | "script";
+  node_run_id?: string;
+  conversation_key?: string;
 }
 
 export interface AgentRef {
@@ -98,6 +109,14 @@ export interface TicketFrontmatter extends Record<string, unknown> {
   agents: Record<string, AgentRef>;
   attempts: Record<string, { total: number; consecutive_lease_losses: number }>;
   last_callback?: null | { lease_id: string; response: Record<string, unknown> };
+  workflow?: null | {
+    id: string; revision: string; current_node: string; transition_count: number;
+    node_visits: Record<string, number>; node_attempts: Record<string, { total: number; consecutive_lease_losses: number }>; prompt_revisions: Record<string, string>;
+    inputs: Record<string, boolean | string>; stage_enabled: Record<string, boolean>;
+    incoming: null | { source_node: string; target_node: string; outcome: string; summary: string | null; handoff: string | null; actor: string; created_at: string };
+    node_runs: Array<{ id: string; node_id: string; node_type: string; visit: number; attempt: number; status: string; outcome: string | null; summary: string | null; handoff?: string | null; output?: string | null; output_path?: string | null; output_sha256?: string | null; output_bytes?: number | null; started_at: string; completed_at: string | null }>;
+  };
+  conversations?: Record<string, AgentRef>;
 }
 
 export interface SupervisorHealth {
@@ -108,6 +127,7 @@ export interface SupervisorHealth {
   project_root: string;
   herdr_session: string;
   providers: Array<"claude" | "codex">;
+  activity_capabilities: Array<"repository_action" | "inline_shell" | "inline_javascript" | "inline_python">;
   started_at: string;
   last_seen_at: string;
   status: "online" | "offline";
@@ -130,7 +150,7 @@ export interface TrackerConfig extends Record<string, unknown> {
 }
 
 export interface PromptDocument {
-  name: "assignment" | "specification" | "implementation" | "review" | "guidance" | "callback-reminder";
+  name: string;
   title: string;
   purpose: string;
   trigger: string;
@@ -142,6 +162,44 @@ export interface PromptDocument {
   revision: string;
   valid: boolean;
   errors: string[];
+  workflow_references?: Array<{ workflow_id: string; workflow_name: string; node_id: string; node_name: string; outcomes: string[] }>;
+}
+
+export interface WorkflowNode {
+  id: string;
+  name: string;
+  type: "agent" | "script" | "human_gate" | "terminal";
+  phase: "specification" | "implementation" | "review" | "done";
+  stage: string;
+  prompt?: string;
+  provider?: "work" | "review" | "claude" | "codex";
+  conversation_key?: string;
+  repository?: string;
+  action?: string;
+  inline?: { language: "shell" | "python" | "javascript"; code: string };
+  github_watch?: { pull_request_phase: "specification" | "implementation" | "review" | "all"; feedback_outcome?: string; feedback_target?: string };
+  pull_request_requirement?: { scope: "any" | "primary"; phase: "specification" | "implementation" | "review" };
+  when?: { input: string; equals: boolean | string };
+  otherwise?: string;
+  max_visits?: number;
+  terminal_status?: "completed" | "failed" | "cancelled";
+  outcomes: Array<{ id: string; label: string; description: string; target: string }>;
+  choices: Array<{ id: string; label: string; description: string; target: string; comment_required?: boolean }>;
+  exit_codes: Array<{ id: string; label: string; description: string; target: string; codes?: number[]; default?: boolean }>;
+}
+
+export interface WorkflowDocument {
+  definition: {
+    version: 2; id: string; name: string; description: string; start: string; max_transitions: number;
+    inputs: Array<{ id: string; label: string; type: "boolean" | "select"; default: boolean | string; options?: Array<{ value: string; label: string }> }>;
+    stages: Array<{ id: string; name: string; phase: "specification" | "implementation" | "review" | "done"; skippable: boolean; default_enabled: boolean; bypass_to?: string }>;
+    nodes: WorkflowNode[];
+  };
+  content: string;
+  revision: string;
+  valid: boolean;
+  errors: string[];
+  referenced_prompts: string[];
 }
 
 export interface TicketDetail {
@@ -154,6 +212,7 @@ export interface TicketDetail {
   errors: string[];
   integration_warnings?: string[];
   frontmatter: TicketFrontmatter | null;
+  workflow_definition?: WorkflowDocument["definition"];
 }
 
 export interface RuntimeAgent {
@@ -161,7 +220,7 @@ export interface RuntimeAgent {
   title: string;
   phase: string;
   status: string;
-  provider: string;
+  provider: string | null;
   attempt: number;
   claimed_at: string;
   last_heartbeat_at: string;
@@ -170,6 +229,8 @@ export interface RuntimeAgent {
   pane_id: string | null;
   session_ref: string | null;
   herdr: HerdrObservation | null;
+  node_id?: string;
+  node_type?: "agent" | "script";
 }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
@@ -193,6 +254,12 @@ export const api = {
   supervisors: () => request<{ supervisors: SupervisorHealth[] }>("/api/supervisors"),
   config: () => request<{ config: TrackerConfig }>("/api/config"),
   prompts: () => request<{ prompts: PromptDocument[] }>("/api/prompts"),
+  createPrompt: (name: string, content: string) => request<{ prompt: PromptDocument }>("/api/prompts", { method: "POST", body: JSON.stringify({ name, content }) }),
+  workflows: () => request<{ workflows: WorkflowDocument[] }>("/api/workflows"),
+  createWorkflow: (content: string) => request<{ workflow: WorkflowDocument }>("/api/workflows", { method: "POST", body: JSON.stringify({ content }) }),
+  updateWorkflow: (workflow: WorkflowDocument, content: string) => request<{ workflow: WorkflowDocument }>(`/api/workflows/${encodeURIComponent(workflow.definition.id)}`, {
+    method: "PUT", body: JSON.stringify({ expected_revision: workflow.revision, content }),
+  }),
   updatePrompt: (prompt: PromptDocument, content: string) => request<{ prompt: PromptDocument }>(`/api/prompts/${encodeURIComponent(prompt.name)}`, {
     method: "PUT", body: JSON.stringify({ expected_revision: prompt.revision, content }),
   }),
@@ -204,7 +271,7 @@ export const api = {
   }),
   nextId: () => request<{ id: string }>("/api/tickets/next-id"),
   get: (id: string) => request<TicketDetail>(`/api/tickets/${encodeURIComponent(id)}`),
-  create: (markdown: string, autoId = true) => request<TicketDetail>("/api/tickets", { method: "POST", body: JSON.stringify({ markdown, auto_id: autoId }) }),
+  create: (markdown: string, autoId = true, workflowId = "standard-delivery", workflowInputs: Record<string, boolean | string> = {}, stageEnabled: Record<string, boolean> = {}) => request<TicketDetail>("/api/tickets", { method: "POST", body: JSON.stringify({ markdown, auto_id: autoId, workflow_id: workflowId, workflow_inputs: workflowInputs, stage_enabled: stageEnabled }) }),
   jiraImport: (key: string) => request<{ draft: { id: string; title: string; description: string; labels: string[]; jira: TicketFrontmatter["jira"] } }>("/api/jira/import", { method: "POST", body: JSON.stringify({ key }) }),
   checkPullRequests: (id: string) => request<{ checked: number; reopened: boolean }>(`/api/tickets/${encodeURIComponent(id)}/check-pull-requests`, { method: "POST", body: "{}" }),
   edit: (ticket: TicketDetail, markdown: string, mode: "keep_phase" | "rewind", rewindPhase?: string) => request<TicketDetail>(

@@ -15,7 +15,7 @@ SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "tracker.py"
 
 
 class StubHandler(BaseHTTPRequestHandler):
-    responses: dict[tuple[str, str], tuple[int, Any]] = {}
+    responses: dict[tuple[str, str], tuple[int, Any] | tuple[int, Any, str]] = {}
     received: list[dict[str, Any]] = []
 
     def handle_request(self) -> None:
@@ -23,10 +23,16 @@ class StubHandler(BaseHTTPRequestHandler):
         raw = self.rfile.read(length) if length else b""
         body = json.loads(raw) if raw else None
         self.__class__.received.append({"method": self.command, "path": self.path, "body": body})
-        status, payload = self.__class__.responses.get((self.command, self.path), (404, {"error": "Not found"}))
-        encoded = b"" if payload is None else json.dumps(payload).encode()
+        configured = self.__class__.responses.get((self.command, self.path), (404, {"error": "Not found"}))
+        status, payload = configured[:2]
+        content_type = configured[2] if len(configured) == 3 else "application/json"
+        encoded = (
+            str(payload).encode("utf-8")
+            if content_type.startswith("text/")
+            else b"" if payload is None else json.dumps(payload).encode()
+        )
         self.send_response(status)
-        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(encoded)))
         self.end_headers()
         self.wfile.write(encoded)
@@ -68,14 +74,36 @@ class TrackerClientTest(unittest.TestCase):
 
     def test_lists_and_filters_current_ticket_fields(self) -> None:
         StubHandler.responses[("GET", "/api/tickets?include_archived=true")] = (200, {"tickets": [
-            {"id": "A", "status": "ready", "phase": "implementation", "work_provider": "claude"},
+            {
+                "id": "A", "status": "ready", "phase": "implementation", "work_provider": "claude",
+                "workflow_id": "end-to-end", "workflow_node_name": "Deploy", "workflow_stage_name": "Non-production",
+                "provider": "codex",
+            },
             {"id": "B", "status": "completed", "phase": "done", "work_provider": "claude"},
         ]})
-        result = self.run_cli("ticket", "list", "--include-archived", "--status", "ready", "--work-provider", "claude")
+        result = self.run_cli(
+            "ticket", "list", "--include-archived", "--status", "ready", "--work-provider", "claude",
+            "--workflow-id", "end-to-end", "--workflow-node", "Deploy", "--workflow-stage", "Non-production",
+            "--provider", "codex",
+        )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(result.stdout)["data"]["tickets"], [
-            {"id": "A", "status": "ready", "phase": "implementation", "work_provider": "claude"},
+            {
+                "id": "A", "status": "ready", "phase": "implementation", "work_provider": "claude",
+                "workflow_id": "end-to-end", "workflow_node_name": "Deploy", "workflow_stage_name": "Non-production",
+                "provider": "codex",
+            },
         ])
+
+    def test_reads_plain_text_node_run_output(self) -> None:
+        StubHandler.responses[("GET", "/api/tickets/APT-1/runs/run%2F1/output")] = (
+            200, "full\nscript output\n", "text/plain",
+        )
+        result = self.run_cli("ticket", "run-output", "APT-1", "run/1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["data"], {
+            "ticket_id": "APT-1", "run_id": "run/1", "output": "full\nscript output\n",
+        })
 
     def test_sends_revisioned_guidance_payload(self) -> None:
         StubHandler.responses[("POST", "/api/tickets/APT-1/guidance")] = (200, {"id": "APT-1"})
@@ -92,32 +120,44 @@ class TrackerClientTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(StubHandler.received[0]["body"], {"markdown": "---\nid: draft\n---\nGoal\n", "auto_id": True})
 
-    def test_config_update_allowlists_operator_settings(self) -> None:
-        StubHandler.responses[("PUT", "/api/config")] = (200, {"config": {"revision": 4}})
-        document = {
-            "ok": True,
-            "status": 200,
-            "data": {"config": {
-                "revision": 3,
-                "tickets": {"next_number": 99},
-                "providers": {"enabled": ["claude"]},
-                "repositories": [{"id": "repo", "url": "git@example/repo.git"}],
-                "jira": {"enabled": False},
-                "github": {"observation_enabled": False},
-                "unknown": "preserved by server, not client controlled",
-            }},
-        }
+    def test_creates_ticket_with_v3_workflow_inputs_and_stage_choices(self) -> None:
+        StubHandler.responses[("POST", "/api/tickets")] = (201, {"id": "AGENT-0002"})
         with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "config.json"
-            path.write_text(json.dumps(document), encoding="utf-8")
-            result = self.run_cli("config", "update", "--revision", "3", "--json-file", str(path))
+            markdown = Path(directory) / "ticket.md"
+            inputs = Path(directory) / "inputs.json"
+            stages = Path(directory) / "stages.json"
+            markdown.write_text("---\nid: draft\n---\nGoal\n", encoding="utf-8")
+            inputs.write_text(json.dumps({"deploy-required": True, "target": "staging"}), encoding="utf-8")
+            stages.write_text(json.dumps({"specification": False, "review": True}), encoding="utf-8")
+            result = self.run_cli(
+                "ticket", "create", "--markdown-file", str(markdown), "--auto-id",
+                "--workflow-id", "end-to-end", "--workflow-inputs-json", str(inputs),
+                "--stage-enabled-json", str(stages),
+            )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(StubHandler.received[0]["body"], {
-            "expected_revision": 3,
-            "providers": {"enabled": ["claude"]},
-            "repositories": [{"id": "repo", "url": "git@example/repo.git"}],
-            "jira": {"enabled": False},
-            "github": {"observation_enabled": False},
+            "markdown": "---\nid: draft\n---\nGoal\n", "auto_id": True, "workflow_id": "end-to-end",
+            "workflow_inputs": {"deploy-required": True, "target": "staging"},
+            "stage_enabled": {"specification": False, "review": True},
+        })
+
+    def test_rejects_invalid_workflow_option_json_before_request(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            markdown = Path(directory) / "ticket.md"
+            inputs = Path(directory) / "inputs.json"
+            markdown.write_text("---\nid: draft\n---\nGoal\n", encoding="utf-8")
+            inputs.write_text(json.dumps({"deploy-required": 1}), encoding="utf-8")
+            result = self.run_cli("ticket", "create", "--markdown-file", str(markdown), "--workflow-inputs-json", str(inputs))
+        self.assertEqual(result.returncode, 4)
+        self.assertIn("Workflow inputs JSON values must be bool or str", result.stderr)
+        self.assertEqual(StubHandler.received, [])
+
+    def test_sends_generic_human_gate_decision(self) -> None:
+        StubHandler.responses[("POST", "/api/tickets/APT-1/decide")] = (200, {"id": "APT-1"})
+        result = self.run_cli("ticket", "decide", "APT-1", "changes_requested", "--revision", "9", "--message", "Cover rollback.")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(StubHandler.received[0]["body"], {
+            "expected_revision": 9, "decision": "changes_requested", "message": "Cover rollback.",
         })
 
     def test_surfaces_revision_conflict_without_retry(self) -> None:
@@ -136,6 +176,18 @@ class TrackerClientTest(unittest.TestCase):
         self.assertNotIn("/api/work/", source)
         self.assertNotIn("/api/supervisors/heartbeat", source)
         self.assertNotIn("/api/supervisors/unregister", source)
+
+    def test_exposes_configuration_and_workflows_as_read_only_and_no_prompt_surface(self) -> None:
+        StubHandler.responses[("GET", "/api/config")] = (200, {"config": {"repositories": []}})
+        StubHandler.responses[("GET", "/api/workflows")] = (200, {"workflows": []})
+        self.assertEqual(self.run_cli("config", "show").returncode, 0)
+        self.assertEqual(self.run_cli("workflow", "list").returncode, 0)
+        for args in (("config", "update"), ("workflow", "create"), ("prompt", "list")):
+            result = self.run_cli(*args)
+            self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertEqual([(request["method"], request["path"]) for request in StubHandler.received], [
+            ("GET", "/api/config"), ("GET", "/api/workflows"),
+        ])
 
 
 if __name__ == "__main__":

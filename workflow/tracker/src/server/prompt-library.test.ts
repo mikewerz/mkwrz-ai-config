@@ -8,6 +8,12 @@ import {
   PRE_BRANCH_IMPLEMENTATION_DEFAULT,
   PRE_BRANCH_SPECIFICATION_DEFAULT,
   PRE_CALLBACK_SCHEMA_REMINDER_DEFAULT,
+  PRE_PROMPT_ENGINEERING_ASSIGNMENT_DEFAULT,
+  PRE_PROMPT_ENGINEERING_CALLBACK_REMINDER_DEFAULT,
+  PRE_PROMPT_ENGINEERING_IMPLEMENTATION_DEFAULT,
+  PRE_PROMPT_ENGINEERING_REVIEW_DEFAULT,
+  PRE_PROMPT_ENGINEERING_SPECIFICATION_DEFAULT,
+  PRE_MERGE_PROMPT_ASSIGNMENT_DEFAULT,
   PRE_PROJECT_ROOT_ASSIGNMENT_DEFAULT,
   PROMPT_NAMES,
   PromptLibrary,
@@ -26,10 +32,16 @@ describe("PromptLibrary", () => {
 
     const assignment = await first.get("assignment");
     expect(assignment.content).toContain('{"question":"Which environment should receive the deployment?","options":["Development","Staging","Both"]}');
-    expect(assignment.content).toContain("the human can always give a freeform answer");
-    expect(assignment.content).toContain('"decision":"changes_requested"');
+    expect(assignment.content).toContain("the human can always answer freely");
+    expect(assignment.content).toContain('"outcome":"<exact allowed outcome ID>"');
+    expect(assignment.content).toContain("injected into the next agent assignment");
     expect(assignment.content).toContain("The supervisor started this conversation in {{project_root}}");
     expect(assignment.tags.map((tag) => tag.name)).toContain("project_root");
+    expect(assignment.content).toContain("unless the current node instructions explicitly authorize it");
+
+    const merge = await first.get("merge");
+    expect(merge.content).toContain("explicitly authorizes you to merge");
+    expect(merge.content).toContain("Never bypass branch protection");
 
     const specification = await first.get("specification");
     expect(specification.content).toContain("identify the remote default branch (normally main or master)");
@@ -37,10 +49,10 @@ describe("PromptLibrary", () => {
     const implementation = await first.get("implementation");
     expect(implementation.content).toContain("pull or fast-forward it to the latest remote state");
     const reminder = await first.get("callback-reminder");
-    expect(reminder.content).toContain("The earlier callback instructions may have been lost during context compaction");
+    expect(reminder.content).toContain("The earlier contract may have been lost during context compaction");
     expect(reminder.content).toContain("POST {{callback_base}}ask");
-    expect(reminder.content).toContain('"decision":"changes_requested"');
-    expect(reminder.tags.map((tag) => tag.name)).toEqual(["ticket_id", "phase", "callback_base"]);
+    expect(reminder.content).toContain('"outcome":"<exact allowed outcome ID>"');
+    expect(reminder.tags.map((tag) => tag.name)).toEqual(["ticket_id", "phase", "callback_base", "node_id", "node_name", "allowed_outcomes"]);
 
     const guidancePath = join(root, "prompts", "guidance.md");
     await writeFile(guidancePath, "Custom guidance for {{ticket_id}}: {{message}}\n");
@@ -52,10 +64,10 @@ describe("PromptLibrary", () => {
     const promptDirectory = join(root, "prompts");
     await mkdir(promptDirectory, { recursive: true });
     const assignmentPath = join(promptDirectory, "assignment.md");
-    for (const olderDefault of [LEGACY_ASSIGNMENT_DEFAULT, BATCH_QUESTION_ASSIGNMENT_DEFAULT, PRE_PROJECT_ROOT_ASSIGNMENT_DEFAULT]) {
+    for (const olderDefault of [LEGACY_ASSIGNMENT_DEFAULT, BATCH_QUESTION_ASSIGNMENT_DEFAULT, PRE_PROJECT_ROOT_ASSIGNMENT_DEFAULT, PRE_PROMPT_ENGINEERING_ASSIGNMENT_DEFAULT, PRE_MERGE_PROMPT_ASSIGNMENT_DEFAULT]) {
       await writeFile(assignmentPath, `${olderDefault.trim()}\n`);
       await new PromptLibrary(root).start();
-      expect(await readFile(assignmentPath, "utf8")).toContain("Options are suggestions only");
+      expect(await readFile(assignmentPath, "utf8")).toContain("the human can always answer freely");
       expect(await readFile(assignmentPath, "utf8")).toContain("{{project_root}}");
     }
 
@@ -76,6 +88,16 @@ describe("PromptLibrary", () => {
     expect(await readFile(join(promptDirectory, "specification.md"), "utf8")).toContain("remote default branch");
     expect(await readFile(join(promptDirectory, "implementation.md"), "utf8")).toContain("resumed iteration");
     expect(await readFile(join(promptDirectory, "callback-reminder.md"), "utf8")).toContain("{{callback_base}}complete");
+
+    await writeFile(join(promptDirectory, "specification.md"), `${PRE_PROMPT_ENGINEERING_SPECIFICATION_DEFAULT}\n`);
+    await writeFile(join(promptDirectory, "implementation.md"), `${PRE_PROMPT_ENGINEERING_IMPLEMENTATION_DEFAULT}\n`);
+    await writeFile(join(promptDirectory, "review.md"), `${PRE_PROMPT_ENGINEERING_REVIEW_DEFAULT}\n`);
+    await writeFile(join(promptDirectory, "callback-reminder.md"), `${PRE_PROMPT_ENGINEERING_CALLBACK_REMINDER_DEFAULT}\n`);
+    await new PromptLibrary(root).start();
+    expect(await readFile(join(promptDirectory, "specification.md"), "utf8")).toContain("decision-complete specification");
+    expect(await readFile(join(promptDirectory, "implementation.md"), "utf8")).toContain("Deliver the ticket's requested behavior");
+    expect(await readFile(join(promptDirectory, "review.md"), "utf8")).toContain("evidence-based review");
+    expect(await readFile(join(promptDirectory, "callback-reminder.md"), "utf8")).toContain("Use `summary` as the durable record");
 
     const custom = "Use the repository's documented preparation process for {{ticket_id}}.\n";
     await writeFile(join(promptDirectory, "specification.md"), custom);
@@ -99,7 +121,7 @@ describe("PromptLibrary", () => {
       "implementation",
       "Implement {{ticket_id}} in {{phase}} and report to {{callback_base}}complete.",
     );
-    expect(rendered).toContain("You are assigned ticket AGENT-0042 for the implementation phase.");
+    expect(rendered).toContain("You own ticket AGENT-0042 for the implementation phase");
     expect(rendered).toContain("/srv/agent-workspaces/supervisor-a");
     expect(rendered).toContain("Implement AGENT-0042 in implementation");
     expect(rendered).toContain("http://tracker:4310/api/work/dummy-lease/complete");
@@ -112,7 +134,7 @@ describe("PromptLibrary", () => {
     const rendered = await library.preview("callback-reminder", reminder.content, "specification");
     expect(rendered).toContain("Ticket AGENT-0042 is still leased for specification");
     expect(rendered).toContain("http://tracker:4310/api/work/dummy-lease/ask");
-    expect(rendered).toContain('"decision":"approved"');
+    expect(rendered).toContain('"outcome":"<exact allowed outcome ID>"');
     expect(rendered).not.toContain("{{");
   });
 

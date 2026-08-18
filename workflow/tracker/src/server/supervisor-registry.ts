@@ -1,4 +1,4 @@
-import { HttpError, type Provider, type TicketFrontmatter } from "./domain.js";
+import { HttpError, type ActivityCapability, type Provider, type TicketFrontmatter } from "./domain.js";
 
 export interface SupervisorPresenceInput {
   supervisor_id: string;
@@ -8,6 +8,7 @@ export interface SupervisorPresenceInput {
   project_root: string;
   herdr_session: string;
   providers: Provider[];
+  activity_capabilities: ActivityCapability[];
   started_at: string;
 }
 
@@ -31,7 +32,13 @@ export class SupervisorRegistry {
     if (current && current.instance_id !== input.instance_id && now.getTime() - Date.parse(current.last_seen_at) <= this.ttlMs) {
       throw new HttpError(409, `Supervisor ID ${input.supervisor_id} is already used by a live process`);
     }
-    const record = { ...input, ip_addresses: [...input.ip_addresses], providers: [...input.providers], last_seen_at: now.toISOString() };
+    const record = {
+      ...input,
+      ip_addresses: [...input.ip_addresses],
+      providers: [...input.providers],
+      activity_capabilities: [...input.activity_capabilities],
+      last_seen_at: now.toISOString(),
+    };
     this.records.set(input.supervisor_id, record);
     return record;
   }

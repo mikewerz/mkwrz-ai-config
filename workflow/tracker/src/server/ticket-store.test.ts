@@ -2,8 +2,10 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import { stringify } from "yaml";
 import { TicketStore } from "./ticket-store.js";
 import { ticketMarkdown } from "./test-helpers.js";
+import { WorkflowLibrary, initializeWorkflow, transitionTo } from "./workflow-library.js";
 
 const cleanup: string[] = [];
 async function store(clock?: () => Date, leaseTtlMs = 120_000) {
@@ -65,6 +67,31 @@ describe("TicketStore", () => {
     await context.store.close();
   });
 
+  it("does not reserve a workflow for a supervisor missing an enabled Script runtime", async () => {
+    const context = await store();
+    const workflows = new WorkflowLibrary(context.root); context.store.setWorkflowLibrary(workflows);
+    const definition = {
+      version: 2 as const, id: "python-work", name: "Python work", description: "Requires inline Python", start: "work", max_transitions: 5,
+      inputs: [], stages: [
+        { id: "work", name: "Work", phase: "implementation" as const, skippable: false, default_enabled: true },
+        { id: "done", name: "Done", phase: "done" as const, skippable: false, default_enabled: true },
+      ],
+      nodes: [
+        { id: "work", name: "Work", type: "agent" as const, phase: "implementation" as const, stage: "work", prompt: "implementation", provider: "work" as const, conversation_key: "work", outcomes: [{ id: "completed", label: "Complete", description: "Continue.", target: "python" }], choices: [], exit_codes: [] },
+        { id: "python", name: "Python", type: "script" as const, phase: "implementation" as const, stage: "work", repository: "primary", inline: { language: "python" as const, code: "print('ok')" }, outcomes: [], choices: [], exit_codes: [{ id: "success", label: "Success", description: "Continue.", target: "done", codes: [0] }, { id: "failure", label: "Failure", description: "Retry.", target: "python", default: true }] },
+        { id: "done", name: "Done", type: "terminal" as const, phase: "done" as const, stage: "done", terminal_status: "completed" as const, outcomes: [], choices: [], exit_codes: [] },
+      ],
+    };
+    const document = await workflows.save(stringify(definition));
+    await context.store.create(ticketMarkdown({ spec_required: false, review_required: false }));
+    await context.store.command("APT-0001", { event: "ticket.ready", message: "Ready" }, (ticket) => {
+      initializeWorkflow(ticket, document); ticket.status = "ready"; return { ticket };
+    });
+    expect(await context.store.claim("worker", "claude", ["claude"], "worker", ["repository_action", "inline_shell", "inline_javascript"])).toBeNull();
+    expect(await context.store.claim("worker", "claude", ["claude"], "worker", ["repository_action", "inline_shell", "inline_javascript", "inline_python"])).not.toBeNull();
+    await context.store.close();
+  });
+
   it("uses Claude work and Codex review defaults for legacy tickets without routing fields", async () => {
     const context = await store();
     const legacy = ticketMarkdown().replace(/^work_provider:.*\n/m, "").replace(/^review_provider:.*\n/m, "");
@@ -89,6 +116,40 @@ describe("TicketStore", () => {
     await context.store.close();
   });
 
+  it("accounts for consecutive lease losses per workflow node", async () => {
+    let time = Date.parse("2026-08-14T12:00:00Z");
+    const context = await store(() => new Date(time), 1_000);
+    const workflows = new WorkflowLibrary(context.root); context.store.setWorkflowLibrary(workflows);
+    const definition = {
+      version: 2 as const, id: "node-losses", name: "Node losses", description: "Node-scoped retries", start: "first", max_transitions: 10,
+      inputs: [], stages: [{ id: "work", name: "Work", phase: "implementation" as const, skippable: false, default_enabled: true }, { id: "done", name: "Done", phase: "done" as const, skippable: false, default_enabled: true }],
+      nodes: [
+        { id: "first", name: "First", type: "agent" as const, phase: "implementation" as const, stage: "work", prompt: "implementation", provider: "work" as const, conversation_key: "work", outcomes: [{ id: "completed", label: "Complete", description: "Continue.", target: "second" }], choices: [], exit_codes: [] },
+        { id: "second", name: "Second", type: "agent" as const, phase: "implementation" as const, stage: "work", prompt: "implementation", provider: "work" as const, conversation_key: "work", outcomes: [{ id: "completed", label: "Complete", description: "Finish.", target: "done" }], choices: [], exit_codes: [] },
+        { id: "done", name: "Done", type: "terminal" as const, phase: "done" as const, stage: "done", terminal_status: "completed" as const, outcomes: [], choices: [], exit_codes: [] },
+      ],
+    };
+    const document = await workflows.save(stringify(definition));
+    await context.store.create(ticketMarkdown({ spec_required: false, review_required: false }));
+    await context.store.command("APT-0001", { event: "ticket.ready", message: "Ready" }, (ticket) => {
+      initializeWorkflow(ticket, document); ticket.status = "ready"; return { ticket };
+    });
+    for (let loss = 0; loss < 2; loss += 1) {
+      expect(await context.store.claim("worker", "claude")).not.toBeNull();
+      time += 1_001; await context.store.expireLeases();
+    }
+    await context.store.command("APT-0001", { event: "test.transition", message: "Move to second node" }, (ticket) => {
+      transitionTo(ticket, document.definition, "second", { outcome: "test", actor: "test" }); return { ticket };
+    });
+    expect(await context.store.claim("worker", "claude")).not.toBeNull();
+    time += 1_001; await context.store.expireLeases();
+    const ticket = await context.store.get("APT-0001");
+    expect(ticket.frontmatter).toMatchObject({ status: "ready", workflow: { node_attempts: {
+      first: { consecutive_lease_losses: 2 }, second: { consecutive_lease_losses: 1 },
+    } } });
+    await context.store.close();
+  });
+
   it("blocks the requested target when an agent interruption is not acknowledged", async () => {
     let time = Date.parse("2026-08-14T12:00:00Z");
     const context = await store(() => new Date(time), 1_000);
@@ -108,6 +169,34 @@ describe("TicketStore", () => {
     const blocked = await context.store.get("APT-0001");
     expect(blocked.frontmatter).toMatchObject({ phase: "specification", status: "blocked", execution: null });
     expect(blocked.markdown).toContain("work.interrupt_timed_out");
+    await context.store.close();
+  });
+
+  it("keeps V3 current-node and phase projections aligned after an interrupt timeout", async () => {
+    let time = Date.parse("2026-08-14T12:00:00Z");
+    const context = await store(() => new Date(time), 1_000);
+    const workflows = new WorkflowLibrary(context.root); context.store.setWorkflowLibrary(workflows);
+    const workflow = await workflows.get("standard-delivery");
+    await context.store.create(ticketMarkdown({ spec_required: false, review_required: true }));
+    await context.store.command("APT-0001", { event: "ticket.ready", message: "Ready" }, (ticket) => {
+      initializeWorkflow(ticket, workflow); ticket.status = "ready"; return { ticket };
+    });
+    const claimed = await context.store.claim("worker", "claude");
+    await context.store.command("APT-0001", { event: "test.interrupt", message: "Interrupt" }, (ticket) => {
+      ticket.execution!.interrupt_request = {
+        target_phase: "review", target_node: "review", target_workflow_id: workflow.definition.id,
+        target_workflow_revision: workflow.revision, requested_at: new Date(time).toISOString(),
+      };
+      return { ticket };
+    });
+    time += 1_001;
+    await context.store.expireLeases();
+    const blocked = await context.store.get("APT-0001");
+    expect(claimed).not.toBeNull();
+    expect(blocked.frontmatter).toMatchObject({
+      phase: "review", status: "blocked", execution: null,
+      workflow: { current_node: "review", incoming: { source_node: "implementation", target_node: "review", outcome: "operator_interrupt_timeout" } },
+    });
     await context.store.close();
   });
 

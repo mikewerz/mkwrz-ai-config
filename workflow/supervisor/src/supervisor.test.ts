@@ -4,6 +4,7 @@ import { PromptStore, type PromptTemplates } from "./prompts.js";
 import { Supervisor, buildAssignmentPrompt, buildCallbackReminder } from "./supervisor.js";
 import { TrackerClient } from "./tracker-client.js";
 import type { AgentObservation, ClaimedTicket, Provider } from "./types.js";
+import * as activities from "./activities.js";
 
 function ticket(phase: "specification" | "implementation" | "review"): ClaimedTicket {
   return {
@@ -55,6 +56,22 @@ describe("assignment prompt", () => {
     expect(prompt).toContain("Perform an independent review");
     expect(prompt).toContain("Do not repair the implementation");
     expect(prompt).not.toContain("disable");
+  });
+
+  it("injects declared outcomes and the preceding handoff into agent prompts", () => {
+    const work = ticket("implementation");
+    work.workflow_node = {
+      id: "repair", name: "Repair implementation", type: "agent", phase: "implementation", prompt: "implementation", provider: "work", conversation_key: "work",
+      outcomes: [{ id: "completed", label: "Repair completed", description: "Return the changes for review.", target: "review" }], choices: [], exit_codes: [],
+    };
+    work.frontmatter.workflow = { incoming: { source_node: "review", target_node: "repair", outcome: "changes_requested", summary: "Rollback coverage is missing.", handoff: "Add rollback coverage before re-review." } };
+    const prompt = buildAssignmentPrompt(work, "http://127.0.0.1:4310", "/srv/projects", trackerPrompts({
+      assignment: "{{incoming_node}} {{incoming_outcome}}\n{{incoming_summary}}\n{{incoming_handoff}}\n{{allowed_outcomes}}\n{{phase_instructions}}",
+    }));
+    expect(prompt).toContain("review changes_requested");
+    expect(prompt).toContain("Rollback coverage is missing");
+    expect(prompt).toContain("Add rollback coverage before re-review");
+    expect(prompt).toContain("completed: Repair completed — Return the changes for review.");
   });
 
   it("renders callback reminders with enough lease context to act after compaction", () => {
@@ -164,6 +181,77 @@ describe("assignment prompt", () => {
     expect(herdr.prompt).toHaveBeenCalledWith("w1:p1", "Submit a callback.");
   });
 
+  it("interrupts the Herdr turn when cancellation or fencing removes the lease", async () => {
+    const observation: AgentObservation = {
+      paneId: "w1:p1", state: "working", sessionRef: "session-1", workspaceId: "w1", tabId: "w1:t1",
+      terminalId: "term-1", focused: false, cwd: "/srv/projects", foregroundCwd: "/srv/projects",
+      terminalTitle: null, terminalTitleStripped: null, displayName: "Codex", revision: 1,
+      sessionSource: "herdr:codex", sessionKind: "id", tokens: {},
+    };
+    const herdr = {
+      projectRoot: "/srv/projects",
+      ensureAgent: vi.fn().mockResolvedValue(observation),
+      promptAndConfirm: vi.fn().mockResolvedValue(true),
+      interrupt: vi.fn().mockResolvedValue(undefined),
+    } as unknown as HerdrController;
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request) => {
+      const url = input instanceof Request ? input.url : String(input);
+      if (url.includes("/heartbeat")) return Response.json({ active: true });
+      if (url.includes("/control")) return Response.json({ error: "Lease is stale or fenced" }, { status: 409 });
+      throw new Error(`Unexpected request: ${url}`);
+    }));
+    const supervisor = new Supervisor(herdr, {
+      trackerUrl: "http://tracker.test", supervisorId: "vm", providers: ["codex"],
+      heartbeatIntervalMs: 30_000, idlePollMs: 1,
+    });
+    const internals = supervisor as unknown as {
+      prompts: PromptStore;
+      runAssignment(provider: Provider, value: ClaimedTicket): Promise<void>;
+    };
+    internals.prompts.replace(trackerPromptTemplates());
+
+    await internals.runAssignment("codex", ticket("review"));
+
+    expect(herdr.interrupt).toHaveBeenCalledWith("w1:p1");
+  });
+
+  it("aborts a running Script when tracker control fails", async () => {
+    let aborted = false;
+    vi.spyOn(activities, "runRepositoryActivity").mockImplementation(async (_root, _ticket, signal) => new Promise((resolve) => {
+      signal?.addEventListener("abort", () => {
+        aborted = true;
+        resolve({ success: false, summary: "aborted", output: "", exit_code: null });
+      }, { once: true });
+    }));
+    const claimed = ticket("implementation");
+    claimed.frontmatter.execution.provider = null;
+    claimed.frontmatter.execution.node_type = "script";
+    claimed.frontmatter.execution.node_id = "verify";
+    claimed.workflow_node = {
+      id: "verify", name: "Verify", type: "script", phase: "implementation", repository: "primary",
+      inline: { language: "shell", code: "sleep 60" }, outcomes: [], choices: [], exit_codes: [],
+    };
+    let supervisor!: Supervisor;
+    let claimedOnce = false;
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request) => {
+      const url = input instanceof Request ? input.url : String(input);
+      if (url.endsWith("/api/work/claim-activity") && !claimedOnce) { claimedOnce = true; return Response.json(claimed); }
+      if (url.includes("/api/work/lease-1/control")) {
+        await supervisor.stop();
+        return Response.json({ error: "tracker unavailable" }, { status: 503 });
+      }
+      return new Response(null, { status: 204 });
+    }));
+    supervisor = new Supervisor({ projectRoot: "/srv/projects" } as HerdrController, {
+      trackerUrl: "http://tracker.test", supervisorId: "vm", providers: [],
+      heartbeatIntervalMs: 30_000, idlePollMs: 1,
+    });
+
+    await supervisor.run();
+
+    expect(aborted).toBe(true);
+  });
+
   it("refreshes phase and envelope prompts from the tracker library", async () => {
     const templates = {
       assignment: "CENTRAL ENVELOPE {{project_root}}\n{{phase_instructions}}\n{{callback_base}}complete",
@@ -174,7 +262,10 @@ describe("assignment prompt", () => {
       "callback-reminder": "CENTRAL REMINDER",
     };
     vi.stubGlobal("fetch", vi.fn(async () => Response.json({
-      prompts: Object.entries(templates).map(([name, content]) => ({ name, content, revision: `${name}-r1`, valid: true, errors: [] })),
+      prompts: [
+        ...Object.entries(templates).map(([name, content]) => ({ name, content, revision: `${name}-r1`, valid: true, errors: [] })),
+        { name: "unused-broken", content: "{{unknown}}", revision: "broken-r1", valid: false, errors: ["unknown placeholder"] },
+      ],
     })));
     const supervisor = new Supervisor({} as HerdrController, {
       trackerUrl: "http://tracker.test", supervisorId: "vm", providers: ["claude"],
@@ -218,10 +309,13 @@ describe("assignment prompt", () => {
     await client.heartbeatSupervisor({
       instanceId: "instance-one", hostname: "worker-one", ipAddresses: ["192.0.2.70"],
       projectRoot: "/srv/projects/one", herdrSession: "agents-one", startedAt: "2026-08-14T12:00:00Z",
-    }, ["claude", "codex"]);
+    }, ["claude", "codex"], ["repository_action", "inline_shell"]);
     expect(fetch).toHaveBeenCalledWith(new URL("/api/supervisors/heartbeat", "http://tracker.test"), expect.objectContaining({
       method: "POST",
       body: expect.stringContaining('"project_root":"/srv/projects/one"'),
+    }));
+    expect(fetch).toHaveBeenCalledWith(expect.any(URL), expect.objectContaining({
+      body: expect.stringContaining('"activity_capabilities":["repository_action","inline_shell"]'),
     }));
   });
 

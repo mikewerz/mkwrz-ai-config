@@ -1,6 +1,7 @@
 import { HttpError, type PullRequestObservation, type PullRequestRef } from "./domain.js";
 import type { TrackerConfigStore } from "./config-store.js";
 import type { TicketStore } from "./ticket-store.js";
+import { advanceWorkflow, transitionTo, workflowNode, workflowRoute, type WorkflowLibrary } from "./workflow-library.js";
 
 interface GithubUser { login?: string; type?: string }
 interface GithubComment { id: number; body?: string; user?: GithubUser }
@@ -16,7 +17,9 @@ function coordinates(url: string): { owner: string; repo: string; number: number
 }
 
 export class GithubObserver {
-  constructor(private readonly store: TicketStore, private readonly configs: TrackerConfigStore, private readonly request: typeof fetch = fetch) {}
+  private workflows: WorkflowLibrary | null;
+  constructor(private readonly store: TicketStore, private readonly configs: TrackerConfigStore, private readonly request: typeof fetch = fetch, workflows?: WorkflowLibrary) { this.workflows = workflows ?? null; }
+  setWorkflowLibrary(workflows: WorkflowLibrary): void { this.workflows = workflows; }
 
   private async get<T>(path: string): Promise<T> {
     const token = process.env.GITHUB_TOKEN?.trim();
@@ -74,26 +77,56 @@ export class GithubObserver {
     const ticket = current.frontmatter;
     if (!current.valid || !ticket) throw new HttpError(422, "Ticket is invalid", current.errors);
     if (ticket.archived_at) throw new HttpError(409, "Archived tickets are not observed");
-    const completedWork = ticket.phase === "done" && ticket.status === "completed";
-    const specificationApproval = ticket.phase === "specification" && ticket.status === "waiting_approval";
-    if (!completedWork && !specificationApproval) throw new HttpError(409, "Only completed tickets or specifications waiting for approval can be checked for PR follow-up");
-    const pullRequests = specificationApproval
-      ? ticket.pull_requests.filter((pr) => pr.phase === undefined || pr.phase === "specification")
-      : ticket.pull_requests;
+    const workflowDefinition = ticket.workflow && this.workflows
+      ? (await this.workflows.get(ticket.workflow.id, ticket.workflow.revision)).definition : null;
+    const currentNode = workflowDefinition && ticket.workflow ? workflowNode(workflowDefinition, ticket.workflow.current_node) : null;
+    const watchedGate = ticket.status === "waiting_approval" && currentNode?.type === "human_gate" && currentNode.github_watch
+      ? { node: currentNode, watch: currentNode.github_watch } : null;
+    const watchedTerminal = ticket.status === "completed" && currentNode?.type === "terminal" && currentNode.terminal_status === "completed"
+      && currentNode.github_watch?.feedback_target ? { node: currentNode, watch: currentNode.github_watch } : null;
+    const legacySpecificationApproval = !ticket.workflow && ticket.phase === "specification" && ticket.status === "waiting_approval";
+    const completedWork = !ticket.workflow && ticket.phase === "done" && ticket.status === "completed";
+    if (!completedWork && !watchedGate && !watchedTerminal && !legacySpecificationApproval) {
+      throw new HttpError(409, "Only completed tickets or workflow gates configured to watch GitHub can be checked for PR follow-up");
+    }
+    const watchedPhase = watchedGate?.watch.pull_request_phase ?? watchedTerminal?.watch.pull_request_phase ?? (legacySpecificationApproval ? "specification" : "all");
+    const pullRequests = watchedPhase === "all"
+      ? ticket.pull_requests
+      : ticket.pull_requests.filter((pr) => pr.phase === watchedPhase || (watchedPhase === "specification" && pr.phase === undefined));
     if (pullRequests.length === 0) return { checked: 0, reopened: false };
     const ignored = new Set(config.github.ignored_logins.map((item) => item.toLowerCase()));
-    const results = await Promise.all(pullRequests.map(async (pr) => ({ pr, result: await this.observe(pr, ignored, specificationApproval) })));
+    const observingGate = Boolean(watchedGate || legacySpecificationApproval);
+    const results = await Promise.all(pullRequests.map(async (pr) => ({ pr, result: await this.observe(pr, ignored, observingGate) })));
     const actionable = results.flatMap(({ pr, result }) => result.actionable.map((item) => `${pr.url}: ${item}`));
     await this.store.command(id, {
-      event: actionable.length ? specificationApproval ? "github.specification_follow_up_found" : "github.follow_up_found" : "github.pull_requests_checked",
+      event: actionable.length ? watchedPhase === "specification" ? "github.specification_follow_up_found" : observingGate ? "github.gate_follow_up_found" : "github.follow_up_found" : "github.pull_requests_checked",
       message: actionable.length ? actionable.join(" ") : `Checked ${results.length} pull request(s); no new follow-up was found.`,
       expectedRevision: ticket.revision,
     }, (next) => {
       const observations = new Map(results.map(({ pr, result }) => [pr.url, result.observation]));
       next.pull_requests = next.pull_requests.map((pr) => ({ ...pr, observation: observations.get(pr.url) ?? pr.observation ?? null }));
       if (actionable.length) {
-        next.phase = specificationApproval ? "specification" : "implementation";
-        next.status = "ready";
+        if (workflowDefinition && next.workflow) {
+          if (watchedGate) {
+            const freshNode = workflowNode(workflowDefinition, next.workflow.current_node);
+            const feedbackOutcome = watchedGate.watch.feedback_outcome;
+            if (!feedbackOutcome || freshNode.id !== watchedGate.node.id || freshNode.type !== "human_gate" || !workflowRoute(freshNode, feedbackOutcome)) {
+              throw new HttpError(409, "Configured GitHub gate is no longer current");
+            }
+            const context = actionable.join(" ");
+            advanceWorkflow(next, workflowDefinition, feedbackOutcome, context, context, "github");
+          } else if (watchedTerminal?.watch.feedback_target) {
+            const context = actionable.join(" ");
+            transitionTo(next, workflowDefinition, watchedTerminal.watch.feedback_target, {
+              outcome: "github_feedback", summary: context, handoff: context, actor: "github", source_node: watchedTerminal.node.id,
+            });
+          } else {
+            throw new HttpError(409, "Completed workflow does not declare a GitHub feedback target");
+          }
+        } else {
+          next.phase = legacySpecificationApproval ? "specification" : "implementation";
+          next.status = "ready";
+        }
         next.archived_at = null;
       }
       return { ticket: next };
@@ -105,9 +138,9 @@ export class GithubObserver {
     const config = await this.configs.read();
     if (!config.github.observation_enabled) return;
     const tickets = await this.store.summaries(false);
-    for (const ticket of tickets.filter((item) => item.valid && ((item.phase === "done" && item.status === "completed")
-      || (item.phase === "specification" && item.status === "waiting_approval")))) {
-      try { await this.checkTicket(ticket.id); } catch (error) { console.error(`[github] observation failed for ${ticket.id}`, error); }
+    for (const ticket of tickets.filter((item) => item.valid && ((item.phase === "done" && item.status === "completed") || item.status === "waiting_approval"))) {
+      try { await this.checkTicket(ticket.id); }
+      catch (error) { if (!(error instanceof HttpError && error.status === 409)) console.error(`[github] observation failed for ${ticket.id}`, error); }
     }
   }
 }

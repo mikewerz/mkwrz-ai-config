@@ -1,4 +1,4 @@
-import type { AgentObservation, ClaimedTicket, Guidance, InterruptRequest, Provider, SupervisorPresence, TrackerConfig, TrackerPrompt } from "./types.js";
+import type { ActivityCapability, AgentObservation, ClaimedTicket, Guidance, InterruptRequest, Provider, SupervisorPresence, TrackerConfig, TrackerPrompt } from "./types.js";
 
 export class TrackerError extends Error {
   constructor(public readonly status: number, message: string) { super(message); }
@@ -18,14 +18,32 @@ export class TrackerClient {
     return response.json() as Promise<T>;
   }
 
-  async claim(provider: Provider, availableProviders: Provider[]): Promise<ClaimedTicket | null> {
+  async claim(provider: Provider, availableProviders: Provider[], activityCapabilities: ActivityCapability[]): Promise<ClaimedTicket | null> {
     const response = await fetch(new URL("/api/work/claim", this.baseUrl), {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ supervisor_id: this.supervisorId, instance_id: this.instanceId, provider, available_providers: availableProviders, wait_seconds: 30 }),
+      body: JSON.stringify({ supervisor_id: this.supervisorId, instance_id: this.instanceId, provider, available_providers: availableProviders, activity_capabilities: activityCapabilities, wait_seconds: 30 }),
     });
     if (response.status === 204) return null;
     if (!response.ok) throw new TrackerError(response.status, (await response.json().catch(() => ({})) as { error?: string }).error ?? response.statusText);
     return response.json() as Promise<ClaimedTicket>;
+  }
+
+  async claimActivity(availableProviders: Provider[], activityCapabilities: ActivityCapability[]): Promise<ClaimedTicket | null> {
+    const response = await fetch(new URL("/api/work/claim-activity", this.baseUrl), {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ supervisor_id: this.supervisorId, instance_id: this.instanceId, available_providers: availableProviders, activity_capabilities: activityCapabilities }),
+    });
+    if (response.status === 204) return null;
+    if (!response.ok) throw new TrackerError(response.status, (await response.json().catch(() => ({})) as { error?: string }).error ?? response.statusText);
+    return response.json() as Promise<ClaimedTicket>;
+  }
+
+  activityResult(lease: string, result: { success: boolean; summary: string; output: string; exit_code: number | null }): Promise<unknown> {
+    return this.request<unknown>(`/api/work/${lease}/activity-result`, { method: "POST", body: JSON.stringify(result) });
+  }
+
+  heartbeatActivity(lease: string): Promise<unknown> {
+    return this.request<unknown>(`/api/work/${lease}/heartbeat`, { method: "POST", body: "{}" });
   }
 
   async config(): Promise<TrackerConfig> {
@@ -36,7 +54,7 @@ export class TrackerClient {
     return (await this.request<{ prompts: TrackerPrompt[] }>("/api/prompts")).prompts;
   }
 
-  heartbeatSupervisor(presence: SupervisorPresence, providers: Provider[]): Promise<unknown> {
+  heartbeatSupervisor(presence: SupervisorPresence, providers: Provider[], activityCapabilities: ActivityCapability[]): Promise<unknown> {
     return this.request<unknown>("/api/supervisors/heartbeat", {
       method: "POST",
       body: JSON.stringify({
@@ -47,6 +65,7 @@ export class TrackerClient {
         project_root: presence.projectRoot,
         herdr_session: presence.herdrSession,
         providers,
+        activity_capabilities: activityCapabilities,
         started_at: presence.startedAt,
       }),
     });

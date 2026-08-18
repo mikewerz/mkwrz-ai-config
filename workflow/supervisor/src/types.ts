@@ -1,4 +1,5 @@
 export type Provider = "claude" | "codex";
+export type ActivityCapability = "repository_action" | "inline_shell" | "inline_javascript" | "inline_python";
 export type WorkPhase = "specification" | "implementation" | "review";
 
 export interface RepositoryConfig {
@@ -14,7 +15,7 @@ export interface TrackerConfig {
 }
 
 export interface TrackerPrompt {
-  name: "assignment" | "specification" | "implementation" | "review" | "guidance" | "callback-reminder";
+  name: string;
   content: string;
   revision: string;
   valid: boolean;
@@ -45,6 +46,8 @@ export interface Guidance {
 export interface InterruptRequest {
   target_phase: WorkPhase;
   requested_at: string;
+  terminal_status?: "failed" | "cancelled";
+  terminal_reason?: string;
 }
 
 export interface ClaimedTicket {
@@ -59,10 +62,34 @@ export interface ClaimedTicket {
     work_provider: Provider;
     review_provider: Provider;
     repositories: Array<{ id: string; primary: boolean }>;
-    pull_requests: Array<{ repository: string; url: string }>;
+    pull_requests: Array<{ repository: string; url: string; phase?: WorkPhase }>;
     agents: Record<WorkPhase, AgentRef>;
-    execution: { lease_id: string; provider: Provider; interrupt_request: InterruptRequest | null };
+    conversations?: Record<string, AgentRef>;
+    workflow?: {
+      id?: string; revision?: string; current_node?: string;
+      incoming?: null | { outcome: string; summary: string | null; handoff: string | null; source_node: string; target_node: string; actor?: string };
+    };
+    execution: {
+      lease_id: string; provider: Provider | null; interrupt_request: InterruptRequest | null; attempt?: number;
+      node_run_id?: string; node_id?: string; node_type?: "agent" | "script"; conversation_key?: string;
+    };
   };
+  workflow_node?: {
+    id: string;
+    name: string;
+    type: "agent" | "script" | "human_gate" | "terminal";
+    phase: WorkPhase | "done";
+    prompt?: string;
+    provider?: Provider | "work" | "review";
+    conversation_key?: string;
+    repository?: string;
+    action?: string;
+    inline?: { language: "shell" | "python" | "javascript"; code: string };
+    outcomes: Array<{ id: string; label: string; description: string; target: string }>;
+    choices: Array<{ id: string; label: string; description: string; target: string; comment_required?: boolean }>;
+    exit_codes: Array<{ id: string; label: string; description: string; target: string; codes?: number[]; default?: boolean }>;
+  };
+  node_prompt?: { id: string; revision: string; content: string } | null;
 }
 
 export interface AgentObservation {

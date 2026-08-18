@@ -6,6 +6,7 @@ import { TrackerConfigStore } from "./config-store.js";
 import { GithubObserver } from "./github-observer.js";
 import { TicketStore } from "./ticket-store.js";
 import { ticketMarkdown } from "./test-helpers.js";
+import { WorkflowLibrary, enterCurrentNode, initializeWorkflow } from "./workflow-library.js";
 
 const roots: string[] = [];
 afterEach(async () => { vi.unstubAllEnvs(); while (roots.length) await rm(roots.pop()!, { recursive: true, force: true }); });
@@ -75,6 +76,67 @@ describe("GithubObserver", () => {
     expect(resumed.frontmatter?.pull_requests[0]?.observation).toMatchObject({ last_issue_comment_id: 7 });
     expect(resumed.body).toContain("Please document the rollback behavior");
     expect(resumed.body).toContain("github.specification_follow_up_found");
+    await store.close();
+  });
+
+  it("follows the configured feedback outcome on a non-specification human gate", async () => {
+    vi.stubEnv("GITHUB_TOKEN", "token");
+    const root = await mkdtemp(join(tmpdir(), "github-gate-observer-")); roots.push(root);
+    const store = new TicketStore(root, { watch: false }); await store.start();
+    const configs = new TrackerConfigStore(root); await configs.start();
+    const workflows = new WorkflowLibrary(root); const workflow = await workflows.get("dev-only");
+    await store.create(ticketMarkdown({ spec_required: true, review_required: true }));
+    await store.command("APT-0001", { event: "test.at_pr_gate", message: "Waiting for PR approval." }, (ticket) => {
+      initializeWorkflow(ticket, workflow, { specification: "a".repeat(64), implementation: "b".repeat(64), review: "c".repeat(64), merge: "d".repeat(64) });
+      ticket.workflow!.current_node = "pr-approval";
+      enterCurrentNode(ticket, workflow.definition, false);
+      ticket.pull_requests = [{ repository: "demo", url: "https://github.com/example/demo/pull/42", phase: "implementation" }];
+      return { ticket };
+    });
+    const request = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith("/pulls/42")) return Response.json({ state: "open", draft: false, merged: false, mergeable: true });
+      if (url.includes("/issues/42/comments")) return Response.json([
+        { id: 11, body: "Please add coverage for retries.", user: { login: "reviewer", type: "User" } },
+      ]);
+      return Response.json([]);
+    });
+    const observer = new GithubObserver(store, configs, request as typeof fetch, workflows);
+    expect(await observer.checkTicket("APT-0001")).toEqual({ checked: 1, reopened: true });
+    const resumed = await store.get("APT-0001");
+    expect(resumed.frontmatter).toMatchObject({ phase: "implementation", status: "ready", workflow: { current_node: "implementation" } });
+    expect(resumed.frontmatter?.workflow?.incoming).toMatchObject({ outcome: "changes_requested", actor: "github" });
+    expect(resumed.body).toContain("github.gate_follow_up_found");
+    await store.close();
+  });
+
+  it("follows the completed terminal node's explicit GitHub feedback target", async () => {
+    vi.stubEnv("GITHUB_TOKEN", "token");
+    const root = await mkdtemp(join(tmpdir(), "github-terminal-observer-")); roots.push(root);
+    const workflows = new WorkflowLibrary(root); const workflow = await workflows.get("standard-delivery");
+    const store = new TicketStore(root, { watch: false, workflowLibrary: workflows }); await store.start();
+    const configs = new TrackerConfigStore(root); await configs.start();
+    await store.create(ticketMarkdown({ spec_required: false, review_required: false }));
+    await store.command("APT-0001", { event: "test.completed", message: "Completed." }, (ticket) => {
+      initializeWorkflow(ticket, workflow);
+      ticket.workflow!.current_node = "done";
+      enterCurrentNode(ticket, workflow.definition, false);
+      ticket.pull_requests = [{ repository: "demo", url: "https://github.com/example/demo/pull/42", phase: "implementation" }];
+      return { ticket };
+    });
+    let comments: Array<Record<string, unknown>> = [];
+    const request = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith("/pulls/42")) return Response.json({ state: "open", draft: false, merged: false, mergeable: true });
+      if (url.includes("/issues/42/comments")) return Response.json(comments);
+      return Response.json([]);
+    });
+    const observer = new GithubObserver(store, configs, request as typeof fetch, workflows);
+    expect(await observer.checkTicket("APT-0001")).toEqual({ checked: 1, reopened: false });
+    comments = [{ id: 12, body: "Please repair the compatibility edge case.", user: { login: "reviewer", type: "User" } }];
+    expect(await observer.checkTicket("APT-0001")).toEqual({ checked: 1, reopened: true });
+    const resumed = await store.get("APT-0001");
+    expect(resumed.frontmatter).toMatchObject({ status: "ready", workflow: { current_node: "implementation", incoming: { source_node: "done", outcome: "github_feedback", actor: "github" } } });
     await store.close();
   });
 });

@@ -2,7 +2,7 @@
 
 ## Status
 
-Approved V1 product and architecture specification.
+Approved V1 product and architecture specification. Preserved as the lightweight baseline; the additive software-factory architecture is specified in [V3](./v3.md).
 
 ## Goal
 
@@ -33,7 +33,7 @@ The system does not decompose implementation into graph nodes, prescribe how an 
                               |
                               v
                  +-------------------------+
-                 | agentic-project-tracker |
+                 |    workflow/tracker     |
                  | tickets, state, leases, |
                  | approval, guidance      |
                  +------------+------------+
@@ -41,7 +41,7 @@ The system does not decompose implementation into graph nodes, prescribe how an 
                          claim/callback
                               |
                  +------------v---------------+
-                 | agentic-project-supervisor |
+                 |   workflow/supervisor      |
                  | small deterministic loop   |
                  +------------+---------------+
                               |
@@ -50,9 +50,9 @@ The system does not decompose implementation into graph nodes, prescribe how an 
                          +----v----+
                          |  Herdr  |
                          +----+----+
-                         +-----+-----+
-                         |           |
-                      Claude       Codex
+                         +----+----+
+                         |         |
+                       Claude    Codex
 ```
 
 Herdr supplies persistent terminal sessions, lifecycle observation, prompts to agents that are already working, and native Codex and Claude session references. Its `working`, `blocked`, `idle`, and `done` states help the operator and supervisor understand liveness, but do not identify whether the assigned semantic task succeeded. See [Herdr agent automation](https://herdr.dev/docs/agent-automation/), [Herdr socket API](https://herdr.dev/docs/socket-api/), and [Herdr session restore](https://herdr.dev/docs/session-state/).
@@ -89,7 +89,7 @@ It contains no workflow graph, branch/worktree manager, test runner, GitHub adap
 
 ### `workflow/herdr`
 
-Owns installation and pinned configuration of Herdr, including the official Claude and Codex integrations and the named session used by the supervisor.
+Owns installation and pinned configuration of Herdr on the coordinator VM, including the official Claude and Codex integrations and the named session used by the supervisor.
 
 It does not edit agent tool availability, permissions, credentials, prompts, reasoning settings, or repository access. Agents remain normal interactive installations.
 
@@ -145,7 +145,7 @@ github:
 
 Repository `id` values are unique safe directory names matching `[A-Za-z0-9][A-Za-z0-9._-]*`; `.` and `..` are forbidden. URLs are nonempty Git clone sources and must also be unique. The tracker rejects invalid YAML, duplicate entries, unsafe IDs, and stale UI revisions without replacing the last valid file.
 
-`providers.enabled` controls the work-agent choices offered when creating a ticket. It contains one or more unique values from `claude` and `codex`; missing configuration defaults to both. This is an operator preference rather than a live capability projection: supervisor availability does not automatically add or remove choices. Existing tickets retain and display their recorded provider even when it is no longer enabled for new work.
+`providers.enabled` controls the work-agent choices offered when creating a ticket. It contains one or more unique values from `claude` and `codex`; missing legacy configuration defaults to both. This is an operator preference rather than a live capability projection: supervisor availability does not automatically add or remove choices. Existing tickets retain and display their recorded provider even when it is no longer enabled for new work.
 
 Each supervisor periodically fetches the current catalog and reconciles every entry to `PROJECT_ROOT/<id>`. If that path already exists, it is left untouched. If it is absent, the supervisor runs `git clone -- <url> <absolute-target>`. It does not pull, reset, change branches, inspect remotes, or replace existing directories.
 
@@ -282,7 +282,7 @@ The operator primarily authors:
 - `work_provider`, `review_provider`, `priority`, and `labels`; and
 - `repositories`.
 
-`work_provider` and `review_provider` are each exactly `claude` or `codex`. Claude work requires Codex review and Codex work requires Claude review. Missing routing fields default to an existing work assignment when one exists, otherwise Claude work and Codex review. `priority` is an integer; higher values claim first. `labels` are scheduling-neutral free-form strings in V1.
+`work_provider` and `review_provider` are exactly `claude` or `codex`. Claude work requires Codex review, and Codex work requires Claude review. Missing routing fields on a legacy ticket default to its existing work assignment when one exists, otherwise Claude work and the corresponding reviewer. `priority` is an integer; higher values claim first. `labels` are scheduling-neutral free-form strings in V1.
 
 Every ticket must reference at least one repository and exactly one entry must have `primary: true`. Repository IDs are human-meaningful identifiers supplied to the agent. The tracker does not resolve, clone, validate, or prepare those repositories.
 
@@ -940,4 +940,4 @@ The eventual implementations must include unit and integration coverage for:
 - proof that observed lifecycle state never triggers semantic completion; and
 - the primary React queue, editor decision, approval, guidance, and recovery flows.
 
-The end-to-end acceptance scenarios should run against fake Claude, Codex, Herdr, and GitHub behavior by default. Explicit real-agent acceptance may be provided separately because it consumes credentials, inference, and repository side effects.
+The two end-to-end acceptance scenarios should run against fake Claude, Codex, Herdr, and GitHub behavior by default. Explicit real-agent acceptance may be provided separately because it consumes credentials, inference, and repository side effects.

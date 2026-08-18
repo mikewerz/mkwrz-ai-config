@@ -11,27 +11,35 @@ python3 scripts/tracker.py health
 python3 scripts/tracker.py runtime
 python3 scripts/tracker.py supervisor list
 python3 scripts/tracker.py config show
-python3 scripts/tracker.py prompt list
-python3 scripts/tracker.py prompt show implementation
+python3 scripts/tracker.py workflow list
+python3 scripts/tracker.py workflow show standard-delivery
 python3 scripts/tracker.py ticket next-id
 python3 scripts/tracker.py ticket list --status ready
 python3 scripts/tracker.py ticket list --include-archived --phase done
+python3 scripts/tracker.py ticket list --workflow-id end-to-end --workflow-stage "Non-production validation"
+python3 scripts/tracker.py ticket list --workflow-node "Deploy and validate non-production" --provider claude
 python3 scripts/tracker.py ticket show AGENT-0001
+python3 scripts/tracker.py ticket run-output AGENT-0001 node-run-uuid
 ```
 
-`runtime` reports active leases and Herdr observations. `supervisor list` reports online/offline presence, project roots, providers, and ticket reservations. Neither lifecycle observation proves phase completion.
+`runtime` reports active leases and Herdr observations. `supervisor list` reports online/offline presence, project roots, providers, detected Script activity capabilities, and ticket reservations. Neither lifecycle observation proves phase completion.
+
+The V3 list filters match the pinned workflow ID, displayed current-node name, displayed stage name, and resolved provider. Legacy phase/provider filters remain available as projections. `ticket run-output` reads the full externally stored output for a recorded node run; it never executes or retries a Script node.
 
 ## Ticket authoring
 
 ```bash
 cp assets/ticket-template.md /tmp/ticket.md
-python3 scripts/tracker.py ticket create --markdown-file /tmp/ticket.md --auto-id
+python3 scripts/tracker.py ticket create --markdown-file /tmp/ticket.md --auto-id --workflow-id standard-delivery
+python3 scripts/tracker.py ticket create --markdown-file /tmp/ticket.md --auto-id --workflow-id end-to-end --workflow-inputs-json /tmp/inputs.json --stage-enabled-json /tmp/stages.json
 python3 scripts/tracker.py ticket create --markdown-file /tmp/ticket.md
 python3 scripts/tracker.py ticket edit AGENT-0001 --revision 4 --markdown-file /tmp/ticket.md
 python3 scripts/tracker.py ticket edit AGENT-0001 --revision 4 --markdown-file /tmp/ticket.md --mode rewind --rewind-phase specification
 ```
 
-`ticket edit` requires the complete current Markdown, including tracker-maintained frontmatter and interaction-log markers. Begin from `ticket show`, change only operator-authored fields/body, and preserve the rest. A live rewind records an interrupt request; it does not immediately make replacement work claimable.
+Workflow input JSON maps declared input IDs to Boolean or string values. Stage-selection JSON maps configurable stage IDs to Booleans. Inspect the selected workflow first and omit both files when its defaults are correct.
+
+`ticket edit` requires the complete current Markdown, including tracker-maintained workflow state and interaction-log markers. Begin from `ticket show`, change only operator-authored fields/body, and preserve the rest. `--mode keep_phase` guides a running agent to reread a changed ticket. A live rewind records an interrupt request; it does not immediately make replacement work claimable.
 
 ## Comments, guidance, and questions
 
@@ -47,8 +55,8 @@ Comments do not steer active work. Guidance is queued for the running conversati
 
 ```bash
 python3 scripts/tracker.py ticket ready AGENT-0001 --revision 2
-python3 scripts/tracker.py ticket approve-specification AGENT-0001 --revision 8
-python3 scripts/tracker.py ticket request-specification-changes AGENT-0001 --revision 8 --message "Cover rollback."
+python3 scripts/tracker.py ticket decide AGENT-0001 approved --revision 8
+python3 scripts/tracker.py ticket migrate-workflow AGENT-0001 standard-delivery implementation --revision 10
 python3 scripts/tracker.py ticket retry AGENT-0001 --revision 10
 python3 scripts/tracker.py ticket rewind AGENT-0001 --revision 10 --phase implementation
 python3 scripts/tracker.py ticket reopen AGENT-0001 --revision 14 --phase implementation
@@ -59,25 +67,28 @@ python3 scripts/tracker.py ticket archive AGENT-0001 --revision 15
 python3 scripts/tracker.py ticket unarchive AGENT-0001 --revision 16
 ```
 
-Always inspect the ticket immediately before these commands. Do not guess a revision or silently repeat a conflicted transition.
+Always inspect the ticket immediately before these commands. For `ticket decide`, use only a choice ID exposed by the current `workflow_node.choices`; include `--message` when that choice requires a comment. Do not guess a revision or silently repeat a conflicted transition.
 
-## Prompt library
+For a running assignment, successful `fail` or `cancel` means the tracker requested terminal interruption; it does not mean the agent has already stopped. Reread the ticket until the supervisor acknowledges the request and the terminal state is recorded. An unacknowledged interruption may time out into blocked work requiring operator attention.
+
+`rewind` and `reopen` use the operational phase projection and select the first applicable agent node. When a custom workflow has multiple agent nodes in one phase, use `migrate-workflow` with an explicit workflow and node only when the user requests that exact redirect. Migration changes the ticket's pinned execution and may move it to the latest published revision; it does not edit the workflow artifact.
+
+## Workflow selection
 
 ```bash
-python3 scripts/tracker.py prompt preview implementation --phase implementation --content-file /tmp/implementation.md
-python3 scripts/tracker.py prompt update implementation --revision PROMPT_DIGEST --content-file /tmp/implementation.md
+python3 scripts/tracker.py workflow list
+python3 scripts/tracker.py workflow show dev-only
 ```
 
-Use `prompt show` to obtain the current content and digest. Preview before updating. Prompt tags and required tags are validated by the tracker.
+Workflow access is read-only. Inspect a definition to discover its inputs, configurable stages, nodes, and human-gate choice IDs before creating or redirecting a ticket. The skill cannot publish workflow or prompt artifacts.
 
-## Configuration
+## Configuration inspection
 
 ```bash
 python3 scripts/tracker.py config show > /tmp/config-response.json
-python3 scripts/tracker.py config update --revision 3 --json-file /tmp/config-response.json
 ```
 
-The update file may be the complete client response, a `{ "config": ... }` data object, or a JSON object containing `repositories` plus optional `providers`, `jira`, and `github`. The CLI never updates ticket numbering fields. Credentials remain environment variables on the tracker host.
+Configuration access is read-only. Use it to discover saved repositories, enabled providers, and whether Jira or GitHub observation is available. The skill cannot change configuration or ticket numbering.
 
 ## Jira and GitHub observation
 
@@ -88,4 +99,4 @@ python3 scripts/tracker.py ticket jira-resync ENG-42 --revision 2
 python3 scripts/tracker.py ticket check-pull-requests AGENT-0001
 ```
 
-Jira import returns an unsaved draft; create it only after supplying tracker-only repositories and workflow choices. Jira export and resync mutate the ticket. A PR check may return completed or specification-approval work to a ready phase when new actionable feedback or a merge conflict is found.
+Jira import returns an unsaved draft; create it only after supplying tracker-only repositories and workflow choices. Viewing or marking a pending Jira-backed ticket ready may resync it. Jira export and resync mutate the ticket. A PR check may follow the current human gate's configured feedback choice or a completed terminal node's explicit feedback target when new actionable feedback or a merge conflict is found. Always read the ticket again after a PR check.

@@ -9,7 +9,7 @@ import { App } from "./App.js";
 const summary = {
   id: "APT-42", title: "UI ticket", phase: "implementation", status: "running",
   work_provider: "claude", review_provider: "codex", review_required: true,
-  priority: 50, provider: "claude", revision: 7, valid: true, errors: [], path: "APT-42.md", claim_blockers: [], archived_at: null,
+  priority: 50, provider: "claude", revision: 7, valid: true, errors: [], path: "APT-42.md", claim_blockers: [], archived_at: null, workflow_id: "standard-delivery",
 };
 
 const execution = {
@@ -72,6 +72,31 @@ const promptFixtures = [
   })),
 ];
 
+const workflowDefinition = {
+  version: 2, id: "standard-delivery", name: "Standard delivery", description: "Specification, implementation, review, and repair loops.",
+  start: "specification", max_transitions: 80,
+  inputs: [],
+  stages: [
+    { id: "specification", name: "Specification", phase: "specification", skippable: true, default_enabled: true, bypass_to: "implementation" },
+    { id: "implementation", name: "Implementation", phase: "implementation", skippable: false, default_enabled: true },
+    { id: "review", name: "Review", phase: "review", skippable: true, default_enabled: true, bypass_to: "done" },
+    { id: "done", name: "Done", phase: "done", skippable: false, default_enabled: true },
+  ],
+  nodes: [
+    { id: "specification", name: "Specification", type: "agent", phase: "specification", stage: "specification", prompt: "specification", provider: "work", conversation_key: "work", max_visits: 20, outcomes: [{ id: "completed", label: "Specification completed", description: "Ready for approval.", target: "specification-approval" }], choices: [], exit_codes: [] },
+    { id: "specification-approval", name: "Approve specification", type: "human_gate", phase: "specification", stage: "specification", max_visits: 20, outcomes: [], choices: [{ id: "approved", label: "Approve", description: "Continue.", target: "implementation" }, { id: "changes_requested", label: "Request changes", description: "Revise.", target: "specification", comment_required: true }], exit_codes: [] },
+    { id: "implementation", name: "Implementation", type: "agent", phase: "implementation", stage: "implementation", prompt: "implementation", provider: "work", conversation_key: "work", max_visits: 20, outcomes: [{ id: "completed", label: "Implementation completed", description: "Ready for review.", target: "review" }], choices: [], exit_codes: [] },
+    { id: "review", name: "Independent review", type: "agent", phase: "review", stage: "review", prompt: "review", provider: "review", conversation_key: "review", max_visits: 20, outcomes: [{ id: "approved", label: "Approve", description: "Finish.", target: "done" }, { id: "changes_requested", label: "Request changes", description: "Repair.", target: "implementation" }], choices: [], exit_codes: [] },
+    { id: "done", name: "Done", type: "terminal", phase: "done", stage: "done", terminal_status: "completed", outcomes: [], choices: [], exit_codes: [] },
+  ],
+};
+
+const workflowFixture = {
+  definition: workflowDefinition,
+  content: JSON.stringify(workflowDefinition, null, 2),
+  revision: "workflow-r1", valid: true, errors: [], referenced_prompts: ["specification", "implementation", "review"],
+};
+
 class FakeEventSource { addEventListener() {} close() {} }
 
 function installLocalStorage(): Storage {
@@ -93,12 +118,14 @@ describe("operator UI", () => {
   let claimBlockers: any[] = [];
   let trackerConfig: any;
   let prompts: any[];
+  let workflows: any[];
   beforeEach(() => {
     installLocalStorage();
     document.documentElement.removeAttribute("data-theme");
     current = structuredClone(detail);
     claimBlockers = [];
     prompts = structuredClone(promptFixtures);
+    workflows = [structuredClone(workflowFixture)];
     trackerConfig = { version: 1, revision: 2, updated_at: "2026-08-14T12:00:00Z", tickets: { id_prefix: "AGENT", next_number: 1 }, providers: { enabled: ["claude", "codex"] }, repositories: [{ id: "demo", url: "git@github.com:example/demo.git" }], jira: { enabled: false, site_url: "", project_key: "", issue_type: "Task" }, github: { observation_enabled: false, observation_interval_minutes: 30, ignored_logins: [] } };
     vi.stubGlobal("EventSource", FakeEventSource);
     vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -115,12 +142,30 @@ describe("operator UI", () => {
       if (path === "/api/supervisors" && !init?.method) return Response.json({ supervisors: [{
         supervisor_id: "coordinator-vm", instance_id: "instance-1", hostname: "worker-vm",
         ip_addresses: ["192.0.2.70"], project_root: "/srv/projects", herdr_session: "agentic-projects",
-        providers: ["claude", "codex"], started_at: "2026-08-14T11:00:00Z",
+        providers: ["claude", "codex"], activity_capabilities: ["repository_action", "inline_shell", "inline_javascript", "inline_python"], started_at: "2026-08-14T11:00:00Z",
         last_seen_at: "2026-08-14T12:01:30Z", status: "online",
         assigned_ticket: { id: "APT-42", title: "UI ticket", phase: current.frontmatter.phase, status: current.frontmatter.status },
       }] });
       if (path === "/api/config" && !init?.method) return Response.json({ config: trackerConfig });
       if (path === "/api/prompts" && !init?.method) return Response.json({ prompts });
+      if (path === "/api/prompts" && init?.method === "POST") {
+        const payload = JSON.parse(String(init.body));
+        const prompt = { name: payload.name, title: payload.name.replaceAll("-", " "), purpose: "Reusable workflow-node instructions.", trigger: "Workflow agent node", stages: ["Workflow agent node"], allowed_tags: [], required_tags: [], tags: [], content: `${payload.content.trim()}\n`, revision: `${payload.name}-r1`, valid: true, errors: [], workflow_references: [] };
+        prompts.push(prompt); return Response.json({ prompt }, { status: 201 });
+      }
+      if (path === "/api/workflows" && !init?.method) return Response.json({ workflows });
+      if (path === "/api/workflows" && init?.method === "POST") {
+        const payload = JSON.parse(String(init.body));
+        const definition = (await import("yaml")).parse(payload.content);
+        const workflow = { definition, content: payload.content, revision: `${definition.id}-r1`, valid: true, errors: [], referenced_prompts: definition.nodes.filter((node: any) => node.prompt).map((node: any) => node.prompt) };
+        workflows.push(workflow); return Response.json({ workflow }, { status: 201 });
+      }
+      if (path.startsWith("/api/workflows/") && init?.method === "PUT") {
+        const payload = JSON.parse(String(init.body));
+        const definition = (await import("yaml")).parse(payload.content);
+        const workflow = { definition, content: payload.content, revision: `${definition.id}-r2`, valid: true, errors: [], referenced_prompts: definition.nodes.filter((node: any) => node.prompt).map((node: any) => node.prompt) };
+        workflows = workflows.map((item) => item.definition.id === definition.id ? workflow : item); return Response.json({ workflow });
+      }
       if (path.startsWith("/api/prompts/") && path.endsWith("/preview") && init?.method === "POST") {
         const payload = JSON.parse(String(init.body));
         return Response.json({ rendered: `Rendered dummy assignment for AGENT-0042\n${payload.content}` });
@@ -255,6 +300,95 @@ describe("operator UI", () => {
       method: "PUT", body: expect.stringContaining('"expected_revision":"assignment-r1"'),
     })));
   });
+
+  it("creates a new prompt independently from cloning an existing prompt", async () => {
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: "Prompts" }));
+    expect(await screen.findByRole("button", { name: "New prompt" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Clone prompt" })).toBeDisabled();
+    fireEvent.click(within(screen.getByLabelText("Prompt templates")).getByRole("button", { name: /Specification instructions/ }));
+    expect(screen.getByRole("button", { name: "Clone prompt" })).toBeEnabled();
+    fireEvent.click(screen.getByRole("button", { name: "Clone prompt" }));
+    expect(screen.getByLabelText("Prompt ID")).toHaveValue("copy-of-specification");
+    expect(screen.getByLabelText("Prompt Markdown")).toHaveValue("specification instructions");
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    fireEvent.click(screen.getByRole("button", { name: "New prompt" }));
+    fireEvent.change(screen.getByLabelText("Prompt ID"), { target: { value: "release-check" } });
+    fireEvent.change(screen.getByLabelText("Prompt Markdown"), { target: { value: "Check the release and report {{allowed_outcomes}}." } });
+    fireEvent.click(screen.getByRole("button", { name: "Create prompt" }));
+    await waitFor(() => expect(fetch).toHaveBeenCalledWith("/api/prompts", expect.objectContaining({
+      method: "POST", body: expect.stringContaining('"name":"release-check"'),
+    })));
+    expect((await screen.findAllByText("release-check.md")).length).toBeGreaterThan(0);
+  });
+
+  it("renders and edits the workflow as a directed graph while preserving YAML revisions", async () => {
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: "Workflows" }));
+    expect(await screen.findByRole("heading", { name: "Workflow editor" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "New workflow" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Clone workflow" })).toBeInTheDocument();
+    const graph = screen.getByLabelText("Workflow graph");
+    expect(within(graph).getAllByRole("button")[0]).toHaveTextContent("Specification");
+    expect(graph.querySelectorAll(".factory-connector").length).toBeGreaterThan(0);
+    expect(graph.querySelectorAll(".factory-connector.loop").length).toBeGreaterThan(0);
+    expect(screen.getByRole("heading", { name: "Conditions" })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "Stages" })).toBeInTheDocument();
+    expect(screen.getByLabelText("Outcome 1 label")).toHaveValue("Specification completed");
+    expect(screen.getByLabelText("Outcome 1 target").tagName).toBe("SELECT");
+
+    fireEvent.change(screen.getByLabelText("Node name"), { target: { value: "Write specification" } });
+    expect((screen.getByLabelText("Workflow YAML") as HTMLTextAreaElement).value).toContain("name: Write specification");
+    fireEvent.click(screen.getByRole("button", { name: "Publish revision" }));
+    await waitFor(() => expect(fetch).toHaveBeenCalledWith("/api/workflows/standard-delivery", expect.objectContaining({
+      method: "PUT", body: expect.stringContaining("Write specification"),
+    })));
+  });
+
+  it("starts a genuinely new minimal workflow and adds typed nodes", async () => {
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: "Workflows" }));
+    fireEvent.click(await screen.findByRole("button", { name: "New workflow" }));
+    fireEvent.change(screen.getByLabelText("Workflow ID"), { target: { value: "release-factory" } });
+    fireEvent.change(screen.getByLabelText("Workflow name"), { target: { value: "Release factory" } });
+    fireEvent.click(screen.getByRole("button", { name: "＋ Script" }));
+    expect(within(screen.getByLabelText("Workflow graph")).getByRole("button", { name: /Script/ })).toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText("Action name"), { target: { value: "verify-release" } });
+    fireEvent.change(screen.getByLabelText("Activity source"), { target: { value: "inline" } });
+    const expectedEnvironment = [
+      "AGENTIC_TICKET_ID", "AGENTIC_TICKET_PATH", "AGENTIC_PROJECT_ROOT", "AGENTIC_NODE_ID", "AGENTIC_NODE_NAME",
+      "AGENTIC_NODE_RUN_ID", "AGENTIC_WORKFLOW_NODE_TYPE", "AGENTIC_ATTEMPT", "AGENTIC_WORKFLOW_ID",
+      "AGENTIC_WORKFLOW_REVISION", "AGENTIC_WORKFLOW_PHASE", "AGENTIC_REPOSITORY_ID", "AGENTIC_REPOSITORY_PATH",
+      "AGENTIC_PRIMARY_REPOSITORY_ID", "AGENTIC_PRIMARY_REPOSITORY_PATH", "AGENTIC_CURRENT_BRANCH", "AGENTIC_DEFAULT_BRANCH",
+      "AGENTIC_HEAD_SHA", "AGENTIC_REMOTE_URL", "AGENTIC_REPOSITORIES_JSON", "AGENTIC_PULL_REQUESTS_JSON",
+      "AGENTIC_CONTEXT_JSON", "AGENTIC_INCOMING_NODE", "AGENTIC_INCOMING_OUTCOME", "AGENTIC_INCOMING_SUMMARY",
+      "AGENTIC_INCOMING_HANDOFF",
+    ];
+    const expectCompleteEnvironmentHeader = () => {
+      const code = (screen.getByLabelText("Inline code") as HTMLTextAreaElement).value;
+      for (const variable of expectedEnvironment) expect(code).toContain(`${variable} -`);
+    };
+    expectCompleteEnvironmentHeader();
+    expect((screen.getByLabelText("Inline code") as HTMLTextAreaElement).value).toContain("/^AGENTIC_/");
+    fireEvent.change(screen.getByLabelText("Inline language"), { target: { value: "python" } });
+    expectCompleteEnvironmentHeader();
+    expect((screen.getByLabelText("Inline code") as HTMLTextAreaElement).value).toContain('name.startswith("AGENTIC_")');
+    fireEvent.change(screen.getByLabelText("Inline language"), { target: { value: "javascript" } });
+    expectCompleteEnvironmentHeader();
+    expect((screen.getByLabelText("Inline code") as HTMLTextAreaElement).value).toContain('name.startsWith("AGENTIC_")');
+    fireEvent.change(screen.getByLabelText("Inline language"), { target: { value: "python" } });
+    fireEvent.change(screen.getByLabelText("Inline code"), { target: { value: "import sys\nsys.exit(0)" } });
+    fireEvent.change(screen.getByLabelText("Inline language"), { target: { value: "shell" } });
+    expect(screen.getByLabelText("Inline code")).toHaveValue("import sys\nsys.exit(0)");
+    fireEvent.change(screen.getByLabelText("Inline language"), { target: { value: "python" } });
+    expect(screen.getByText(/runs inside the selected repository/)).toBeInTheDocument();
+    expect(screen.getByLabelText("Outcome 1 exit codes")).toHaveValue("0");
+    expect(screen.getByLabelText("Outcome 2 exit codes")).toHaveValue("All other / error");
+    fireEvent.click(screen.getByRole("button", { name: "Create workflow" }));
+    await waitFor(() => expect(fetch).toHaveBeenCalledWith("/api/workflows", expect.objectContaining({
+      method: "POST", body: expect.stringMatching(/release-factory[\s\S]*language: python[\s\S]*sys\.exit\(0\)/),
+    })));
+  }, 15_000);
 
   it("shows a same-host repository blocker without changing the ready status", async () => {
     current.frontmatter.status = "ready";

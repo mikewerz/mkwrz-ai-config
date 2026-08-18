@@ -68,17 +68,17 @@ export function resumeArguments(provider: Provider, sessionRef: string | null): 
   return ["resume", sessionRef];
 }
 
-export function agentName(ticketId: string, provider: Provider, conversation: "work" | "review"): string {
+export function agentName(ticketId: string, provider: Provider, conversation: string): string {
   const compact = ticketId.toLowerCase().replaceAll(/[^a-z0-9]/g, "").slice(0, 7) || "ticket";
   const identity = createHash("sha256").update(ticketId).digest("hex").slice(0, 10);
-  const role = conversation === "review" ? "r" : "w";
+  const role = conversation === "review" ? "r" : conversation === "work" ? "w" : createHash("sha256").update(conversation).digest("hex").slice(0, 3);
   return `apt_${compact}_${identity}_${provider}_${role}`.slice(0, 32);
 }
 
 export class HerdrController {
   constructor(private readonly runner: CommandRunner, readonly projectRoot: string) {}
 
-  async ensureAgent(ticketId: string, provider: Provider, conversation: "work" | "review", existingPane: string | null, sessionRef: string | null): Promise<AgentObservation> {
+  async ensureAgent(ticketId: string, provider: Provider, conversation: string, existingPane: string | null, sessionRef: string | null): Promise<AgentObservation> {
     if (existingPane) {
       try { return await this.observe(existingPane); } catch { /* restore into saved pane */ }
       await this.runner.run(["agent", "start", agentName(ticketId, provider, conversation), "--kind", provider, "--pane", existingPane, "--", ...resumeArguments(provider, sessionRef)]);

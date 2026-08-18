@@ -6,6 +6,7 @@ import { SupervisorRegistry } from "./supervisor-registry.js";
 import { TrackerConfigStore } from "./config-store.js";
 import { GithubObserver } from "./github-observer.js";
 import { PromptLibrary } from "./prompt-library.js";
+import { WorkflowLibrary } from "./workflow-library.js";
 
 try { loadEnvFile(); } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
 
@@ -14,15 +15,17 @@ const port = Number(process.env.PORT ?? 4310);
 const ticketRoot = process.env.TICKETS_ROOT ? resolve(process.env.TICKETS_ROOT) : resolve("tickets");
 const leaseTtlMs = Number(process.env.LEASE_TTL_MS ?? 120_000);
 
-const store = new TicketStore(ticketRoot, { leaseTtlMs });
+const workflowLibrary = new WorkflowLibrary(ticketRoot);
+await workflowLibrary.start();
+const store = new TicketStore(ticketRoot, { leaseTtlMs, workflowLibrary });
 await store.start();
 const configStore = new TrackerConfigStore(ticketRoot);
 await configStore.start();
 const registry = new SupervisorRegistry(Number(process.env.SUPERVISOR_TTL_MS ?? 90_000));
-const githubObserver = new GithubObserver(store, configStore);
+const githubObserver = new GithubObserver(store, configStore, fetch, workflowLibrary);
 const promptLibrary = new PromptLibrary(ticketRoot);
 await promptLibrary.start();
-const app = createApp(store, resolve("dist/client"), registry, configStore, undefined, githubObserver, promptLibrary);
+const app = createApp(store, resolve("dist/client"), registry, configStore, undefined, githubObserver, promptLibrary, workflowLibrary);
 const server = app.listen(port, host, () => console.log(`agentic-project-tracker listening on http://${host}:${port}`));
 const sweeper = setInterval(() => void store.expireLeases(), Math.min(30_000, Math.max(1_000, leaseTtlMs / 2)));
 let githubTimer: NodeJS.Timeout | null = null;

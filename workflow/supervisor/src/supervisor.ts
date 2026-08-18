@@ -2,7 +2,8 @@ import type { HerdrController } from "./herdr.js";
 import { PromptStore, type PromptName, type PromptTemplates } from "./prompts.js";
 import { TrackerClient, TrackerError } from "./tracker-client.js";
 import { RepositoryReconciler, type RepositoryReconcilerLike } from "./repositories.js";
-import type { ClaimedTicket, Provider, SupervisorPresence } from "./types.js";
+import type { ActivityCapability, ClaimedTicket, Provider, SupervisorPresence } from "./types.js";
+import { detectActivityCapabilities, runRepositoryActivity } from "./activities.js";
 
 export interface SupervisorOptions {
   trackerUrl: string;
@@ -20,10 +21,18 @@ const ASSIGNMENT_PROMPT_ATTEMPTS = 2;
 
 function callbackValues(ticket: ClaimedTicket, callbackBaseUrl: string): Record<string, string> {
   const lease = ticket.frontmatter.execution.lease_id;
+  const node = ticket.workflow_node;
   return {
     ticket_id: ticket.frontmatter.id,
     phase: ticket.frontmatter.phase,
     callback_base: new URL(`/api/work/${lease}/`, callbackBaseUrl).toString(),
+    node_id: node?.id ?? ticket.frontmatter.phase,
+    node_name: node?.name ?? ticket.frontmatter.phase,
+    allowed_outcomes: node?.outcomes?.length ? node.outcomes.map((outcome) => `- ${outcome.id}: ${outcome.label}${outcome.description ? ` — ${outcome.description}` : ""}`).join("\n") : "- completed: Complete the assigned work\n- failed: The work cannot continue",
+    incoming_outcome: ticket.frontmatter.workflow?.incoming?.outcome ?? "none",
+    incoming_summary: ticket.frontmatter.workflow?.incoming?.summary ?? "No prior transition summary.",
+    incoming_handoff: ticket.frontmatter.workflow?.incoming?.handoff ?? "No explicit handoff message.",
+    incoming_node: ticket.frontmatter.workflow?.incoming?.source_node ?? "none",
   };
 }
 
@@ -35,7 +44,10 @@ export function buildAssignmentPrompt(ticket: ClaimedTicket, callbackBaseUrl: st
     ticket_markdown: ticket.markdown,
     project_root: projectRoot,
   };
-  return prompts.render("assignment", { ...values, phase_instructions: prompts.render(phase, values) });
+  const instructions = ticket.node_prompt
+    ? prompts.renderContent(ticket.node_prompt.id, ticket.node_prompt.content, values)
+    : prompts.render(phase, values);
+  return prompts.render("assignment", { ...values, phase_instructions: instructions });
 }
 
 export function buildCallbackReminder(ticket: ClaimedTicket, callbackBaseUrl: string, prompts: PromptStore): string {
@@ -48,6 +60,7 @@ export class Supervisor {
   private readonly callbackBaseUrl: string;
   private readonly prompts: PromptStore;
   private readonly repositoryReconciler: RepositoryReconcilerLike | null;
+  private readonly activityCapabilities: ActivityCapability[];
   private repositorySync: Promise<void> | null = null;
   private lastRepositorySyncAt = 0;
 
@@ -55,6 +68,7 @@ export class Supervisor {
     this.tracker = new TrackerClient(options.trackerUrl, options.supervisorId, options.presence?.instanceId);
     this.callbackBaseUrl = options.callbackBaseUrl ?? options.trackerUrl;
     this.prompts = new PromptStore();
+    this.activityCapabilities = detectActivityCapabilities();
     this.repositoryReconciler = options.repositoryReconciler ?? (options.presence ? new RepositoryReconciler(options.presence.projectRoot) : null);
   }
 
@@ -75,14 +89,14 @@ export class Supervisor {
         catch (error) { console.error("[repositories] initial reconciliation failed", error); await sleep(this.options.idlePollMs); }
       }
       if (this.stopped) return;
-      await Promise.all([this.presenceLoop(), ...this.options.providers.map((provider) => this.slotLoop(provider))]);
+      await Promise.all([this.presenceLoop(), this.activityLoop(), ...this.options.providers.map((provider) => this.slotLoop(provider))]);
       return;
     }
-    await Promise.all(this.options.providers.map((provider) => this.slotLoop(provider)));
+    await Promise.all([this.activityLoop(), ...this.options.providers.map((provider) => this.slotLoop(provider))]);
   }
 
   private async publishPresence(): Promise<void> {
-    if (this.options.presence) await this.tracker.heartbeatSupervisor(this.options.presence, this.options.providers);
+    if (this.options.presence) await this.tracker.heartbeatSupervisor(this.options.presence, this.options.providers, this.activityCapabilities);
   }
 
   private async ensureRepositories(force = false): Promise<void> {
@@ -100,10 +114,11 @@ export class Supervisor {
 
   private async refreshPrompts(): Promise<void> {
     const documents = await this.tracker.prompts();
-    const invalid = documents.filter((prompt) => !prompt.valid);
-    if (invalid.length) throw new Error(`Tracker prompt library is invalid: ${invalid.map((prompt) => `${prompt.name}: ${prompt.errors.join(", ")}`).join("; ")}`);
-    const expected: PromptName[] = ["assignment", "specification", "implementation", "review", "guidance", "callback-reminder"];
-    const byName = Object.fromEntries(documents.map((prompt) => [prompt.name, prompt.content])) as Partial<PromptTemplates>;
+    const expected: PromptName[] = ["assignment", "guidance", "callback-reminder"];
+    const required = documents.filter((prompt) => expected.includes(prompt.name));
+    const invalid = required.filter((prompt) => !prompt.valid);
+    if (invalid.length) throw new Error(`Required tracker prompts are invalid: ${invalid.map((prompt) => `${prompt.name}: ${prompt.errors.join(", ")}`).join("; ")}`);
+    const byName = Object.fromEntries(documents.filter((prompt) => prompt.valid).map((prompt) => [prompt.name, prompt.content])) as Partial<PromptTemplates>;
     const missing = expected.filter((name) => typeof byName[name] !== "string");
     if (missing.length) throw new Error(`Tracker prompt library is missing: ${missing.join(", ")}`);
     this.prompts.replace(byName as PromptTemplates);
@@ -142,7 +157,7 @@ export class Supervisor {
           const [active] = await this.tracker.active(provider);
           if (active) { await this.runAssignment(provider, active); continue; }
         }
-        const ticket = await this.tracker.claim(provider, this.options.providers);
+        const ticket = await this.tracker.claim(provider, this.options.providers, this.activityCapabilities);
         if (!ticket) { await sleep(this.options.idlePollMs); continue; }
         await this.runAssignment(provider, ticket);
       } catch (error) {
@@ -152,11 +167,74 @@ export class Supervisor {
     }
   }
 
+  private async activityLoop(): Promise<void> {
+    while (!this.stopped) {
+      try {
+        await this.ensureRepositories();
+        const ticket = await this.tracker.claimActivity(this.options.providers, this.activityCapabilities);
+        if (!ticket) { await sleep(this.options.idlePollMs); continue; }
+        const lease = ticket.frontmatter.execution.lease_id;
+        const controller = new AbortController();
+        let settled = false;
+        const activity = runRepositoryActivity(this.herdr.projectRoot, ticket, controller.signal)
+          .catch((error) => ({ success: false, summary: (error as Error).message, output: "", exit_code: null }))
+          .finally(() => { settled = true; });
+        try {
+          let interrupted = false;
+          let lastHeartbeatAt = Date.now();
+          while (!settled && !this.stopped) {
+            await sleep(Math.min(this.options.idlePollMs, this.options.heartbeatIntervalMs));
+            const control = await this.tracker.control(lease).catch((error) => {
+              if (error instanceof TrackerError && error.status === 409) return null;
+              throw error;
+            });
+            if (control === null) { controller.abort(); await activity; interrupted = true; break; }
+            if (control.interrupt) {
+              controller.abort();
+              await activity;
+              await this.tracker.acknowledgeInterrupt(lease);
+              interrupted = true;
+              break;
+            }
+            if (Date.now() - lastHeartbeatAt >= this.options.heartbeatIntervalMs) {
+              await this.tracker.heartbeatActivity(lease);
+              lastHeartbeatAt = Date.now();
+            }
+          }
+          if (this.stopped) {
+            if (!settled) controller.abort();
+            await activity;
+            break;
+          }
+          if (interrupted) continue;
+          const finalControl = await this.tracker.control(lease).catch((error) => {
+            if (error instanceof TrackerError && error.status === 409) return null;
+            throw error;
+          });
+          if (finalControl === null) { controller.abort(); continue; }
+          if (finalControl.interrupt) {
+            controller.abort(); await activity; await this.tracker.acknowledgeInterrupt(lease); continue;
+          }
+          const result = await activity;
+          await this.tracker.activityResult(lease, result);
+        } finally {
+          if (!settled) {
+            controller.abort();
+            await activity;
+          }
+        }
+      } catch (error) {
+        console.error("[activity] supervisor loop failed", error);
+        await sleep(this.options.idlePollMs);
+      }
+    }
+  }
+
   private async runAssignment(provider: Provider, ticket: ClaimedTicket): Promise<void> {
     const lease = ticket.frontmatter.execution.lease_id;
     const phase = ticket.frontmatter.phase;
-    const existing = ticket.frontmatter.agents[phase];
-    const conversation = phase === "review" ? "review" : "work";
+    const conversation = ticket.workflow_node?.conversation_key ?? (phase === "review" ? "review" : "work");
+    const existing = ticket.frontmatter.conversations?.[conversation] ?? ticket.frontmatter.agents[phase];
     const observation = await this.herdr.ensureAgent(ticket.frontmatter.id, provider, conversation, existing.herdr_pane_id, existing.session_ref);
     let cursor = 0;
     await this.tracker.heartbeat(lease, { ...observation, guidanceCursor: cursor });
@@ -178,6 +256,10 @@ export class Supervisor {
         if (error instanceof TrackerError && error.status === 409) return null;
         throw error;
       });
+      if (control === null) {
+        await this.herdr.interrupt(observation.paneId).catch(() => undefined);
+        return;
+      }
       if (control?.interrupt) {
         await this.herdr.interrupt(observation.paneId);
         await this.tracker.acknowledgeInterrupt(lease);

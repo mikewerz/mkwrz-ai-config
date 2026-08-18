@@ -3,10 +3,12 @@ export const STATUSES = [
   "pending", "ready", "running", "blocked", "waiting_approval", "completed", "failed", "cancelled",
 ] as const;
 export const PROVIDERS = ["claude", "codex"] as const;
+export const ACTIVITY_CAPABILITIES = ["repository_action", "inline_shell", "inline_javascript", "inline_python"] as const;
 
 export type Phase = (typeof PHASES)[number];
 export type TicketStatus = (typeof STATUSES)[number];
 export type Provider = (typeof PROVIDERS)[number];
+export type ActivityCapability = (typeof ACTIVITY_CAPABILITIES)[number];
 export type ReviewProvider = Provider;
 
 export interface RepositoryRef {
@@ -73,6 +75,11 @@ export interface GuidanceItem {
 export interface InterruptRequest {
   target_phase: Exclude<Phase, "done">;
   requested_at: string;
+  target_node?: string | undefined;
+  target_workflow_id?: string | undefined;
+  target_workflow_revision?: string | undefined;
+  terminal_status?: "failed" | "cancelled" | undefined;
+  terminal_reason?: string | undefined;
 }
 
 export interface HerdrObservation {
@@ -98,7 +105,7 @@ export interface HerdrObservation {
 export interface Execution {
   lease_id: string;
   supervisor_id: string;
-  provider: Provider;
+  provider: Provider | null;
   phase: Phase;
   attempt: number;
   claimed_at: string;
@@ -108,6 +115,56 @@ export interface Execution {
   herdr_observation: HerdrObservation | null;
   guidance: GuidanceItem[];
   interrupt_request: InterruptRequest | null;
+  node_run_id?: string | undefined;
+  node_id?: string | undefined;
+  node_type?: "agent" | "script" | undefined;
+  conversation_key?: string | undefined;
+}
+
+export interface WorkflowNodeRun {
+  id: string;
+  workflow_revision: string;
+  node_id: string;
+  node_type: "agent" | "script" | "verification" | "human_gate" | "terminal";
+  visit: number;
+  attempt: number;
+  status: "running" | "completed" | "failed" | "interrupted";
+  supervisor_id: string | null;
+  provider: Provider | null;
+  started_at: string;
+  completed_at: string | null;
+  outcome: string | null;
+  summary: string | null;
+  handoff: string | null;
+  output: string | null;
+  output_path?: string | null;
+  output_sha256?: string | null;
+  output_bytes?: number | null;
+  input_revision: number;
+}
+
+export interface WorkflowTransitionContext {
+  source_node: string;
+  target_node: string;
+  outcome: string;
+  summary: string | null;
+  handoff: string | null;
+  actor: string;
+  created_at: string;
+}
+
+export interface WorkflowRuntime {
+  id: string;
+  revision: string;
+  current_node: string;
+  transition_count: number;
+  node_visits: Record<string, number>;
+  node_attempts: Record<string, AttemptCounter>;
+  node_runs: WorkflowNodeRun[];
+  prompt_revisions: Record<string, string>;
+  inputs: Record<string, boolean | string>;
+  stage_enabled: Record<string, boolean>;
+  incoming: WorkflowTransitionContext | null;
 }
 
 export interface CallbackReceipt {
@@ -142,6 +199,8 @@ export interface TicketFrontmatter {
   created_at: string;
   updated_at: string;
   last_callback?: CallbackReceipt | null | undefined;
+  workflow?: WorkflowRuntime | null | undefined;
+  conversations?: Record<string, AgentRef> | undefined;
 }
 
 export interface ParsedDocument {
@@ -175,6 +234,10 @@ export interface TicketSummary {
   path: string;
   claim_blockers: RepositoryClaimBlocker[];
   archived_at: string | null;
+  workflow_id: string | null;
+  workflow_node_id: string | null;
+  workflow_node_name: string | null;
+  workflow_stage_name: string | null;
 }
 
 export interface RepositoryClaimBlocker {

@@ -17,7 +17,6 @@ from urllib.request import Request, urlopen
 PROVIDERS = ("claude", "codex")
 REVIEW_PROVIDERS = ("claude", "codex")
 PHASES = ("specification", "implementation", "review")
-PROMPTS = ("assignment", "specification", "implementation", "review", "guidance", "callback-reminder")
 DEFAULT_URL = os.environ.get("AGENTIC_PROJECT_TRACKER_URL", "http://127.0.0.1:4310")
 
 
@@ -53,6 +52,7 @@ class TrackerClient:
             with urlopen(request, timeout=self.timeout) as response:
                 status = response.status
                 body = response.read()
+                content_type = response.headers.get_content_type()
         except HTTPError as error:
             body = error.read()
             raise TrackerHTTPError(error.code, decode_body(body)) from error
@@ -60,6 +60,8 @@ class TrackerClient:
             raise ClientFailure(f"Unable to reach tracker: {error.reason}") from error
         except TimeoutError as error:
             raise ClientFailure("Tracker request timed out") from error
+        if content_type.startswith("text/"):
+            return status, body.decode("utf-8", errors="replace")
         return status, decode_body(body)
 
 
@@ -91,6 +93,16 @@ def read_json(path: str) -> Any:
         return json.loads(read_text(path))
     except json.JSONDecodeError as error:
         raise ClientFailure(f"Invalid JSON in {path}: {error}") from error
+
+
+def read_mapping(path: str, label: str, value_types: tuple[type, ...]) -> dict[str, Any]:
+    loaded = read_json(path)
+    if not isinstance(loaded, dict):
+        raise ClientFailure(f"{label} JSON must be an object")
+    if any(not isinstance(key, str) or not isinstance(value, value_types) for key, value in loaded.items()):
+        expected = " or ".join(value_type.__name__ for value_type in value_types)
+        raise ClientFailure(f"{label} JSON values must be {expected}")
+    return loaded
 
 
 def selected_text(args: argparse.Namespace, name: str) -> str:
@@ -141,54 +153,12 @@ def cmd_config_show(client: TrackerClient, _args: argparse.Namespace) -> tuple[i
     return get(client, "/api/config")
 
 
-def cmd_config_update(client: TrackerClient, args: argparse.Namespace) -> tuple[int, Any]:
-    loaded = read_json(args.json_file)
-    if isinstance(loaded, dict) and isinstance(loaded.get("data"), dict):
-        loaded = loaded["data"]
-    if isinstance(loaded, dict) and isinstance(loaded.get("config"), dict):
-        loaded = loaded["config"]
-    if not isinstance(loaded, dict):
-        raise ClientFailure("Configuration JSON must be an object or a {\"config\": {...}} response")
-    repositories = loaded.get("repositories")
-    if not isinstance(repositories, list):
-        raise ClientFailure("Configuration JSON must contain a repositories array")
-    payload = {
-        "expected_revision": args.revision,
-        "repositories": repositories,
-    }
-    for key in ("providers", "jira", "github"):
-        if key in loaded:
-            payload[key] = loaded[key]
-    return put(client, "/api/config", payload)
+def cmd_workflow_list(client: TrackerClient, _args: argparse.Namespace) -> tuple[int, Any]:
+    return get(client, "/api/workflows")
 
 
-def cmd_prompt_list(client: TrackerClient, _args: argparse.Namespace) -> tuple[int, Any]:
-    return get(client, "/api/prompts")
-
-
-def cmd_prompt_show(client: TrackerClient, args: argparse.Namespace) -> tuple[int, Any]:
-    status, payload = get(client, "/api/prompts")
-    prompts = payload.get("prompts") if isinstance(payload, dict) else None
-    if not isinstance(prompts, list):
-        raise ClientFailure("Tracker returned an invalid prompt list")
-    prompt = next((item for item in prompts if isinstance(item, dict) and item.get("name") == args.name), None)
-    if prompt is None:
-        raise ClientFailure(f"Prompt {args.name} was not returned by the tracker")
-    return status, {"prompt": prompt}
-
-
-def cmd_prompt_preview(client: TrackerClient, args: argparse.Namespace) -> tuple[int, Any]:
-    return post(client, f"/api/prompts/{encoded(args.name)}/preview", {
-        "content": selected_text(args, "content"),
-        "phase": args.phase,
-    })
-
-
-def cmd_prompt_update(client: TrackerClient, args: argparse.Namespace) -> tuple[int, Any]:
-    return put(client, f"/api/prompts/{encoded(args.name)}", {
-        "content": selected_text(args, "content"),
-        "expected_revision": args.revision,
-    })
+def cmd_workflow_show(client: TrackerClient, args: argparse.Namespace) -> tuple[int, Any]:
+    return get(client, f"/api/workflows/{encoded(args.id)}")
 
 
 def cmd_ticket_list(client: TrackerClient, args: argparse.Namespace) -> tuple[int, Any]:
@@ -202,6 +172,10 @@ def cmd_ticket_list(client: TrackerClient, args: argparse.Namespace) -> tuple[in
         "status": args.status,
         "work_provider": args.work_provider,
         "review_provider": args.review_provider,
+        "workflow_id": args.workflow_id,
+        "workflow_node_name": args.workflow_node,
+        "workflow_stage_name": args.workflow_stage,
+        "provider": args.provider,
     }
     for field, value in filters.items():
         if value is not None:
@@ -215,6 +189,13 @@ def cmd_ticket_show(client: TrackerClient, args: argparse.Namespace) -> tuple[in
     return get(client, f"/api/tickets/{encoded(args.id)}")
 
 
+def cmd_ticket_run_output(client: TrackerClient, args: argparse.Namespace) -> tuple[int, Any]:
+    status, output = get(client, f"/api/tickets/{encoded(args.id)}/runs/{encoded(args.run_id)}/output")
+    if not isinstance(output, str):
+        raise ClientFailure("Tracker returned invalid node-run output")
+    return status, {"ticket_id": args.id, "run_id": args.run_id, "output": output}
+
+
 def cmd_ticket_next_id(client: TrackerClient, _args: argparse.Namespace) -> tuple[int, Any]:
     return get(client, "/api/tickets/next-id")
 
@@ -226,6 +207,12 @@ def cmd_ticket_create(client: TrackerClient, args: argparse.Namespace) -> tuple[
     }
     if args.filename:
         payload["filename"] = args.filename
+    if args.workflow_id:
+        payload["workflow_id"] = args.workflow_id
+    if args.workflow_inputs_json:
+        payload["workflow_inputs"] = read_mapping(args.workflow_inputs_json, "Workflow inputs", (bool, str))
+    if args.stage_enabled_json:
+        payload["stage_enabled"] = read_mapping(args.stage_enabled_json, "Stage selection", (bool,))
     return post(client, "/api/tickets", payload)
 
 
@@ -275,6 +262,19 @@ def cmd_ticket_check_prs(client: TrackerClient, args: argparse.Namespace) -> tup
     return post(client, f"/api/tickets/{encoded(args.id)}/check-pull-requests", {})
 
 
+def cmd_ticket_decide(client: TrackerClient, args: argparse.Namespace) -> tuple[int, Any]:
+    return post(client, f"/api/tickets/{encoded(args.id)}/decide", {
+        "expected_revision": args.revision, "decision": args.decision,
+        **({"message": args.message} if args.message else {}),
+    })
+
+
+def cmd_ticket_migrate_workflow(client: TrackerClient, args: argparse.Namespace) -> tuple[int, Any]:
+    return post(client, f"/api/tickets/{encoded(args.id)}/workflow/migrate", {
+        "expected_revision": args.revision, "workflow_id": args.workflow_id, "node_id": args.node_id,
+    })
+
+
 def cmd_jira_import(client: TrackerClient, args: argparse.Namespace) -> tuple[int, Any]:
     return post(client, "/api/jira/import", {"key": args.key})
 
@@ -308,30 +308,16 @@ def build_parser() -> argparse.ArgumentParser:
     supervisor_commands = supervisor.add_subparsers(dest="supervisor_command", required=True)
     set_handler(supervisor_commands.add_parser("list", help="List supervisor health and reservations."), cmd_supervisor_list)
 
-    config = resources.add_parser("config", help="Inspect or update tracker configuration.")
+    config = resources.add_parser("config", help="Inspect tracker configuration for ticket authoring.")
     config_commands = config.add_subparsers(dest="config_command", required=True)
     set_handler(config_commands.add_parser("show", help="Show tracker configuration."), cmd_config_show)
-    config_update = config_commands.add_parser("update", help="Update providers, repositories, Jira, and GitHub settings from JSON.")
-    config_update.add_argument("--json-file", required=True, help="JSON object or prior config response; use - for stdin.")
-    add_revision(config_update)
-    set_handler(config_update, cmd_config_update)
 
-    prompt = resources.add_parser("prompt", help="Inspect, preview, or update centralized prompts.")
-    prompt_commands = prompt.add_subparsers(dest="prompt_command", required=True)
-    set_handler(prompt_commands.add_parser("list", help="List prompt descriptors and contents."), cmd_prompt_list)
-    prompt_show = prompt_commands.add_parser("show", help="Show one prompt.")
-    prompt_show.add_argument("name", choices=PROMPTS)
-    set_handler(prompt_show, cmd_prompt_show)
-    prompt_preview = prompt_commands.add_parser("preview", help="Render an unsaved prompt draft.")
-    prompt_preview.add_argument("name", choices=PROMPTS)
-    prompt_preview.add_argument("--phase", choices=PHASES, default="implementation")
-    add_text_input(prompt_preview, "content", "Prompt Markdown.")
-    set_handler(prompt_preview, cmd_prompt_preview)
-    prompt_update = prompt_commands.add_parser("update", help="Replace a prompt with optimistic revision checking.")
-    prompt_update.add_argument("name", choices=PROMPTS)
-    prompt_update.add_argument("--revision", required=True, help="Prompt content digest returned by prompt show/list.")
-    add_text_input(prompt_update, "content", "Prompt Markdown.")
-    set_handler(prompt_update, cmd_prompt_update)
+    workflow = resources.add_parser("workflow", help="Inspect workflow artifacts for ticket selection and controls.")
+    workflow_commands = workflow.add_subparsers(dest="workflow_command", required=True)
+    set_handler(workflow_commands.add_parser("list", help="List workflow artifacts."), cmd_workflow_list)
+    workflow_show = workflow_commands.add_parser("show", help="Show a workflow artifact.")
+    workflow_show.add_argument("id")
+    set_handler(workflow_show, cmd_workflow_show)
 
     jira = resources.add_parser("jira", help="Import a Jira issue as a tracker ticket draft.")
     jira_commands = jira.add_subparsers(dest="jira_command", required=True)
@@ -348,18 +334,29 @@ def build_parser() -> argparse.ArgumentParser:
     ticket_list.add_argument("--status", choices=("pending", "ready", "running", "blocked", "waiting_approval", "completed", "failed", "cancelled"))
     ticket_list.add_argument("--work-provider", choices=PROVIDERS)
     ticket_list.add_argument("--review-provider", choices=REVIEW_PROVIDERS)
+    ticket_list.add_argument("--workflow-id", help="Filter by pinned workflow artifact ID.")
+    ticket_list.add_argument("--workflow-node", help="Filter by displayed current-node name.")
+    ticket_list.add_argument("--workflow-stage", help="Filter by displayed current-stage name.")
+    ticket_list.add_argument("--provider", choices=PROVIDERS, help="Filter by the current node's resolved provider.")
     ticket_list.add_argument("--invalid-only", action="store_true")
     set_handler(ticket_list, cmd_ticket_list)
 
     ticket_show = ticket_commands.add_parser("show", help="Show authoritative Markdown and structured ticket state.")
     add_ticket_id(ticket_show)
     set_handler(ticket_show, cmd_ticket_show)
+    ticket_run_output = ticket_commands.add_parser("run-output", help="Read externally stored output for a recorded node run.")
+    add_ticket_id(ticket_run_output)
+    ticket_run_output.add_argument("run_id", help="Node run ID returned by ticket show.")
+    set_handler(ticket_run_output, cmd_ticket_run_output)
     set_handler(ticket_commands.add_parser("next-id", help="Preview the next tracker-local ID."), cmd_ticket_next_id)
 
     ticket_create = ticket_commands.add_parser("create", help="Create a ticket from Markdown.")
     ticket_create.add_argument("--markdown-file", required=True, help="Ticket Markdown path, or - for stdin.")
     ticket_create.add_argument("--auto-id", action="store_true", help="Replace the Markdown ID with an atomically allocated tracker ID.")
     ticket_create.add_argument("--filename", help="Optional storage filename hint.")
+    ticket_create.add_argument("--workflow-id", help="Optional workflow artifact to pin; otherwise the tracker uses standard-delivery.")
+    ticket_create.add_argument("--workflow-inputs-json", metavar="PATH", help="JSON object of declared workflow input values; use - for stdin.")
+    ticket_create.add_argument("--stage-enabled-json", metavar="PATH", help="JSON object mapping configurable stage IDs to booleans; use - for stdin.")
     set_handler(ticket_create, cmd_ticket_create)
 
     ticket_edit = ticket_commands.add_parser("edit", help="Replace authoritative ticket Markdown.")
@@ -370,9 +367,19 @@ def build_parser() -> argparse.ArgumentParser:
     ticket_edit.add_argument("--rewind-phase", choices=PHASES)
     set_handler(ticket_edit, cmd_ticket_edit)
 
+    ticket_decide = ticket_commands.add_parser("decide", help="Choose an outcome at the current human gate.")
+    add_ticket_id(ticket_decide); add_revision(ticket_decide)
+    ticket_decide.add_argument("decision")
+    ticket_decide.add_argument("--message")
+    set_handler(ticket_decide, cmd_ticket_decide)
+
+    ticket_migrate = ticket_commands.add_parser("migrate-workflow", help="Explicitly move a paused or interrupted ticket to a workflow revision/node.")
+    add_ticket_id(ticket_migrate); add_revision(ticket_migrate)
+    ticket_migrate.add_argument("workflow_id"); ticket_migrate.add_argument("node_id")
+    set_handler(ticket_migrate, cmd_ticket_migrate_workflow)
+
     for command, api_action, help_text in (
         ("ready", "ready", "Mark a pending valid ticket ready."),
-        ("approve-specification", "approve-specification", "Approve the specification gate."),
         ("retry", "retry", "Return failed or needs-attention work to ready."),
         ("release-supervisor", "release-supervisor", "Release inactive supervisor affinity."),
         ("archive", "archive", "Archive a completed ticket."),
@@ -388,7 +395,6 @@ def build_parser() -> argparse.ArgumentParser:
     for command, api_action, help_text in (
         ("comment", "comment", "Append durable operator context."),
         ("guidance", "guidance", "Persist and deliver guidance to active work."),
-        ("request-specification-changes", "request-specification-changes", "Return specification to ready with feedback."),
         ("cancel", "cancel", "Cancel a ticket with a reason."),
         ("fail", "fail", "Fail a ticket with a reason."),
     ):

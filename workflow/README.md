@@ -8,6 +8,8 @@ This directory packages the lightweight project workflow as one locally deployab
 
 The tracker and supervisor default to localhost communication. Agents retain their normal tools, credentials, and reasoning behavior; only explicit callbacks advance ticket phases.
 
+The current source snapshot includes the V3 workflow library, versioned graph editor, reusable prompt revisions, typed agent/gate/activity/terminal nodes, and deterministic supervisor-side Script activities. See [`SOURCE_REVISIONS.md`](SOURCE_REVISIONS.md) for the exact standalone commits incorporated into this copy.
+
 ## Local setup
 
 Requirements:

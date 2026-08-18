@@ -8,7 +8,7 @@ describe("SupervisorRegistry", () => {
     registry.heartbeat({
       supervisor_id: "vm-one", instance_id: "instance-one", hostname: "worker-one",
       ip_addresses: ["192.0.2.70"], project_root: "/srv/projects", herdr_session: "agents",
-      providers: ["claude", "codex"], started_at: new Date(time).toISOString(),
+      providers: ["claude", "codex"], activity_capabilities: ["repository_action", "inline_shell"], started_at: new Date(time).toISOString(),
     });
     const ticket = {
       id: "APT-1", title: "Pinned work", phase: "implementation", status: "waiting_approval",

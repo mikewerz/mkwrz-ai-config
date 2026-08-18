@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import request from "supertest";
@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { createApp } from "./app.js";
 import { TicketStore } from "./ticket-store.js";
 import { ticketMarkdown } from "./test-helpers.js";
+import { stringify } from "yaml";
 
 let root: string;
 let store: TicketStore;
@@ -45,6 +46,78 @@ describe("health endpoint", () => {
 });
 
 describe("tracker API", () => {
+  it("executes a custom activity, human gate, and agent node through declared outcomes", async () => {
+    const app = createApp(store, join(root, "missing-client"));
+    const workflow = {
+      version: 2, id: "factory-test", name: "Factory test", description: "Typed-node acceptance path", start: "verify", max_transitions: 10,
+      inputs: [], stages: [{ id: "work", name: "Work", phase: "implementation", skippable: false, default_enabled: true }, { id: "done", name: "Done", phase: "done", skippable: false, default_enabled: true }],
+      nodes: [
+        { id: "verify", name: "Verify repository", type: "script", phase: "implementation", stage: "work", repository: "primary", inline: { language: "javascript", code: "process.stdout.write('verified')" }, outcomes: [], choices: [], exit_codes: [{ id: "success", label: "Verified", description: "Verification passed.", target: "approval", codes: [0] }, { id: "failure", label: "Failed", description: "Verification failed.", target: "failed", default: true }] },
+        { id: "approval", name: "Human approval", type: "human_gate", phase: "implementation", stage: "work", outcomes: [], choices: [{ id: "approved", label: "Approve", description: "Continue delivery.", target: "deliver" }, { id: "rejected", label: "Reject", description: "Stop delivery.", target: "failed", comment_required: true }], exit_codes: [] },
+        { id: "deliver", name: "Deliver", type: "agent", phase: "implementation", stage: "work", prompt: "implementation", provider: "codex", conversation_key: "work", outcomes: [{ id: "completed", label: "Delivered", description: "Delivery is complete.", target: "done" }], choices: [], exit_codes: [] },
+        { id: "done", name: "Done", type: "terminal", phase: "done", stage: "done", terminal_status: "completed", outcomes: [], choices: [], exit_codes: [] },
+        { id: "failed", name: "Failed", type: "terminal", phase: "done", stage: "done", terminal_status: "failed", outcomes: [], choices: [], exit_codes: [] },
+      ],
+    };
+    await request(app).post("/api/workflows").send({ content: stringify(workflow) }).expect(201);
+    const created = await request(app).post("/api/tickets").send({ markdown: ticketMarkdown({ spec_required: false, review_required: false }), workflow_id: "factory-test" }).expect(201);
+    const seeded = await store.command("APT-0001", { event: "test.seed_losses", message: "Seed prior activity lease losses." }, (ticket) => {
+      ticket.workflow!.node_attempts.verify = { total: 2, consecutive_lease_losses: 2 }; return { ticket };
+    });
+    await request(app).post("/api/tickets/APT-0001/ready").send({ expected_revision: seeded.frontmatter!.revision }).expect(200);
+    await request(app).post("/api/work/claim-activity").send({ supervisor_id: "factory-vm", available_providers: ["claude"], activity_capabilities: ["inline_javascript"] }).expect(204);
+    const activity = await request(app).post("/api/work/claim-activity").send({ supervisor_id: "factory-vm", available_providers: ["codex"], activity_capabilities: ["inline_javascript"] }).expect(200);
+    expect(activity.body.workflow_node).toMatchObject({ id: "verify", type: "script", inline: { language: "javascript", code: "process.stdout.write('verified')" } });
+    const activityResult = await request(app).post(`/api/work/${activity.body.frontmatter.execution.lease_id}/activity-result`).send({ success: true, summary: "Verified", output: "ok", exit_code: 0 }).expect(200);
+    expect(activityResult.body.outcome).toBe("success");
+    const waiting = await request(app).get("/api/tickets/APT-0001").expect(200);
+    expect(waiting.body.frontmatter.workflow.node_attempts.verify.consecutive_lease_losses).toBe(0);
+    const activityRun = waiting.body.frontmatter.workflow.node_runs[0];
+    expect(activityRun).toMatchObject({ output: "ok", output_bytes: 2, output_sha256: expect.any(String), output_path: expect.any(String) });
+    expect((await request(app).get(`/api/tickets/APT-0001/runs/${activityRun.id}/output`).expect(200)).text).toBe("ok");
+    expect(waiting.body.frontmatter).toMatchObject({ status: "waiting_approval", workflow: { current_node: "approval" } });
+    await request(app).post("/api/tickets/APT-0001/decide").send({ expected_revision: waiting.body.frontmatter.revision, decision: "rejected" }).expect(422);
+    await request(app).post("/api/tickets/APT-0001/decide").send({ expected_revision: waiting.body.frontmatter.revision, decision: "approved" }).expect(200);
+    const assignment = await request(app).post("/api/work/claim").send({ supervisor_id: "factory-vm", provider: "codex", available_providers: ["codex"], activity_capabilities: ["inline_javascript"] }).expect(200);
+    expect(assignment.body).toMatchObject({ workflow_node: { id: "deliver", conversation_key: "work" }, node_prompt: { id: "implementation" } });
+    await request(app).post(`/api/work/${assignment.body.frontmatter.execution.lease_id}/complete`).send({ summary: "Delivered", handoff: "Ready for release notes.", outcome: "completed" }).expect(200);
+    const complete = await request(app).get("/api/tickets/APT-0001").expect(200);
+    expect(complete.body.frontmatter).toMatchObject({ phase: "done", status: "completed", workflow: { current_node: "done" } });
+    expect(complete.body.frontmatter.workflow.node_runs.map((run: { outcome: string }) => run.outcome)).toEqual(["success", "approved", "completed"]);
+    expect(complete.body.frontmatter.workflow).toMatchObject({ incoming: { source_node: "deliver", target_node: "done", outcome: "completed", handoff: "Ready for release notes." } });
+  }, 15_000);
+
+  it("uses an explicit node provider and conversation instead of legacy phase provider invariants", async () => {
+    const app = createApp(store, join(root, "missing-client"));
+    const workflow = {
+      version: 2, id: "explicit-provider", name: "Explicit provider", description: "Codex node on a Claude-default ticket", start: "work", max_transitions: 5,
+      inputs: [], stages: [{ id: "work", name: "Work", phase: "implementation", skippable: false, default_enabled: true }, { id: "done", name: "Done", phase: "done", skippable: false, default_enabled: true }],
+      nodes: [
+        { id: "work", name: "Codex work", type: "agent", phase: "implementation", stage: "work", prompt: "implementation", provider: "codex", conversation_key: "codex-work", pull_request_requirement: { scope: "any", phase: "implementation" }, outcomes: [{ id: "completed", label: "Complete", description: "Work is complete.", target: "done" }], choices: [], exit_codes: [] },
+        { id: "done", name: "Done", type: "terminal", phase: "done", stage: "done", terminal_status: "completed", outcomes: [], choices: [], exit_codes: [] },
+      ],
+    };
+    await request(app).post("/api/workflows").send({ content: stringify(workflow) }).expect(201);
+    await request(app).post("/api/tickets").send({ markdown: ticketMarkdown({ spec_required: false, review_required: false, work_provider: "claude" }), workflow_id: "explicit-provider" }).expect(201);
+    const seeded = await store.command("APT-0001", { event: "test.seed_wrong_provider", message: "Seed an incompatible prior conversation." }, (ticket) => {
+      ticket.conversations!["codex-work"] = { provider: "claude", herdr_pane_id: "old:pane", session_ref: "claude-session" };
+      return { ticket };
+    });
+    await request(app).post("/api/tickets/APT-0001/ready").send({ expected_revision: seeded.frontmatter!.revision }).expect(200);
+    await request(app).post("/api/work/claim").send({ supervisor_id: "vm", provider: "claude", available_providers: ["claude", "codex"] }).expect(204);
+    const claimed = await request(app).post("/api/work/claim").send({ supervisor_id: "vm", provider: "codex", available_providers: ["claude", "codex"] }).expect(200);
+    expect(claimed.body.frontmatter).toMatchObject({
+      work_provider: "claude", execution: { provider: "codex" },
+      conversations: { "codex-work": { provider: "codex", herdr_pane_id: null, session_ref: null } },
+    });
+    await request(app).post(`/api/work/${claimed.body.frontmatter.execution.lease_id}/heartbeat`).send({ pane_id: "w1:p1", session_ref: "codex-explicit" }).expect(200);
+    await request(app).post(`/api/work/${claimed.body.frontmatter.execution.lease_id}/complete`).send({ summary: "Completed", outcome: "completed" }).expect(422);
+    await request(app).post(`/api/work/${claimed.body.frontmatter.execution.lease_id}/complete`).send({
+      summary: "Completed", outcome: "completed", pull_requests: [{ repository: "demo", url: "https://github.com/example/demo/pull/17" }],
+    }).expect(200);
+    expect((await request(app).get("/api/tickets/APT-0001").expect(200)).body.frontmatter).toMatchObject({ status: "completed", workflow: { current_node: "done" } });
+  });
+
   it("admits the bundled agent-skill ticket template", async () => {
     const app = createApp(store, join(root, "missing-client"));
     const markdown = await readFile("skills/agentic-project-tracker/assets/ticket-template.md", "utf8");
@@ -59,7 +132,7 @@ describe("tracker API", () => {
   it("serves, previews, and revision-fences the central prompt library", async () => {
     const app = createApp(store, join(root, "missing-client"));
     const initial = await request(app).get("/api/prompts").expect(200);
-    expect(initial.body.prompts).toHaveLength(6);
+    expect(initial.body.prompts).toHaveLength(11);
     const implementation = initial.body.prompts.find((prompt: { name: string }) => prompt.name === "implementation");
     expect(implementation).toMatchObject({
       valid: true,
@@ -69,7 +142,7 @@ describe("tracker API", () => {
     const preview = await request(app).post("/api/prompts/implementation/preview").send({
       content: "Implement {{ticket_id}} and call {{callback_base}}complete.", phase: "implementation",
     }).expect(200);
-    expect(preview.body.rendered).toContain("You are assigned ticket AGENT-0042");
+    expect(preview.body.rendered).toContain("You own ticket AGENT-0042");
     expect(preview.body.rendered).toContain("Implement AGENT-0042");
 
     const updated = await request(app).put("/api/prompts/implementation").send({
@@ -80,6 +153,22 @@ describe("tracker API", () => {
     await request(app).put("/api/prompts/implementation").send({
       content: implementation.content, expected_revision: implementation.revision,
     }).expect(409);
+  });
+
+  it("refuses to publish a workflow that references an invalid prompt", async () => {
+    const app = createApp(store, join(root, "missing-client"));
+    await request(app).get("/api/prompts").expect(200);
+    await writeFile(join(root, "prompts", "broken-node.md"), "{{unknown_placeholder}}\n");
+    const workflow = {
+      version: 2, id: "broken-prompt-workflow", name: "Broken prompt workflow", description: "Must not publish", start: "work", max_transitions: 5,
+      inputs: [], stages: [{ id: "work", name: "Work", phase: "implementation", skippable: false, default_enabled: true }, { id: "done", name: "Done", phase: "done", skippable: false, default_enabled: true }],
+      nodes: [
+        { id: "work", name: "Work", type: "agent", phase: "implementation", stage: "work", prompt: "broken-node", provider: "work", conversation_key: "work", outcomes: [{ id: "completed", label: "Complete", description: "Finish.", target: "done" }], choices: [], exit_codes: [] },
+        { id: "done", name: "Done", type: "terminal", phase: "done", stage: "done", terminal_status: "completed", outcomes: [], choices: [], exit_codes: [] },
+      ],
+    };
+    const result = await request(app).post("/api/workflows").send({ content: stringify(workflow) }).expect(422);
+    expect(result.body.details).toContain("node work: prompt broken-node does not exist or is invalid");
   });
 
   it("allocates local ticket IDs from tracker configuration", async () => {
@@ -94,6 +183,16 @@ describe("tracker API", () => {
     const custom = await request(app).post("/api/tickets").send({ markdown: ticketMarkdown({ id: "TEAM-42" }), auto_id: false }).expect(201);
     expect(custom.body.frontmatter.id).toBe("TEAM-42");
     expect((await request(app).get("/api/config").expect(200)).body.config.tickets.next_number).toBe(3);
+  });
+
+  it("omits valid pre-workflow tickets from the V3 queue while retaining direct access", async () => {
+    const app = createApp(store, join(root, "missing-client"));
+    await store.create(ticketMarkdown({ id: "LEGACY-1" }));
+    expect((await request(app).get("/api/tickets").expect(200)).body.tickets).toEqual([]);
+    expect((await request(app).get("/api/tickets/LEGACY-1").expect(200)).body.frontmatter.id).toBe("LEGACY-1");
+
+    await request(app).post("/api/tickets").send({ markdown: ticketMarkdown({ id: "V3-1" }) }).expect(201);
+    expect((await request(app).get("/api/tickets").expect(200)).body.tickets).toMatchObject([{ id: "V3-1", workflow_id: "standard-delivery" }]);
   });
 
   it("serves and revision-fences the repository catalog", async () => {
@@ -127,13 +226,16 @@ describe("tracker API", () => {
     const presence = {
       supervisor_id: "vm-one", instance_id: "process-one", hostname: "worker-one",
       ip_addresses: ["192.0.2.70"], project_root: "/srv/projects/one", herdr_session: "agents-one",
-      providers: ["claude", "codex"], started_at: "2026-08-14T12:00:00Z",
+      providers: ["claude", "codex"], activity_capabilities: ["repository_action", "inline_shell", "inline_javascript", "inline_python"],
+      started_at: "2026-08-14T12:00:00Z",
     };
     await request(app).post("/api/supervisors/heartbeat").send(presence).expect(200);
     const health = await request(app).get("/api/supervisors").expect(200);
     expect(health.body.supervisors[0]).toMatchObject({
       supervisor_id: "vm-one", hostname: "worker-one", ip_addresses: ["192.0.2.70"],
-      project_root: "/srv/projects/one", providers: ["claude", "codex"], status: "online", assigned_ticket: null,
+      project_root: "/srv/projects/one", providers: ["claude", "codex"],
+      activity_capabilities: ["repository_action", "inline_shell", "inline_javascript", "inline_python"],
+      status: "online", assigned_ticket: null,
     });
     await request(app).post("/api/supervisors/heartbeat").send({ ...presence, instance_id: "process-two" }).expect(409);
   });
@@ -211,6 +313,49 @@ describe("tracker API", () => {
     expect(second.body.frontmatter.id).toBe("APT-0002");
   });
 
+  it("waits for active execution interruption before cancelling and releasing repository ownership", async () => {
+    const app = createApp(store, join(root, "missing-client"));
+    for (const id of ["APT-0001", "APT-0002"]) {
+      await request(app).post("/api/tickets").send({ markdown: ticketMarkdown({ id, spec_required: false, review_required: false }) }).expect(201);
+      await request(app).post(`/api/tickets/${id}/ready`).send({ expected_revision: 1 }).expect(200);
+    }
+    const first = await request(app).post("/api/work/claim").send({ supervisor_id: "vm", provider: "claude", available_providers: ["claude"] }).expect(200);
+    const lease = first.body.frontmatter.execution.lease_id as string;
+    const requested = await request(app).post("/api/tickets/APT-0001/cancel").send({
+      expected_revision: first.body.frontmatter.revision, message: "Stop this work.",
+    }).expect(200);
+    expect(requested.body.frontmatter).toMatchObject({
+      status: "running", assigned_supervisor: "vm",
+      execution: { lease_id: lease, interrupt_request: { terminal_status: "cancelled", terminal_reason: "Stop this work." } },
+    });
+    await request(app).post("/api/work/claim").send({ supervisor_id: "vm", provider: "claude", available_providers: ["claude"] }).expect(204);
+    const cancelled = await request(app).post(`/api/work/${lease}/interrupt-ack`).send({}).expect(200);
+    expect(cancelled.body.frontmatter).toMatchObject({ status: "cancelled", execution: null, assigned_supervisor: "vm" });
+    expect(cancelled.body.frontmatter.workflow.node_runs.find((run: { node_id: string }) => run.node_id === "implementation")).toMatchObject({ status: "interrupted", outcome: "operator_cancelled" });
+    const second = await request(app).post("/api/work/claim").send({ supervisor_id: "vm", provider: "claude", available_providers: ["claude"] }).expect(200);
+    expect(second.body.frontmatter.id).toBe("APT-0002");
+  });
+
+  it("resets only the current node's lease losses and preserves workflow bounds on retry", async () => {
+    const app = createApp(store, join(root, "missing-client"));
+    await request(app).post("/api/tickets").send({ markdown: ticketMarkdown({ spec_required: false, review_required: false }) }).expect(201);
+    let seeded = await store.command("APT-0001", { event: "test.block", message: "Seed retry state." }, (ticket) => {
+      ticket.status = "blocked";
+      ticket.workflow!.node_attempts.implementation = { total: 3, consecutive_lease_losses: 3 };
+      return { ticket };
+    });
+    const retried = await request(app).post("/api/tickets/APT-0001/retry").send({ expected_revision: seeded.frontmatter!.revision }).expect(200);
+    expect(retried.body.frontmatter).toMatchObject({ status: "ready", workflow: { node_attempts: { implementation: { consecutive_lease_losses: 0 } } } });
+
+    seeded = await store.command("APT-0001", { event: "test.bound", message: "Seed exceeded visit bound." }, (ticket) => {
+      ticket.status = "blocked";
+      ticket.workflow!.node_visits.implementation = 21;
+      return { ticket };
+    });
+    const bounded = await request(app).post("/api/tickets/APT-0001/retry").send({ expected_revision: seeded.frontmatter!.revision }).expect(409);
+    expect(bounded.body.error).toContain("exceeded its visit limit");
+  });
+
   it("requires lifecycle capabilities and explicitly clears machine-local sessions on release", async () => {
     const app = createApp(store, join(root, "missing-client"));
     await request(app).post("/api/tickets").send({ markdown: ticketMarkdown({ spec_required: false, review_required: true }) }).expect(201);
@@ -252,7 +397,7 @@ describe("tracker API", () => {
     await request(app).post("/api/tickets/APT-0001/approve-specification").send({ expected_revision: waiting.body.frontmatter.revision }).expect(200);
     const implementation = await request(app).post("/api/work/claim").send({ supervisor_id: "vm", provider: "claude" }).expect(200);
     const implementationLease = implementation.body.frontmatter.execution.lease_id as string;
-    await request(app).post(`/api/work/${implementationLease}/complete`).send({ summary: "Implemented", pull_requests: [] }).expect(200);
+    await request(app).post(`/api/work/${implementationLease}/complete`).send({ summary: "Implemented", pull_requests: [{ repository: "demo", url: "https://github.com/example/demo/pull/2" }] }).expect(200);
     const review = await request(app).post("/api/work/claim").send({ supervisor_id: "vm", provider: "codex" }).expect(200);
     const reviewLease = review.body.frontmatter.execution.lease_id as string;
     await request(app).post(`/api/work/${reviewLease}/complete`).send({ summary: "Approved", decision: "approved" }).expect(200);
@@ -266,8 +411,9 @@ describe("tracker API", () => {
     await request(app).post("/api/tickets/APT-0001/ready").send({ expected_revision: 1 }).expect(200);
     await request(app).post("/api/work/claim").send({ supervisor_id: "vm", provider: "claude", available_providers: ["claude", "codex"] }).expect(204);
     const work = await request(app).post("/api/work/claim").send({ supervisor_id: "vm", provider: "codex", available_providers: ["claude", "codex"] }).expect(200);
-    expect(work.body.frontmatter.agents.specification.provider).toBe("codex");
+    expect(work.body.frontmatter.agents.specification.provider).toBeNull();
     expect(work.body.frontmatter.agents.implementation.provider).toBe("codex");
+    expect(work.body.frontmatter.conversations.work.provider).toBe("codex");
     const workLease = work.body.frontmatter.execution.lease_id as string;
     await request(app).post(`/api/work/${workLease}/heartbeat`).send({ pane_id: "w1:p1", session_ref: "codex-work" }).expect(200);
     await request(app).post(`/api/work/${workLease}/complete`).send({
@@ -398,7 +544,7 @@ describe("tracker API", () => {
     const control = await request(app).get(`/api/work/${lease}/control`).expect(200);
     expect(control.body.interrupt).toMatchObject({ target_phase: "specification" });
     const acknowledged = await request(app).post(`/api/work/${lease}/interrupt-ack`).send({}).expect(200);
-    expect(acknowledged.body.frontmatter).toMatchObject({ phase: "specification", status: "ready", execution: null });
+    expect(acknowledged.body.frontmatter).toMatchObject({ phase: "specification", status: "ready", execution: null, workflow: { incoming: { source_node: "implementation", target_node: "specification", outcome: "operator_interrupt", actor: "operator" } } });
     await request(app).post(`/api/work/${lease}/heartbeat`).send({ observed_state: "working" }).expect(409);
   });
 
@@ -415,27 +561,27 @@ describe("tracker API", () => {
     let current = await request(app).get("/api/tickets/APT-0001").expect(200);
     await request(app).post("/api/tickets/APT-0001/request-specification-changes").send({ expected_revision: current.body.frontmatter.revision, message: "Cover rollback." }).expect(200);
     const spec2 = await request(app).post("/api/work/claim").send({ supervisor_id: "vm", provider: "claude" }).expect(200);
-    expect(spec2.body.frontmatter.agents.implementation.session_ref).toBe("claude-ticket-1");
+    expect(spec2.body.frontmatter.conversations.work.session_ref).toBe("claude-ticket-1");
     await request(app).post(`/api/work/${spec2.body.frontmatter.execution.lease_id}/complete`).send({ summary: "Updated specification", pull_requests: pr }).expect(200);
     current = await request(app).get("/api/tickets/APT-0001").expect(200);
     await request(app).post("/api/tickets/APT-0001/approve-specification").send({ expected_revision: current.body.frontmatter.revision }).expect(200);
 
     const implementation1 = await request(app).post("/api/work/claim").send({ supervisor_id: "vm", provider: "claude" }).expect(200);
-    expect(implementation1.body.frontmatter.agents.implementation.session_ref).toBe("claude-ticket-1");
+    expect(implementation1.body.frontmatter.conversations.work.session_ref).toBe("claude-ticket-1");
     await request(app).post(`/api/work/${implementation1.body.frontmatter.execution.lease_id}/complete`).send({ summary: "Implemented", pull_requests: pr }).expect(200);
     const review1 = await request(app).post("/api/work/claim").send({ supervisor_id: "vm", provider: "codex" }).expect(200);
     await request(app).post(`/api/work/${review1.body.frontmatter.execution.lease_id}/heartbeat`).send({ pane_id: "w2:p1", session_ref: "codex-review-1" }).expect(200);
     await request(app).post(`/api/work/${review1.body.frontmatter.execution.lease_id}/complete`).send({ summary: "Repair edge case.", decision: "changes_requested" }).expect(200);
 
     const implementation2 = await request(app).post("/api/work/claim").send({ supervisor_id: "vm", provider: "claude" }).expect(200);
-    expect(implementation2.body.frontmatter.agents.implementation.session_ref).toBe("claude-ticket-1");
+    expect(implementation2.body.frontmatter.conversations.work.session_ref).toBe("claude-ticket-1");
     await request(app).post(`/api/work/${implementation2.body.frontmatter.execution.lease_id}/complete`).send({ summary: "Repaired", pull_requests: pr }).expect(200);
     const review2 = await request(app).post("/api/work/claim").send({ supervisor_id: "vm", provider: "codex" }).expect(200);
     expect(review2.body.frontmatter.agents.review.session_ref).toBe("codex-review-1");
     await request(app).post(`/api/work/${review2.body.frontmatter.execution.lease_id}/complete`).send({ summary: "Approved", decision: "approved" }).expect(200);
     current = await request(app).get("/api/tickets/APT-0001").expect(200);
     expect(current.body.frontmatter).toMatchObject({ phase: "done", status: "completed" });
-  });
+  }, 15_000);
 
   it("accepts a batch of agent questions and resumes only after every answer", async () => {
     const app = createApp(store, join(root, "missing-client"));
