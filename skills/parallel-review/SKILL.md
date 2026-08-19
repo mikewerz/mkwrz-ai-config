@@ -109,13 +109,16 @@ Reviewers may report a serious cross-lane defect, but should otherwise stay focu
 
 ### Verification instructions
 
-Run safe, relevant checks using repository-documented commands where possible:
+Confirm verification is necessary. The trusted output of a prior verification run may already be present in the work specification.
+
+When necessary, run safe, relevant checks using repository-documented commands where possible:
 
 * Formatting or formatting verification
 * Compilation or build
 * Linting and static analysis
 * Unit tests
 * Relevant integration, API, contract, migration, or end-to-end tests
+* Relevant verify.sh scripts, which may include some or all of the above tests
 
 Prioritize checks that exercise changed behavior and affected contracts.
 
