@@ -1,9 +1,7 @@
 ---
-
 name: parallel-pr-review
 description: Perform an evidence-based review of a pull request, branch, commit range, patch, or code change using risk-directed parallel analysis. Use for requirements, correctness, compatibility, data integrity, security, reliability, performance, testing, and operational readiness.
----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
-
+---
 # Parallel PR Review
 
 Review the change as a staff-level engineer. Prioritize confirmed defects and material risks over stylistic preferences.
