@@ -1,5 +1,5 @@
-import { describe, expect, it, vi } from "vitest";
-import { HerdrController, agentName, resumeArguments, type CommandRunner } from "./herdr.js";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { HerdrController, agentName, launchArguments, resumeArguments, type CommandRunner } from "./herdr.js";
 
 class FakeRunner implements CommandRunner {
   calls: string[][] = [];
@@ -17,6 +17,8 @@ class FakeRunner implements CommandRunner {
 }
 
 describe("HerdrController", () => {
+  afterEach(() => vi.useRealTimers());
+
   it("creates a workspace without creating filesystem worktrees and starts an agent", async () => {
     const runner = new FakeRunner();
     const controller = new HerdrController(runner, "/srv/projects");
@@ -33,9 +35,82 @@ describe("HerdrController", () => {
   it("uses native provider resume syntax", () => {
     expect(resumeArguments("claude", "x")).toEqual(["--resume", "x"]);
     expect(resumeArguments("codex", "x")).toEqual(["resume", "x"]);
+    expect(launchArguments("codex", "session", "gpt-5.6-sol", "high")).toEqual(["resume", "session", "--model", "gpt-5.6-sol", "-c", 'model_reasoning_effort="high"']);
+    expect(launchArguments("claude", null, "claude-opus-4-6", "max")).toEqual(["--model", "claude-opus-4-6", "--effort", "max"]);
     expect(agentName("APT-123_really-long-ticket", "codex", "work")).toMatch(/^[a-z][a-z0-9_]{0,31}$/);
     expect(agentName("APT-123_really-long-ticket", "codex", "work")).not.toBe(agentName("APT-123_really-long-ticket-2", "codex", "work"));
     expect(agentName("APT-123_really-long-ticket", "codex", "work")).not.toBe(agentName("APT-123_really-long-ticket", "codex", "review"));
+  });
+
+  it("waits for a new macOS login-shell pane to accept the agent start", async () => {
+    vi.useFakeTimers();
+    let starts = 0;
+    const run = vi.fn(async (args: string[]) => {
+      if (args[0] === "workspace") return { result: { root_pane: { pane_id: "w1:p1" } } };
+      if (args[0] === "agent" && args[1] === "start" && ++starts < 3) {
+        throw Object.assign(new Error("pane shell is still starting"), {
+          stderr: '{"error":{"code":"agent_pane_busy"}}\n',
+        });
+      }
+      if (args[0] === "agent" && args[1] === "get") return { result: { agent: { agent_status: "working" } } };
+      return { result: {} };
+    });
+    const pending = new HerdrController({ run }, "/srv/projects").ensureAgent("APT-42", "claude", "work", null, null);
+
+    await vi.runAllTimersAsync();
+
+    await expect(pending).resolves.toMatchObject({ paneId: "w1:p1", state: "working" });
+    expect(run.mock.calls.filter(([args]) => args[0] === "agent" && args[1] === "start")).toHaveLength(3);
+  });
+
+  it("uses the same pane-busy retry when restoring an agent into a saved pane", async () => {
+    vi.useFakeTimers();
+    let observations = 0;
+    let starts = 0;
+    const run = vi.fn(async (args: string[]) => {
+      if (args[0] === "agent" && args[1] === "get") {
+        if (++observations === 1) throw new Error("saved pane has no attached agent");
+        return { result: { agent: { agent_status: "working", agent_session: { value: "session-1" } } } };
+      }
+      if (args[0] === "agent" && args[1] === "start" && ++starts === 1) {
+        throw Object.assign(new Error("pane shell is still starting"), {
+          stderr: 'diagnostic\n{"error":{"kind":"server","details":{"code":"agent_pane_busy"}}}\n',
+        });
+      }
+      return { result: {} };
+    });
+    const pending = new HerdrController({ run }, "/srv/projects").ensureAgent("APT-42", "claude", "work", "w9:p2", "session-1");
+
+    await vi.runAllTimersAsync();
+
+    await expect(pending).resolves.toMatchObject({ paneId: "w9:p2", sessionRef: "session-1" });
+    const startCalls = run.mock.calls.filter(([args]) => args[0] === "agent" && args[1] === "start");
+    expect(startCalls).toHaveLength(2);
+    expect(startCalls[1]?.[0]).toContain("--resume");
+  });
+
+  it("stops retrying pane-busy after ten seconds and does not retry other startup errors", async () => {
+    vi.useFakeTimers();
+    const busy = Object.assign(new Error("pane stayed busy"), { stderr: '{"error":{"code":"agent_pane_busy"}}\n' });
+    const busyRun = vi.fn(async (args: string[]) => {
+      if (args[0] === "workspace") return { result: { root_pane: { pane_id: "w1:p1" } } };
+      throw busy;
+    });
+    const busyResult = new HerdrController({ run: busyRun }, "/srv/projects")
+      .ensureAgent("APT-42", "claude", "work", null, null).catch((error) => error);
+
+    await vi.runAllTimersAsync();
+
+    expect(await busyResult).toBe(busy);
+    expect(busyRun.mock.calls.filter(([args]) => args[0] === "agent" && args[1] === "start")).toHaveLength(21);
+
+    const failure = Object.assign(new Error("agent cannot start"), { stderr: '{"error":{"code":"agent_not_running"}}\n' });
+    const failedRun = vi.fn(async (args: string[]) => {
+      if (args[0] === "workspace") return { result: { root_pane: { pane_id: "w2:p1" } } };
+      throw failure;
+    });
+    await expect(new HerdrController({ run: failedRun }, "/srv/projects").ensureAgent("APT-43", "codex", "work", null, null)).rejects.toBe(failure);
+    expect(failedRun.mock.calls.filter(([args]) => args[0] === "agent" && args[1] === "start")).toHaveLength(1);
   });
 
   it("confirms assignment activity and treats only Herdr's stalled result as ineffective", async () => {

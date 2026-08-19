@@ -2,16 +2,16 @@ import { createHash, randomUUID } from "node:crypto";
 import { mkdir, open, readFile, readdir, rename, rm, stat } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
 import { parse, stringify } from "yaml";
-import { HttpError, PROVIDERS, type ActivityCapability, type Phase, type Provider, type TicketFrontmatter, type WorkflowNodeRun } from "./domain.js";
+import { HttpError, PROVIDERS, type ActivityCapability, type JsonValue, type NodeTimingState, type Phase, type Provider, type ResolvedAgentProfile, type TicketFrontmatter, type WorkflowNodeRun, type WorkflowTransitionContext } from "./domain.js";
 
-export type WorkflowNodeType = "agent" | "script" | "human_gate" | "terminal";
+export type WorkflowNodeType = "agent" | "script" | "human_gate" | "read" | "write" | "workflow" | "fan_out" | "fan_in" | "terminal";
 export type ProviderSelector = Provider | "work" | "review";
 
 export interface WorkflowInputOption { value: string; label: string }
 export interface WorkflowInput {
   id: string;
   label: string;
-  type: "boolean" | "select";
+  type: "boolean" | "select" | "text";
   default: boolean | string;
   options?: WorkflowInputOption[];
 }
@@ -29,16 +29,31 @@ export interface WorkflowOutcome {
   label: string;
   description: string;
   target: string;
+  metric_class?: "success" | "failure" | "neutral";
 }
 export interface WorkflowChoice extends WorkflowOutcome { comment_required?: boolean }
 export interface WorkflowExitRoute extends WorkflowOutcome {
   codes?: number[];
   default?: boolean;
 }
+export interface WorkflowMetadataRoute extends WorkflowOutcome {
+  equals?: JsonValue;
+  default?: boolean;
+}
+export interface WorkflowScriptOutput {
+  persist_stdout: boolean;
+  prompt_tail_lines: number;
+}
 export type WorkflowInlineLanguage = "shell" | "python" | "javascript";
 export interface WorkflowInlineActivity {
   language: WorkflowInlineLanguage;
   code: string;
+}
+export type WorkflowPathBase = "selected_repository" | "primary_repository" | "project_root";
+export interface WorkflowPathReference {
+  relative_to: WorkflowPathBase;
+  path?: string;
+  path_input?: string;
 }
 export interface WorkflowGithubWatch {
   pull_request_phase: Exclude<Phase, "done"> | "all";
@@ -58,16 +73,31 @@ export interface WorkflowNode {
   stage: string;
   prompt?: string;
   provider?: ProviderSelector;
+  agent_profile?: string;
   conversation_key?: string;
   repository?: string;
+  script_file?: WorkflowPathReference;
+  working_directory?: WorkflowPathReference;
+  /** Legacy shorthand normalized to script_file + working_directory. */
   action?: string;
   inline?: WorkflowInlineActivity;
+  script_output?: WorkflowScriptOutput;
+  metadata_key?: string;
+  metadata_value?: JsonValue;
+  next?: string;
+  metadata_cases?: WorkflowMetadataRoute[];
+  workflow_id?: string;
+  status_codes?: WorkflowExitRoute[];
+  branches?: WorkflowOutcome[];
+  fan_in?: string;
+  inputs_from?: string[];
   github_watch?: WorkflowGithubWatch;
   pull_request_requirement?: WorkflowPullRequestRequirement;
   when?: WorkflowCondition;
   otherwise?: string;
   max_visits?: number;
   terminal_status?: "completed" | "failed" | "cancelled";
+  status_code?: number;
   outcomes: WorkflowOutcome[];
   choices: WorkflowChoice[];
   exit_codes: WorkflowExitRoute[];
@@ -98,6 +128,10 @@ export function workflowRoutes(node: WorkflowNode): WorkflowOutcome[] {
   if (node.type === "agent") return node.outcomes;
   if (node.type === "human_gate") return node.choices;
   if (node.type === "script") return node.exit_codes;
+  if (node.type === "read") return node.metadata_cases ?? [];
+  if (node.type === "workflow") return node.status_codes ?? [];
+  if (node.type === "fan_out") return node.branches ?? [];
+  if (node.type === "write" || node.type === "fan_in") return node.next ? [{ id: "completed", label: "Continue", description: "Continue to the next node.", target: node.next }] : [];
   return [];
 }
 
@@ -124,9 +158,35 @@ export function activityRoute(node: WorkflowNode, exitCode: number | null): Work
   return node.exit_codes.find((route) => route.default);
 }
 
+export function activeWorkflowIdentity(ticket: TicketFrontmatter): { id: string; revision: string } {
+  if (!ticket.workflow) throw new HttpError(409, "Ticket does not have a V3 workflow");
+  return {
+    id: ticket.workflow.active_workflow_id || ticket.workflow.id,
+    revision: ticket.workflow.active_workflow_revision || ticket.workflow.revision,
+  };
+}
+
+export function runtimeNodeKey(ticket: TicketFrontmatter, nodeId: string): string {
+  const active = activeWorkflowIdentity(ticket);
+  return active.id === ticket.workflow!.id ? nodeId : `${active.id}/${nodeId}`;
+}
+
+export function resolvedAgentProfile(ticket: TicketFrontmatter, node: WorkflowNode, workflowId?: string): ResolvedAgentProfile | null {
+  if (!ticket.workflow) return null;
+  const id = workflowId ?? activeWorkflowIdentity(ticket).id;
+  return ticket.workflow.resolved_agent_profiles?.[`${id}/${node.id}`] ?? null;
+}
+
 const SAFE_ID = /^[a-z][a-z0-9-]{0,63}$/;
 const SAFE_ROUTE_ID = /^[a-z][a-z0-9_-]{0,63}$/;
-const SAFE_ACTION = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+
+function portableRelativePath(value: string, allowCurrentDirectory: boolean): boolean {
+  const path = value.trim();
+  if (!path || path.includes("\0") || /[\r\n]/.test(path) || /^[\\/]/.test(path) || /^[A-Za-z]:[\\/]/.test(path)) return false;
+  const segments = path.split(/[\\/]+/);
+  if (segments.some((segment) => segment === "..")) return false;
+  return allowCurrentDirectory || segments.some((segment) => segment !== "." && segment !== "");
+}
 const digest = (content: string) => createHash("sha256").update(content).digest("hex");
 
 export const STANDARD_WORKFLOW: WorkflowDefinition = {
@@ -236,7 +296,9 @@ export const DEV_ONLY_WORKFLOW: WorkflowDefinition = {
     },
     {
       id: "completion-callback", name: "Run completion callback", type: "script", phase: "implementation", stage: "callback",
-      repository: "primary", action: "callback", max_visits: 3,
+      repository: "primary",
+      script_file: { path: ".agents/actions/callback.sh", relative_to: "selected_repository" },
+      working_directory: { path: ".", relative_to: "selected_repository" }, max_visits: 3,
       outcomes: [], choices: [], exit_codes: [
         { id: "success", label: "Callback succeeded", description: "The repository callback exited successfully.", target: "done", codes: [0] },
         { id: "failure", label: "Callback failed", description: "The repository callback failed or could not run.", target: "failed", default: true },
@@ -331,6 +393,19 @@ export const END_TO_END_WORKFLOW: WorkflowDefinition = {
   ],
 };
 
+const PRE_METRICS_DEFAULTS = new Map<string, WorkflowDefinition>([
+  [STANDARD_WORKFLOW.id, structuredClone(STANDARD_WORKFLOW)],
+  [DEV_ONLY_WORKFLOW.id, structuredClone(DEV_ONLY_WORKFLOW)],
+  [END_TO_END_WORKFLOW.id, structuredClone(END_TO_END_WORKFLOW)],
+]);
+
+const FAILURE_METRIC_OUTCOMES = new Set(["changes_requested", "failure", "failed", "validation_failed", "deployment_failed"]);
+for (const definition of [STANDARD_WORKFLOW, DEV_ONLY_WORKFLOW, END_TO_END_WORKFLOW]) {
+  for (const node of definition.nodes) for (const route of workflowRoutes(node)) {
+    route.metric_class = FAILURE_METRIC_OUTCOMES.has(route.id) ? "failure" : "success";
+  }
+}
+
 export const DEFAULT_WORKFLOWS = [STANDARD_WORKFLOW, DEV_ONLY_WORKFLOW, END_TO_END_WORKFLOW] as const;
 
 const PRE_CORRECTNESS_STANDARD_WORKFLOW = structuredClone(STANDARD_WORKFLOW);
@@ -390,6 +465,9 @@ function normalizeOutcome(item: unknown, fallbackId = ""): WorkflowOutcome {
     label: typeof value.label === "string" && value.label.trim() ? value.label : labelFor(id),
     description: typeof value.description === "string" && value.description.trim() ? value.description : `${labelFor(id)} outcome.`,
     target: typeof value.target === "string" ? value.target : "",
+    ...(typeof value.metric_class === "string"
+      ? { metric_class: value.metric_class as NonNullable<WorkflowOutcome["metric_class"]> }
+      : {}),
   };
 }
 
@@ -410,7 +488,7 @@ function normalizeDefinition(value: unknown): WorkflowDefinition {
   }) : phases.map((phase) => ({ id: phase, name: labelFor(phase), phase, skippable: false, default_enabled: true }));
   const inputs: WorkflowInput[] = Array.isArray(value.inputs) ? value.inputs.map((item) => {
     const input = record(item) ? item : {};
-    const type = input.type === "select" ? "select" : "boolean";
+    const type = input.type === "select" || input.type === "text" ? input.type : "boolean";
     return {
       id: typeof input.id === "string" ? input.id : "",
       label: typeof input.label === "string" ? input.label : "",
@@ -446,6 +524,23 @@ function normalizeDefinition(value: unknown): WorkflowDefinition {
       { id: "success", label: "Success", description: "The action exited with code 0.", target: legacyOn.success ?? "", codes: [0] },
       { id: "failure", label: "Failure", description: "The action exited non-zero or could not run.", target: legacyOn.failure ?? "", default: true },
     ] : [];
+    const metadataCases = Array.isArray(node.metadata_cases) ? node.metadata_cases.map((route) => {
+      const normalized = normalizeOutcome(route);
+      return {
+        ...normalized,
+        ...(record(route) && "equals" in route ? { equals: route.equals as JsonValue } : {}),
+        ...(record(route) && route.default === true ? { default: true } : {}),
+      };
+    }) : [];
+    const statusCodes = Array.isArray(node.status_codes) ? node.status_codes.map((route) => {
+      const normalized = normalizeOutcome(route);
+      return {
+        ...normalized,
+        ...(record(route) && Array.isArray(route.codes) ? { codes: route.codes.map(Number) } : {}),
+        ...(record(route) && route.default === true ? { default: true } : {}),
+      };
+    }) : [];
+    const branches = Array.isArray(node.branches) ? node.branches.map((route) => normalizeOutcome(route)) : [];
     return {
       id: typeof node.id === "string" ? node.id : "",
       name: typeof node.name === "string" ? node.name : "",
@@ -454,12 +549,34 @@ function normalizeDefinition(value: unknown): WorkflowDefinition {
       stage: typeof node.stage === "string" ? node.stage : phase,
       ...(typeof node.prompt === "string" ? { prompt: node.prompt } : {}),
       ...(typeof node.provider === "string" ? { provider: node.provider as ProviderSelector } : {}),
+      ...(typeof node.agent_profile === "string" ? { agent_profile: node.agent_profile } : {}),
       ...(typeof node.conversation_key === "string" ? { conversation_key: node.conversation_key } : {}),
       ...(typeof node.repository === "string" ? { repository: node.repository } : {}),
-      ...(typeof node.action === "string" ? { action: node.action } : {}),
+      ...(record(node.script_file) ? { script_file: {
+        relative_to: (typeof node.script_file.relative_to === "string" ? node.script_file.relative_to : "selected_repository") as WorkflowPathBase,
+        ...(typeof node.script_file.path === "string" ? { path: node.script_file.path } : {}),
+        ...(typeof node.script_file.path_input === "string" ? { path_input: node.script_file.path_input } : {}),
+      } } : typeof node.action === "string" ? { script_file: {
+        relative_to: "selected_repository" as const, path: `.agents/actions/${node.action}.sh`,
+      } } : {}),
+      ...(record(node.working_directory) ? { working_directory: {
+        relative_to: (typeof node.working_directory.relative_to === "string" ? node.working_directory.relative_to : "selected_repository") as WorkflowPathBase,
+        ...(typeof node.working_directory.path === "string" ? { path: node.working_directory.path } : {}),
+        ...(typeof node.working_directory.path_input === "string" ? { path_input: node.working_directory.path_input } : {}),
+      } } : type === "script" ? { working_directory: { relative_to: "selected_repository" as const, path: "." } } : {}),
       ...(record(node.inline) && typeof node.inline.code === "string" && typeof node.inline.language === "string"
         ? { inline: { language: node.inline.language as WorkflowInlineLanguage, code: node.inline.code } }
         : {}),
+      ...(record(node.script_output) ? { script_output: {
+        persist_stdout: node.script_output.persist_stdout === true,
+        prompt_tail_lines: Number.isInteger(node.script_output.prompt_tail_lines) ? Number(node.script_output.prompt_tail_lines) : 0,
+      } } : {}),
+      ...(typeof node.metadata_key === "string" ? { metadata_key: node.metadata_key } : {}),
+      ...("metadata_value" in node ? { metadata_value: node.metadata_value as JsonValue } : {}),
+      ...(typeof node.next === "string" ? { next: node.next } : {}),
+      ...(typeof node.workflow_id === "string" ? { workflow_id: node.workflow_id } : {}),
+      ...(typeof node.fan_in === "string" ? { fan_in: node.fan_in } : {}),
+      ...(Array.isArray(node.inputs_from) ? { inputs_from: node.inputs_from.map(String) } : {}),
       ...(record(node.github_watch) && typeof node.github_watch.pull_request_phase === "string"
         ? { github_watch: {
           pull_request_phase: node.github_watch.pull_request_phase as Exclude<Phase, "done"> | "all",
@@ -476,9 +593,13 @@ function normalizeDefinition(value: unknown): WorkflowDefinition {
       ...(typeof node.otherwise === "string" ? { otherwise: node.otherwise } : typeof legacyOn.skipped === "string" ? { otherwise: legacyOn.skipped } : {}),
       ...(Number.isInteger(node.max_visits) ? { max_visits: Number(node.max_visits) } : {}),
       ...(typeof node.terminal_status === "string" ? { terminal_status: node.terminal_status as NonNullable<WorkflowNode["terminal_status"]> } : {}),
+      ...(Number.isInteger(node.status_code) ? { status_code: Number(node.status_code) } : {}),
       outcomes,
       choices,
       exit_codes: exitCodes,
+      metadata_cases: metadataCases,
+      status_codes: statusCodes,
+      branches,
     };
   }) : [];
   return {
@@ -494,7 +615,7 @@ function normalizeDefinition(value: unknown): WorkflowDefinition {
   };
 }
 
-export function validateWorkflow(definition: WorkflowDefinition, promptIds?: Set<string>): string[] {
+export function validateWorkflow(definition: WorkflowDefinition, promptIds?: Set<string>, workflowIds?: Set<string>, agentProfileIds?: Set<string>): string[] {
   const errors: string[] = [];
   if (!SAFE_ID.test(definition.id)) errors.push("id must be a lowercase artifact id");
   if (!definition.name.trim()) errors.push("name must be non-empty");
@@ -503,17 +624,18 @@ export function validateWorkflow(definition: WorkflowDefinition, promptIds?: Set
   const ids = definition.nodes.map((node) => node.id);
   if (new Set(ids).size !== ids.length) errors.push("node ids must be unique");
   if (!ids.includes(definition.start)) errors.push("start must reference a node");
-  const validTypes: WorkflowNodeType[] = ["agent", "script", "human_gate", "terminal"];
+  const validTypes: WorkflowNodeType[] = ["agent", "script", "human_gate", "read", "write", "workflow", "fan_out", "fan_in", "terminal"];
   const validPhases: Phase[] = ["specification", "implementation", "review", "done"];
   const stageIds = definition.stages.map((stage) => stage.id);
   const inputIds = definition.inputs.map((input) => input.id);
-  const conversationProviders = new Map<string, ProviderSelector>();
+  const conversationProviders = new Map<string, string>();
   if (new Set(stageIds).size !== stageIds.length) errors.push("stage ids must be unique");
   if (new Set(inputIds).size !== inputIds.length) errors.push("input ids must be unique");
   for (const input of definition.inputs) {
     if (!SAFE_ID.test(input.id)) errors.push(`input ${input.id || "<missing>"}: id must be a lowercase artifact id`);
     if (!input.label.trim()) errors.push(`input ${input.id}: label must be non-empty`);
     if (input.type === "boolean" && typeof input.default !== "boolean") errors.push(`input ${input.id}: boolean default is required`);
+    if (input.type === "text" && typeof input.default !== "string") errors.push(`input ${input.id}: text default is required`);
     if (input.type === "select") {
       if (!input.options?.length) errors.push(`input ${input.id}: select options are required`);
       if (!input.options?.some((option) => option.value === input.default)) errors.push(`input ${input.id}: default must match an option`);
@@ -548,23 +670,27 @@ export function validateWorkflow(definition: WorkflowDefinition, promptIds?: Set
     }
     if (node.otherwise && !ids.includes(node.otherwise)) errors.push(`node ${node.id}: otherwise targets missing node ${node.otherwise}`);
     if (node.max_visits !== undefined && (!Number.isInteger(node.max_visits) || node.max_visits < 1 || node.max_visits > 100)) errors.push(`node ${node.id}: max_visits must be between 1 and 100`);
-    const routes = node.type === "agent" ? node.outcomes : node.type === "human_gate" ? node.choices : node.type === "script" ? node.exit_codes : [];
+    const routes = workflowRoutes(node);
     if (new Set(routes.map((route) => route.id)).size !== routes.length) errors.push(`node ${node.id}: route ids must be unique`);
     for (const route of routes) {
       if (!SAFE_ROUTE_ID.test(route.id)) errors.push(`node ${node.id}: route ${route.id || "<missing>"} must use lowercase letters, numbers, hyphens, or underscores`);
       if (!route.label.trim()) errors.push(`node ${node.id}: route ${route.id} needs a label`);
       if (!route.description.trim()) errors.push(`node ${node.id}: route ${route.id} needs a description`);
       if (!ids.includes(route.target)) errors.push(`node ${node.id}: route ${route.id} targets missing node ${route.target}`);
+      if (route.metric_class !== undefined && !["success", "failure", "neutral"].includes(route.metric_class)) errors.push(`node ${node.id}: route ${route.id} has an invalid metric_class`);
     }
     if (node.type === "agent") {
       if (!node.prompt || !SAFE_ID.test(node.prompt)) errors.push(`node ${node.id}: agent prompt is required`);
       if (node.prompt && promptIds && !promptIds.has(node.prompt)) errors.push(`node ${node.id}: prompt ${node.prompt} does not exist or is invalid`);
-      if (!node.provider || ![...PROVIDERS, "work", "review"].includes(node.provider)) errors.push(`node ${node.id}: agent provider must be work, review, claude, or codex`);
+      if (!node.agent_profile && (!node.provider || ![...PROVIDERS, "work", "review"].includes(node.provider))) errors.push(`node ${node.id}: agent_profile or a legacy provider selector is required`);
+      if (node.agent_profile && !SAFE_ID.test(node.agent_profile)) errors.push(`node ${node.id}: agent_profile must be a lowercase artifact id`);
+      if (node.agent_profile && agentProfileIds && !agentProfileIds.has(node.agent_profile)) errors.push(`node ${node.id}: agent profile ${node.agent_profile} does not exist`);
       if (!node.conversation_key || !SAFE_ID.test(node.conversation_key)) errors.push(`node ${node.id}: conversation_key is required`);
-      if (node.conversation_key && node.provider) {
+      if (node.conversation_key) {
+        const selector = node.agent_profile ? `profile:${node.agent_profile}` : node.provider;
         const priorProvider = conversationProviders.get(node.conversation_key);
-        if (priorProvider && priorProvider !== node.provider) errors.push(`node ${node.id}: conversation ${node.conversation_key} is already assigned to provider selector ${priorProvider}`);
-        else conversationProviders.set(node.conversation_key, node.provider);
+        if (selector && priorProvider && priorProvider !== selector) errors.push(`node ${node.id}: conversation ${node.conversation_key} is already assigned to provider selector ${priorProvider}`);
+        else if (selector) conversationProviders.set(node.conversation_key, selector);
       }
       if (!node.outcomes.length) errors.push(`node ${node.id}: agent needs an outcome`);
       if (node.pull_request_requirement) {
@@ -574,8 +700,18 @@ export function validateWorkflow(definition: WorkflowDefinition, promptIds?: Set
     } else if (node.pull_request_requirement) errors.push(`node ${node.id}: only agent nodes may require pull requests`);
     if (node.type === "script") {
       if (!node.repository?.trim()) errors.push(`node ${node.id}: repository is required`);
-      if (Boolean(node.action) === Boolean(node.inline)) errors.push(`node ${node.id}: define exactly one repository action or inline activity`);
-      if (node.action && !SAFE_ACTION.test(node.action)) errors.push(`node ${node.id}: action must be a safe action name`);
+      if (Boolean(node.script_file) === Boolean(node.inline)) errors.push(`node ${node.id}: define exactly one script file or inline activity`);
+      if (!node.working_directory) errors.push(`node ${node.id}: working_directory is required`);
+      for (const [field, reference] of [["script_file", node.script_file], ["working_directory", node.working_directory]] as const) {
+        if (!reference) continue;
+        if (!["selected_repository", "primary_repository", "project_root"].includes(reference.relative_to)) errors.push(`node ${node.id}: ${field}.relative_to is invalid`);
+        if (Boolean(reference.path) === Boolean(reference.path_input)) errors.push(`node ${node.id}: ${field} must define exactly one path or path_input`);
+        if (reference.path !== undefined && !portableRelativePath(reference.path, field === "working_directory")) errors.push(`node ${node.id}: ${field}.path must be a contained relative path`);
+        if (reference.path_input) {
+          const input = definition.inputs.find((candidate) => candidate.id === reference.path_input);
+          if (!input || input.type === "boolean") errors.push(`node ${node.id}: ${field}.path_input must reference a text or select input`);
+        }
+      }
       if (node.inline && !["shell", "python", "javascript"].includes(node.inline.language)) errors.push(`node ${node.id}: inline language must be shell, python, or javascript`);
       if (node.inline && !node.inline.code.trim()) errors.push(`node ${node.id}: inline code must be non-empty`);
       if (!node.exit_codes.some((route) => route.codes?.includes(0))) errors.push(`node ${node.id}: activities require an exit-code 0 route`);
@@ -584,6 +720,50 @@ export function validateWorkflow(definition: WorkflowDefinition, promptIds?: Set
       const explicitCodes = node.exit_codes.flatMap((route) => route.codes ?? []);
       if (explicitCodes.some((code) => !Number.isInteger(code) || code < 0 || code > 255)) errors.push(`node ${node.id}: exit codes must be integers from 0 to 255`);
       if (new Set(explicitCodes).size !== explicitCodes.length) errors.push(`node ${node.id}: exit codes cannot be routed more than once`);
+      if (node.script_output && (!Number.isInteger(node.script_output.prompt_tail_lines) || node.script_output.prompt_tail_lines < 0 || node.script_output.prompt_tail_lines > 500)) errors.push(`node ${node.id}: prompt_tail_lines must be between 0 and 500`);
+    }
+    if (node.type === "read") {
+      if (!node.metadata_key || !/^[A-Za-z][A-Za-z0-9_.-]{0,127}$/.test(node.metadata_key)) errors.push(`node ${node.id}: metadata_key is required`);
+      if (!node.metadata_cases?.length) errors.push(`node ${node.id}: read nodes require metadata cases`);
+      if (node.metadata_cases?.filter((route) => route.default).length !== 1) errors.push(`node ${node.id}: read nodes require exactly one default case`);
+      if (node.metadata_cases?.some((route) => route.default && "equals" in route)) errors.push(`node ${node.id}: default metadata case cannot define equals`);
+      const values = node.metadata_cases?.filter((route) => !route.default).map((route) => JSON.stringify(route.equals)) ?? [];
+      if (new Set(values).size !== values.length) errors.push(`node ${node.id}: metadata case values must be unique`);
+    }
+    if (node.type === "write") {
+      if (!node.metadata_key || !/^[A-Za-z][A-Za-z0-9_.-]{0,127}$/.test(node.metadata_key)) errors.push(`node ${node.id}: metadata_key is required`);
+      if (!("metadata_value" in node)) errors.push(`node ${node.id}: metadata_value is required`);
+      if (!node.next || !ids.includes(node.next)) errors.push(`node ${node.id}: write nodes require a valid next target`);
+    }
+    if (node.type === "workflow") {
+      if (!node.workflow_id || !SAFE_ID.test(node.workflow_id)) errors.push(`node ${node.id}: workflow_id is required`);
+      if (node.workflow_id === definition.id) errors.push(`node ${node.id}: a workflow cannot call itself`);
+      if (node.workflow_id && workflowIds && !workflowIds.has(node.workflow_id)) errors.push(`node ${node.id}: workflow ${node.workflow_id} does not exist`);
+      if (!node.status_codes?.length) errors.push(`node ${node.id}: workflow nodes require status-code routes`);
+      if (node.status_codes?.filter((route) => route.default).length !== 1) errors.push(`node ${node.id}: workflow nodes require exactly one default route`);
+      const explicitCodes = node.status_codes?.flatMap((route) => route.codes ?? []) ?? [];
+      if (explicitCodes.some((code) => !Number.isInteger(code) || code < 0 || code > 255)) errors.push(`node ${node.id}: workflow status codes must be integers from 0 to 255`);
+      if (new Set(explicitCodes).size !== explicitCodes.length) errors.push(`node ${node.id}: workflow status codes cannot be routed more than once`);
+    }
+    if (node.type === "fan_out") {
+      if (!node.branches || node.branches.length < 2) errors.push(`node ${node.id}: fan-out nodes require at least two branches`);
+      if (!node.fan_in || definition.nodes.find((candidate) => candidate.id === node.fan_in)?.type !== "fan_in") errors.push(`node ${node.id}: fan_in must reference a fan-in node`);
+      if (node.fan_in) for (const branch of node.branches ?? []) {
+        const seen = new Set<string>();
+        const reachesJoin = (target: string): boolean => {
+          if (target === node.fan_in) return true;
+          if (seen.has(target)) return false;
+          seen.add(target);
+          const candidate = definition.nodes.find((item) => item.id === target);
+          return Boolean(candidate && workflowTargets(candidate, definition).some(reachesJoin));
+        };
+        if (!reachesJoin(branch.target)) errors.push(`node ${node.id}: branch ${branch.id} cannot reach fan-in node ${node.fan_in}`);
+      }
+    }
+    if (node.type === "fan_in") {
+      if (!node.next || !ids.includes(node.next)) errors.push(`node ${node.id}: fan-in nodes require a valid next target`);
+      const sources = definition.nodes.filter((candidate) => candidate.type === "fan_out" && candidate.fan_in === node.id);
+      if (!sources.length) errors.push(`node ${node.id}: fan-in node is not referenced by a fan-out node`);
     }
     if (node.type === "human_gate") {
       if (node.choices.length < 1) errors.push(`node ${node.id}: human gate needs a choice`);
@@ -602,6 +782,7 @@ export function validateWorkflow(definition: WorkflowDefinition, promptIds?: Set
     if (node.type === "terminal") {
       if (!node.terminal_status || !["completed", "failed", "cancelled"].includes(node.terminal_status)) errors.push(`node ${node.id}: terminal_status is required`);
       if (node.outcomes.length || node.choices.length || node.exit_codes.length || node.otherwise) errors.push(`node ${node.id}: terminal nodes cannot have edges`);
+      if (!Number.isInteger(node.status_code ?? 0) || (node.status_code ?? 0) < 0 || (node.status_code ?? 0) > 255) errors.push(`node ${node.id}: status_code must be an integer from 0 to 255`);
     }
   }
   if (ids.includes(definition.start)) {
@@ -656,7 +837,7 @@ export class WorkflowLibrary {
         }
         let current = await readFile(path, "utf8");
         await this.archive(definition.id, digest(current), current);
-        if (current === normalizedContent(PREVIOUS_DEFAULTS.get(definition.id)!)) {
+        if (current === normalizedContent(PREVIOUS_DEFAULTS.get(definition.id)!) || current === normalizedContent(PRE_METRICS_DEFAULTS.get(definition.id)!)) {
           current = normalizedContent(definition);
           await atomicWrite(path, current);
           await this.archive(definition.id, digest(current), current);
@@ -684,10 +865,10 @@ export class WorkflowLibrary {
     }
   }
 
-  private document(content: string, promptIds?: Set<string>): WorkflowDocument {
+  private document(content: string, promptIds?: Set<string>, workflowIds?: Set<string>, agentProfileIds?: Set<string>): WorkflowDocument {
     let definition: WorkflowDefinition;
     let errors: string[] = [];
-    try { definition = normalizeDefinition(parse(content)); errors = validateWorkflow(definition, promptIds); }
+    try { definition = normalizeDefinition(parse(content)); errors = validateWorkflow(definition, promptIds, workflowIds, agentProfileIds); }
     catch (error) {
       definition = { version: 2, id: "invalid", name: "Invalid workflow", description: "", start: "", max_transitions: 50, inputs: [], stages: [], nodes: [] };
       errors = [(error as Error).message];
@@ -723,10 +904,10 @@ export class WorkflowLibrary {
     }
   }
 
-  async save(content: string, expectedRevision?: string, promptIds?: Set<string>): Promise<WorkflowDocument> {
+  async save(content: string, expectedRevision?: string, promptIds?: Set<string>, workflowIds?: Set<string>, agentProfileIds?: Set<string>): Promise<WorkflowDocument> {
     await this.start();
     return this.serial(async () => {
-      const document = this.document(content, promptIds);
+      const document = this.document(content, promptIds, workflowIds, agentProfileIds);
       if (!document.valid) throw new HttpError(422, "Workflow is invalid", document.errors);
       const normalized = normalizedContent(document.definition);
       const next = this.document(normalized);
@@ -751,8 +932,10 @@ export function workflowNode(definition: WorkflowDefinition, id: string): Workfl
   return node;
 }
 
-export function resolveNodeProvider(ticket: TicketFrontmatter, node: WorkflowNode): Provider | null {
+export function resolveNodeProvider(ticket: TicketFrontmatter, node: WorkflowNode, workflowId?: string): Provider | null {
   if (node.type !== "agent") return null;
+  const profile = resolvedAgentProfile(ticket, node, workflowId);
+  if (profile) return profile.provider;
   if (node.provider === "work") return ticket.work_provider;
   if (node.provider === "review") return ticket.review_provider;
   return PROVIDERS.includes(node.provider as Provider) ? node.provider as Provider : null;
@@ -760,7 +943,7 @@ export function resolveNodeProvider(ticket: TicketFrontmatter, node: WorkflowNod
 
 export function requiredActivityCapability(node: WorkflowNode): ActivityCapability | null {
   if (node.type !== "script") return null;
-  if (node.action) return "repository_action";
+  if (node.script_file || node.action) return "repository_action";
   if (node.inline?.language === "shell") return "inline_shell";
   if (node.inline?.language === "javascript") return "inline_javascript";
   if (node.inline?.language === "python") return "inline_python";
@@ -770,8 +953,9 @@ export function requiredActivityCapability(node: WorkflowNode): ActivityCapabili
 export function nodeAttemptCounter(ticket: TicketFrontmatter, nodeId?: string): { total: number; consecutive_lease_losses: number } {
   if (ticket.workflow && nodeId) {
     ticket.workflow.node_attempts ??= {};
-    ticket.workflow.node_attempts[nodeId] ??= { total: 0, consecutive_lease_losses: 0 };
-    return ticket.workflow.node_attempts[nodeId]!;
+    const key = runtimeNodeKey(ticket, nodeId);
+    ticket.workflow.node_attempts[key] ??= { total: 0, consecutive_lease_losses: 0 };
+    return ticket.workflow.node_attempts[key]!;
   }
   if (ticket.phase === "done") throw new HttpError(409, "Terminal tickets cannot start work attempts");
   return ticket.attempts[ticket.phase];
@@ -801,11 +985,33 @@ export function initializeWorkflow(
   ticket: TicketFrontmatter,
   document: WorkflowDocument,
   promptRevisions: Record<string, string> = {},
-  selections: { inputs?: Record<string, boolean | string>; stage_enabled?: Record<string, boolean> } = {},
+  selections: {
+    inputs?: Record<string, boolean | string>; stage_enabled?: Record<string, boolean>;
+    workflow_revisions?: Record<string, string>; resolved_agent_profiles?: Record<string, ResolvedAgentProfile>;
+  } = {},
 ): void {
   if (!document.valid) throw new HttpError(422, "Cannot assign an invalid workflow", document.errors);
+  const now = new Date().toISOString();
   const initialStatus = ticket.status;
-  const inputs = Object.fromEntries(document.definition.inputs.map((input) => [input.id, selections.inputs?.[input.id] ?? input.default]));
+  const suppliedInputs = selections.inputs ?? {};
+  const unknownInputs = Object.keys(suppliedInputs).filter((id) => !document.definition.inputs.some((input) => input.id === id));
+  if (unknownInputs.length) throw new HttpError(422, `Unknown workflow input${unknownInputs.length === 1 ? "" : "s"}: ${unknownInputs.join(", ")}`);
+  const inputs = Object.fromEntries(document.definition.inputs.map((input) => {
+    const selected = suppliedInputs[input.id] ?? input.default;
+    if (input.type === "boolean" && typeof selected !== "boolean") throw new HttpError(422, `Workflow input ${input.id} must be boolean`);
+    if ((input.type === "text" || input.type === "select") && typeof selected !== "string") throw new HttpError(422, `Workflow input ${input.id} must be text`);
+    if (input.type === "select" && !input.options?.some((option) => option.value === selected)) throw new HttpError(422, `Workflow input ${input.id} must match a declared option`);
+    return [input.id, selected];
+  }));
+  for (const node of document.definition.nodes.filter((candidate) => candidate.type === "script")) {
+    for (const [field, reference, allowCurrentDirectory] of [["script_file", node.script_file, false], ["working_directory", node.working_directory, true]] as const) {
+      if (!reference) continue;
+      const selectedPath = reference.path ?? (reference.path_input ? inputs[reference.path_input] : undefined);
+      if (typeof selectedPath !== "string" || !portableRelativePath(selectedPath, allowCurrentDirectory)) {
+        throw new HttpError(422, `Workflow node ${node.id} resolved ${field} to an invalid relative path`);
+      }
+    }
+  }
   const stageEnabled = Object.fromEntries(document.definition.stages.map((stage) => {
     const legacy = stage.id === "specification" ? ticket.spec_required : stage.id === "review" ? ticket.review_required : undefined;
     const requested = selections.stage_enabled?.[stage.id];
@@ -813,7 +1019,11 @@ export function initializeWorkflow(
   }));
   ticket.workflow = {
     id: document.definition.id, revision: document.revision, current_node: document.definition.start, transition_count: 0,
+    started_at: now, completed_at: null, current_node_entered_at: now,
     node_visits: {}, node_attempts: {}, node_runs: [], prompt_revisions: promptRevisions, inputs, stage_enabled: stageEnabled, incoming: null,
+    active_workflow_id: document.definition.id, active_workflow_revision: document.revision,
+    workflow_revisions: { [document.definition.id]: document.revision, ...(selections.workflow_revisions ?? {}) },
+    workflow_stack: [], fan_out_stack: [], resolved_agent_profiles: selections.resolved_agent_profiles ?? {},
   };
   if ("specification" in stageEnabled) ticket.spec_required = stageEnabled.specification ?? ticket.spec_required;
   if ("review" in stageEnabled) ticket.review_required = stageEnabled.review ?? ticket.review_required;
@@ -839,16 +1049,19 @@ export function enterCurrentNode(ticket: TicketFrontmatter, definition: Workflow
       const now = new Date().toISOString();
       const summary = stageDisabled ? `Stage ${stage?.name ?? node.stage} was disabled for this ticket.` : `Condition ${node.when?.input} did not match.`;
       ticket.workflow.node_runs.push({
-        id: randomUUID(), workflow_revision: ticket.workflow.revision, node_id: node.id, node_type: node.type,
+        id: randomUUID(), workflow_id: activeWorkflowIdentity(ticket).id, workflow_revision: activeWorkflowIdentity(ticket).revision, node_id: node.id, node_type: node.type,
         visit: ticket.workflow.node_visits[node.id] ?? 0, attempt: 0, status: "completed", supervisor_id: null, provider: null,
+        lease_id: null,
         started_at: now, completed_at: now, outcome: "bypassed", summary,
-        handoff: null, output: null, input_revision: ticket.revision,
+        handoff: null, output: null, input_revision: ticket.revision, telemetry: null,
+        timing: emptyNodeTiming(node.type === "human_gate" ? "human_wait" : "active", null),
       });
       return transitionTo(ticket, definition, target, { outcome: "bypassed", summary, actor: "workflow", source_node: node.id, count_visit: countVisit });
     }
     if (countVisit) {
-      const visits = (ticket.workflow.node_visits[node.id] ?? 0) + 1;
-      ticket.workflow.node_visits[node.id] = visits;
+      const key = runtimeNodeKey(ticket, node.id);
+      const visits = (ticket.workflow.node_visits[key] ?? 0) + 1;
+      ticket.workflow.node_visits[key] = visits;
       if (node.max_visits && visits > node.max_visits) {
         ticket.status = "blocked";
         ticket.phase = node.phase;
@@ -857,53 +1070,64 @@ export function enterCurrentNode(ticket: TicketFrontmatter, definition: Workflow
     }
     ticket.phase = node.phase;
     ticket.status = projectionStatus(node);
+    if (node.type === "terminal") ticket.workflow.completed_at = new Date().toISOString();
     return node;
   }
 }
 
 export function transitionTo(ticket: TicketFrontmatter, definition: WorkflowDefinition, target: string, details: {
-  outcome: string; summary?: string | null; handoff?: string | null; actor?: string; source_node?: string; count_visit?: boolean;
+  outcome: string; summary?: string | null; handoff?: string | null; output?: string | null; output_log_path?: string | null;
+  actor?: string; source_node?: string; count_visit?: boolean;
 }): WorkflowNode {
   if (!ticket.workflow) throw new HttpError(409, "Ticket does not have a V3 workflow");
   workflowNode(definition, target);
   const source = details.source_node ?? ticket.workflow.current_node;
   const sourceNode = definition.nodes.find((candidate) => candidate.id === source);
   const now = new Date().toISOString();
-  const sourceVisit = ticket.workflow.node_visits[source] ?? 0;
+  const identity = activeWorkflowIdentity(ticket);
+  const sourceVisit = ticket.workflow.node_visits[runtimeNodeKey(ticket, source)] ?? 0;
   const matchingRun = [...ticket.workflow.node_runs].reverse().find((run) => run.node_id === source
+    && run.workflow_revision === identity.revision
+    && (run.workflow_id ?? ticket.workflow!.id) === identity.id
     && run.visit === sourceVisit && run.outcome === details.outcome && run.completed_at !== null);
   if (sourceNode && !matchingRun) {
     ticket.workflow.node_runs.push({
-      id: randomUUID(), workflow_revision: ticket.workflow.revision, node_id: source, node_type: sourceNode.type,
+      id: randomUUID(), workflow_id: activeWorkflowIdentity(ticket).id, workflow_revision: activeWorkflowIdentity(ticket).revision, node_id: source, node_type: sourceNode.type,
       visit: sourceVisit, attempt: 0, status: details.outcome.startsWith("operator_") ? "interrupted" : "completed",
       supervisor_id: null, provider: null, started_at: now, completed_at: now, outcome: details.outcome,
       summary: details.summary ?? `Transitioned through ${details.outcome}.`, handoff: details.handoff ?? null,
-      output: null, input_revision: ticket.revision,
+      output: null, input_revision: ticket.revision, lease_id: null, telemetry: null,
+      timing: emptyNodeTiming(sourceNode.type === "human_gate" ? "human_wait" : "active", null),
     });
   }
   ticket.workflow.incoming = {
     source_node: source, target_node: target, outcome: details.outcome,
     summary: details.summary ?? null, handoff: details.handoff ?? null,
+    output: details.output ?? null, output_log_path: details.output_log_path ?? null,
     actor: details.actor ?? "workflow", created_at: now,
   };
   ticket.workflow.current_node = target;
+  ticket.workflow.current_node_entered_at = now;
+  ticket.workflow.completed_at = null;
   ticket.workflow.transition_count += 1;
   return enterCurrentNode(ticket, definition, details.count_visit ?? true);
 }
 
-export function advanceWorkflow(ticket: TicketFrontmatter, definition: WorkflowDefinition, outcome: string, summary: string | null = null, handoff: string | null = null, actor = "workflow"): WorkflowNode {
+export function advanceWorkflow(ticket: TicketFrontmatter, definition: WorkflowDefinition, outcome: string, summary: string | null = null, handoff: string | null = null, actor = "workflow", output: string | null = null, outputLogPath: string | null = null): WorkflowNode {
   if (!ticket.workflow) throw new HttpError(409, "Ticket does not have a V3 workflow");
   const current = workflowNode(definition, ticket.workflow.current_node);
   const route = workflowRoute(current, outcome);
   if (!route) throw new HttpError(422, `Outcome ${outcome} is not allowed for node ${current.id}`, { allowed: workflowRoutes(current).map((candidate) => candidate.id) });
-  return transitionTo(ticket, definition, route.target, { outcome, summary, handoff, actor, source_node: current.id });
+  return transitionTo(ticket, definition, route.target, { outcome, summary, handoff, output, output_log_path: outputLogPath, actor, source_node: current.id });
 }
 
-export function beginNodeRun(ticket: TicketFrontmatter, node: WorkflowNode, workflowRevision: string, attempt: number, now: string, supervisorId: string, provider: Provider | null): WorkflowNodeRun {
+export function beginNodeRun(ticket: TicketFrontmatter, node: WorkflowNode, workflowRevision: string, attempt: number, now: string, supervisorId: string, provider: Provider | null, leaseId: string | null = null): WorkflowNodeRun {
+  const timingState: NodeTimingState = node.type === "human_gate" ? "human_wait" : "active";
   const run: WorkflowNodeRun = {
-    id: randomUUID(), workflow_revision: workflowRevision, node_id: node.id, node_type: node.type,
-    visit: ticket.workflow?.node_visits[node.id] ?? 1, attempt, status: "running", supervisor_id: supervisorId, provider,
-    started_at: now, completed_at: null, outcome: null, summary: null, handoff: null, output: null, input_revision: ticket.revision,
+    id: randomUUID(), ...(ticket.workflow ? { workflow_id: activeWorkflowIdentity(ticket).id } : {}), workflow_revision: workflowRevision, node_id: node.id, node_type: node.type,
+    visit: ticket.workflow?.node_visits[ticket.workflow ? runtimeNodeKey(ticket, node.id) : node.id] ?? 1, attempt, status: "running", supervisor_id: supervisorId, provider,
+    lease_id: leaseId, started_at: now, completed_at: null, outcome: null, summary: null, handoff: null, output: null,
+    input_revision: ticket.revision, telemetry: null, timing: emptyNodeTiming(timingState, now),
   };
   ticket.workflow?.node_runs.push(run);
   return run;
@@ -914,6 +1138,7 @@ export function finishNodeRun(ticket: TicketFrontmatter, runId: string, outcome:
 }): void {
   const run = ticket.workflow?.node_runs.find((candidate) => candidate.id === runId);
   if (!run || run.status !== "running") throw new HttpError(409, "Node run is stale or already finished");
+  accountNodeRunTiming(run, now);
   run.status = outcome === "failed" || outcome === "failure" ? "failed" : "completed";
   run.completed_at = now; run.outcome = outcome; run.summary = summary; run.handoff = handoff; run.output = output;
   if (outputArtifact) {
@@ -921,4 +1146,42 @@ export function finishNodeRun(ticket: TicketFrontmatter, runId: string, outcome:
     run.output_sha256 = outputArtifact.sha256;
     run.output_bytes = outputArtifact.bytes;
   }
+}
+
+export function emptyNodeTiming(state: NodeTimingState, startedAt: string | null): WorkflowNodeRun["timing"] {
+  return {
+    active_ms: 0, quota_paused_ms: 0, human_wait_ms: 0,
+    state, last_accounted_at: startedAt, pause_limit_id: null, pause_until: null,
+  };
+}
+
+export function accountNodeRunTiming(
+  run: WorkflowNodeRun,
+  now: string,
+  next?: { state: NodeTimingState; pause_limit_id?: string | null; pause_until?: string | null },
+): void {
+  if (run.status !== "running") return;
+  const currentAt = Date.parse(now);
+  const priorAt = Date.parse(run.timing.last_accounted_at ?? run.started_at);
+  if (Number.isFinite(currentAt) && Number.isFinite(priorAt) && currentAt > priorAt) {
+    let elapsed = currentAt - priorAt;
+    if (run.timing.state === "quota_paused") {
+      const resetAt = run.timing.pause_until ? Date.parse(run.timing.pause_until) : Number.NaN;
+      const paused = Number.isFinite(resetAt) ? Math.max(0, Math.min(currentAt, resetAt) - priorAt) : elapsed;
+      run.timing.quota_paused_ms += paused;
+      elapsed -= paused;
+      if (elapsed > 0) run.timing.active_ms += elapsed;
+    } else if (run.timing.state === "human_wait") run.timing.human_wait_ms += elapsed;
+    else run.timing.active_ms += elapsed;
+  }
+  if (next) {
+    run.timing.state = next.state;
+    run.timing.pause_limit_id = next.state === "quota_paused" ? next.pause_limit_id ?? null : null;
+    run.timing.pause_until = next.state === "quota_paused" ? next.pause_until ?? null : null;
+  } else if (run.timing.state === "quota_paused" && run.timing.pause_until && Date.parse(run.timing.pause_until) <= currentAt) {
+    run.timing.state = "active";
+    run.timing.pause_limit_id = null;
+    run.timing.pause_until = null;
+  }
+  run.timing.last_accounted_at = now;
 }

@@ -4,12 +4,23 @@ export const STATUSES = [
 ] as const;
 export const PROVIDERS = ["claude", "codex"] as const;
 export const ACTIVITY_CAPABILITIES = ["repository_action", "inline_shell", "inline_javascript", "inline_python"] as const;
+export const PRODUCTION_RESULTS = ["unassessed", "succeeded", "failed", "rolled_back", "not_deployed"] as const;
 
 export type Phase = (typeof PHASES)[number];
 export type TicketStatus = (typeof STATUSES)[number];
 export type Provider = (typeof PROVIDERS)[number];
 export type ActivityCapability = (typeof ACTIVITY_CAPABILITIES)[number];
+export type ProductionResult = (typeof PRODUCTION_RESULTS)[number];
 export type ReviewProvider = Provider;
+export type JsonPrimitive = string | number | boolean | null;
+export type JsonValue = JsonPrimitive | JsonValue[] | { [key: string]: JsonValue };
+
+export interface ResolvedAgentProfile {
+  alias: string;
+  provider: Provider;
+  model: string | null;
+  reasoning: string | null;
+}
 
 export interface RepositoryRef {
   id: string;
@@ -102,6 +113,48 @@ export interface HerdrObservation {
   tokens: Record<string, string>;
 }
 
+export interface TokenUsage {
+  input_tokens: number;
+  cached_input_tokens: number;
+  cache_write_input_tokens: number;
+  output_tokens: number;
+  reasoning_output_tokens: number;
+  total_tokens: number;
+}
+
+export interface HarnessTelemetrySnapshot {
+  schema_version: 1;
+  harness: string;
+  session_ref: string | null;
+  observed_at: string;
+  source: { kind: string; detail: string | null };
+  model: { id: string | null; provider: string | null; observed_ids: string[] };
+  reasoning: { effort: string | null; enabled: boolean | null; source: string | null };
+  usage: TokenUsage | null;
+  cost: { total_usd: number | null; kind: "reported" | "estimated" | "unavailable" };
+  context: { used_tokens: number | null; window_tokens: number | null; used_percent: number | null };
+  rate_limits: Array<{ id: string; name: string | null; used_percent: number; window_minutes: number | null; resets_at: string | null }>;
+  attributes: Record<string, string | number | boolean | null>;
+}
+
+export interface HarnessTelemetryRecord {
+  baseline: HarnessTelemetrySnapshot;
+  latest: HarnessTelemetrySnapshot;
+  delta: { usage: TokenUsage | null; cost_usd: number | null };
+}
+
+export type NodeTimingState = "active" | "quota_paused" | "human_wait";
+
+export interface NodeRunTiming {
+  active_ms: number;
+  quota_paused_ms: number;
+  human_wait_ms: number;
+  state: NodeTimingState;
+  last_accounted_at: string | null;
+  pause_limit_id: string | null;
+  pause_until: string | null;
+}
+
 export interface Execution {
   lease_id: string;
   supervisor_id: string;
@@ -113,6 +166,7 @@ export interface Execution {
   lease_expires_at: string;
   observed_herdr_state: string | null;
   herdr_observation: HerdrObservation | null;
+  telemetry: HarnessTelemetryRecord | null;
   guidance: GuidanceItem[];
   interrupt_request: InterruptRequest | null;
   node_run_id?: string | undefined;
@@ -123,14 +177,16 @@ export interface Execution {
 
 export interface WorkflowNodeRun {
   id: string;
+  workflow_id?: string;
   workflow_revision: string;
   node_id: string;
-  node_type: "agent" | "script" | "verification" | "human_gate" | "terminal";
+  node_type: "agent" | "script" | "verification" | "human_gate" | "read" | "write" | "workflow" | "fan_out" | "fan_in" | "terminal";
   visit: number;
   attempt: number;
   status: "running" | "completed" | "failed" | "interrupted";
   supervisor_id: string | null;
   provider: Provider | null;
+  lease_id: string | null;
   started_at: string;
   completed_at: string | null;
   outcome: string | null;
@@ -140,7 +196,11 @@ export interface WorkflowNodeRun {
   output_path?: string | null;
   output_sha256?: string | null;
   output_bytes?: number | null;
+  script_path?: string | null;
+  working_directory?: string | null;
   input_revision: number;
+  telemetry: HarnessTelemetryRecord | null;
+  timing: NodeRunTiming;
 }
 
 export interface WorkflowTransitionContext {
@@ -149,14 +209,35 @@ export interface WorkflowTransitionContext {
   outcome: string;
   summary: string | null;
   handoff: string | null;
+  output?: string | null;
+  output_log_path?: string | null;
   actor: string;
   created_at: string;
+}
+
+export interface WorkflowCallFrame {
+  workflow_id: string;
+  workflow_revision: string;
+  call_node_id: string;
+}
+
+export interface WorkflowFanOutFrame {
+  workflow_id: string;
+  workflow_revision: string;
+  fan_out_node_id: string;
+  fan_in_node_id: string;
+  pending_targets: string[];
+  inputs: WorkflowTransitionContext[];
+  source: WorkflowTransitionContext | null;
 }
 
 export interface WorkflowRuntime {
   id: string;
   revision: string;
   current_node: string;
+  started_at: string;
+  completed_at: string | null;
+  current_node_entered_at: string;
   transition_count: number;
   node_visits: Record<string, number>;
   node_attempts: Record<string, AttemptCounter>;
@@ -165,6 +246,12 @@ export interface WorkflowRuntime {
   inputs: Record<string, boolean | string>;
   stage_enabled: Record<string, boolean>;
   incoming: WorkflowTransitionContext | null;
+  active_workflow_id?: string;
+  active_workflow_revision?: string;
+  workflow_revisions?: Record<string, string>;
+  workflow_stack?: WorkflowCallFrame[];
+  fan_out_stack?: WorkflowFanOutFrame[];
+  resolved_agent_profiles?: Record<string, ResolvedAgentProfile>;
 }
 
 export interface CallbackReceipt {
@@ -192,7 +279,11 @@ export interface TicketFrontmatter {
   attempts: Record<"specification" | "implementation" | "review", AttemptCounter>;
   pull_requests: PullRequestRef[];
   questions: TicketQuestion[];
+  metadata?: Record<string, JsonValue>;
   jira: JiraRef | null;
+  production_result: ProductionResult;
+  production_assessed_at: string | null;
+  production_assessment_note: string | null;
   archived_at: string | null;
   revision: number;
   event_sequence: number;
@@ -229,11 +320,13 @@ export interface TicketSummary {
   priority: number;
   provider: Provider | null;
   revision: number;
+  created_at: string;
   valid: boolean;
   errors: string[];
   path: string;
   claim_blockers: RepositoryClaimBlocker[];
   archived_at: string | null;
+  production_result: ProductionResult;
   workflow_id: string | null;
   workflow_node_id: string | null;
   workflow_node_name: string | null;

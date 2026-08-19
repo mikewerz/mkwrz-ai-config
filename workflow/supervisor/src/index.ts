@@ -14,6 +14,7 @@ if (providers.length === 0) throw new Error("PROVIDERS must include claude or co
 
 const trackerUrl = process.env.TRACKER_URL ?? "http://127.0.0.1:4310";
 const projectRoot = resolve(process.env.PROJECT_ROOT ?? process.cwd());
+const assignmentRoot = resolve(process.env.ASSIGNMENT_ROOT ?? resolve(projectRoot, ".agentic-assignments"));
 const herdrSession = process.env.HERDR_SESSION ?? "agentic-projects";
 const herdr = new HerdrController(new HerdrCli(herdrSession), projectRoot);
 const detectedIps = Object.values(networkInterfaces()).flatMap((addresses) => addresses ?? [])
@@ -24,6 +25,7 @@ const supervisor = new Supervisor(herdr, {
   providers,
   heartbeatIntervalMs: Number(process.env.HEARTBEAT_INTERVAL_MS ?? 30_000),
   idlePollMs: Number(process.env.IDLE_POLL_MS ?? 5_000),
+  assignmentRoot,
   ...(process.env.CALLBACK_BASE_URL ? { callbackBaseUrl: process.env.CALLBACK_BASE_URL } : {}),
   presence: {
     instanceId: randomUUID(),

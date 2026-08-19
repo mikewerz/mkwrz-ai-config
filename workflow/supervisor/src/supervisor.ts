@@ -4,6 +4,9 @@ import { TrackerClient, TrackerError } from "./tracker-client.js";
 import { RepositoryReconciler, type RepositoryReconcilerLike } from "./repositories.js";
 import type { ActivityCapability, ClaimedTicket, Provider, SupervisorPresence } from "./types.js";
 import { detectActivityCapabilities, runRepositoryActivity } from "./activities.js";
+import { TelemetryCollector, zeroTelemetryBaseline, type TelemetryContext } from "./telemetry.js";
+import type { HarnessTelemetrySnapshot } from "./types.js";
+import { AssignmentBundleWriter, assignmentValues, type AssignmentBundle } from "./assignments.js";
 
 export interface SupervisorOptions {
   trackerUrl: string;
@@ -12,46 +15,34 @@ export interface SupervisorOptions {
   heartbeatIntervalMs: number;
   idlePollMs: number;
   callbackBaseUrl?: string;
+  assignmentRoot?: string;
   presence?: SupervisorPresence;
   repositoryReconciler?: RepositoryReconcilerLike;
+  telemetryCollector?: Pick<TelemetryCollector, "collect">;
 }
 
 const sleep = (milliseconds: number) => new Promise((resolve) => setTimeout(resolve, milliseconds));
 const ASSIGNMENT_PROMPT_ATTEMPTS = 2;
 
-function callbackValues(ticket: ClaimedTicket, callbackBaseUrl: string): Record<string, string> {
-  const lease = ticket.frontmatter.execution.lease_id;
-  const node = ticket.workflow_node;
+function bundleValues(ticket: ClaimedTicket, callbackBaseUrl: string, projectRoot: string, bundle: AssignmentBundle): Record<string, string> {
   return {
-    ticket_id: ticket.frontmatter.id,
-    phase: ticket.frontmatter.phase,
-    callback_base: new URL(`/api/work/${lease}/`, callbackBaseUrl).toString(),
-    node_id: node?.id ?? ticket.frontmatter.phase,
-    node_name: node?.name ?? ticket.frontmatter.phase,
-    allowed_outcomes: node?.outcomes?.length ? node.outcomes.map((outcome) => `- ${outcome.id}: ${outcome.label}${outcome.description ? ` — ${outcome.description}` : ""}`).join("\n") : "- completed: Complete the assigned work\n- failed: The work cannot continue",
-    incoming_outcome: ticket.frontmatter.workflow?.incoming?.outcome ?? "none",
-    incoming_summary: ticket.frontmatter.workflow?.incoming?.summary ?? "No prior transition summary.",
-    incoming_handoff: ticket.frontmatter.workflow?.incoming?.handoff ?? "No explicit handoff message.",
-    incoming_node: ticket.frontmatter.workflow?.incoming?.source_node ?? "none",
+    ...assignmentValues(ticket, callbackBaseUrl, projectRoot),
+    assignment_directory: bundle.runDirectory,
+    start_here_path: bundle.startHerePath,
+    callback_helper_path: bundle.callbackHelperPath,
   };
 }
 
-export function buildAssignmentPrompt(ticket: ClaimedTicket, callbackBaseUrl: string, projectRoot: string, prompts: PromptStore): string {
-  const phase = ticket.frontmatter.phase;
-  const values = {
-    ...callbackValues(ticket, callbackBaseUrl),
-    ticket_path: ticket.path,
-    ticket_markdown: ticket.markdown,
-    project_root: projectRoot,
-  };
+export function buildAssignmentPrompt(ticket: ClaimedTicket, callbackBaseUrl: string, projectRoot: string, prompts: PromptStore, bundle: AssignmentBundle): string {
+  const values = bundleValues(ticket, callbackBaseUrl, projectRoot, bundle);
   const instructions = ticket.node_prompt
     ? prompts.renderContent(ticket.node_prompt.id, ticket.node_prompt.content, values)
-    : prompts.render(phase, values);
+    : prompts.render(ticket.frontmatter.phase, values);
   return prompts.render("assignment", { ...values, phase_instructions: instructions });
 }
 
-export function buildCallbackReminder(ticket: ClaimedTicket, callbackBaseUrl: string, prompts: PromptStore): string {
-  return prompts.render("callback-reminder", callbackValues(ticket, callbackBaseUrl));
+export function buildCallbackReminder(ticket: ClaimedTicket, callbackBaseUrl: string, projectRoot: string, prompts: PromptStore, bundle: AssignmentBundle): string {
+  return prompts.render("callback-reminder", bundleValues(ticket, callbackBaseUrl, projectRoot, bundle));
 }
 
 export class Supervisor {
@@ -63,6 +54,8 @@ export class Supervisor {
   private readonly activityCapabilities: ActivityCapability[];
   private repositorySync: Promise<void> | null = null;
   private lastRepositorySyncAt = 0;
+  private readonly telemetry: Pick<TelemetryCollector, "collect">;
+  private readonly assignments: AssignmentBundleWriter;
 
   constructor(private readonly herdr: HerdrController, private readonly options: SupervisorOptions) {
     this.tracker = new TrackerClient(options.trackerUrl, options.supervisorId, options.presence?.instanceId);
@@ -70,6 +63,13 @@ export class Supervisor {
     this.prompts = new PromptStore();
     this.activityCapabilities = detectActivityCapabilities();
     this.repositoryReconciler = options.repositoryReconciler ?? (options.presence ? new RepositoryReconciler(options.presence.projectRoot) : null);
+    this.telemetry = options.telemetryCollector ?? new TelemetryCollector();
+    this.assignments = new AssignmentBundleWriter(options.assignmentRoot ?? `${herdr.projectRoot}/.agentic-assignments`, options.supervisorId);
+  }
+
+  private async collectTelemetry(context: TelemetryContext): Promise<HarnessTelemetrySnapshot | null> {
+    try { return await this.telemetry.collect(context); }
+    catch (error) { console.warn(`[${context.harness}] telemetry collection failed for ${context.sessionRef}`, error); return null; }
   }
 
   async stop(): Promise<void> {
@@ -124,8 +124,8 @@ export class Supervisor {
     this.prompts.replace(byName as PromptTemplates);
   }
 
-  private async promptAssignment(provider: Provider, ticket: ClaimedTicket, paneId: string): Promise<void> {
-    const assignment = buildAssignmentPrompt(ticket, this.callbackBaseUrl, this.herdr.projectRoot, this.prompts);
+  private async promptAssignment(provider: Provider, ticket: ClaimedTicket, paneId: string, bundle: AssignmentBundle): Promise<void> {
+    const assignment = buildAssignmentPrompt(ticket, this.callbackBaseUrl, this.herdr.projectRoot, this.prompts, bundle);
     for (let attempt = 1; attempt <= ASSIGNMENT_PROMPT_ATTEMPTS; attempt += 1) {
       if (await this.herdr.promptAndConfirm(paneId, assignment)) return;
       if (attempt < ASSIGNMENT_PROMPT_ATTEMPTS) {
@@ -177,7 +177,7 @@ export class Supervisor {
         const controller = new AbortController();
         let settled = false;
         const activity = runRepositoryActivity(this.herdr.projectRoot, ticket, controller.signal)
-          .catch((error) => ({ success: false, summary: (error as Error).message, output: "", exit_code: null }))
+          .catch((error) => ({ success: false, summary: (error as Error).message, output: "", exit_code: null, script_path: null, working_directory: null }))
           .finally(() => { settled = true; });
         try {
           let interrupted = false;
@@ -232,12 +232,30 @@ export class Supervisor {
 
   private async runAssignment(provider: Provider, ticket: ClaimedTicket): Promise<void> {
     const lease = ticket.frontmatter.execution.lease_id;
+    let currentTicket = ticket;
+    const bundle = await this.assignments.prepare(currentTicket, this.callbackBaseUrl, this.herdr.projectRoot, this.prompts);
     const phase = ticket.frontmatter.phase;
     const conversation = ticket.workflow_node?.conversation_key ?? (phase === "review" ? "review" : "work");
     const existing = ticket.frontmatter.conversations?.[conversation] ?? ticket.frontmatter.agents[phase];
-    const observation = await this.herdr.ensureAgent(ticket.frontmatter.id, provider, conversation, existing.herdr_pane_id, existing.session_ref);
+    const observation = await this.herdr.ensureAgent(ticket.frontmatter.id, provider, conversation, existing.herdr_pane_id, existing.session_ref, ticket.resolved_agent_profile);
+    const telemetryContext = (sessionRef: string): TelemetryContext => ({ harness: provider, sessionRef, cwd: observation.foregroundCwd ?? observation.cwd });
+    let telemetryBaseline = ticket.frontmatter.execution.telemetry?.baseline ?? null;
+    const captureBaseline = (snapshot: HarnessTelemetrySnapshot): HarnessTelemetrySnapshot => {
+      if (telemetryBaseline && (telemetryBaseline.harness !== snapshot.harness || telemetryBaseline.session_ref !== snapshot.session_ref)) {
+        telemetryBaseline = zeroTelemetryBaseline(snapshot);
+      }
+      if (!telemetryBaseline) telemetryBaseline = existing.session_ref && snapshot.session_ref === existing.session_ref
+        ? snapshot : zeroTelemetryBaseline(snapshot);
+      return telemetryBaseline;
+    };
+    const initialTelemetry = observation.sessionRef ? await this.collectTelemetry(telemetryContext(observation.sessionRef)) : null;
+    if (initialTelemetry) captureBaseline(initialTelemetry);
     let cursor = 0;
-    await this.tracker.heartbeat(lease, { ...observation, guidanceCursor: cursor });
+    await this.tracker.heartbeat(lease, {
+      ...observation, guidanceCursor: cursor,
+      ...(initialTelemetry ? { telemetry: initialTelemetry } : {}),
+      ...(telemetryBaseline ? { telemetryBaseline } : {}),
+    });
     if (ticket.frontmatter.execution.interrupt_request) {
       await this.herdr.interrupt(observation.paneId);
       await this.tracker.acknowledgeInterrupt(lease);
@@ -245,7 +263,7 @@ export class Supervisor {
     }
     // Do not enter the reminder loop until Herdr has observed assignment activity.
     // A stalled submission is retried with the complete durable assignment.
-    await this.promptAssignment(provider, ticket, observation.paneId);
+    await this.promptAssignment(provider, currentTicket, observation.paneId, bundle);
     let callbackReminderSent = false;
     let knownSessionRef = observation.sessionRef;
     let lastHeartbeatAt = Date.now();
@@ -257,11 +275,25 @@ export class Supervisor {
         throw error;
       });
       if (control === null) {
+        try {
+          const finalObservation = await this.herdr.observe(observation.paneId);
+          if (finalObservation.sessionRef) {
+            const finalTelemetry = await this.collectTelemetry(telemetryContext(finalObservation.sessionRef));
+            if (finalTelemetry) await this.tracker.telemetry(lease, finalTelemetry, captureBaseline(finalTelemetry)).catch(() => undefined);
+          }
+        } catch { /* the completed node may already have closed its pane */ }
         await this.herdr.interrupt(observation.paneId).catch(() => undefined);
         return;
       }
       if (control?.interrupt) {
         await this.herdr.interrupt(observation.paneId);
+        try {
+          const finalObservation = await this.herdr.observe(observation.paneId);
+          if (finalObservation.sessionRef) {
+            const finalTelemetry = await this.collectTelemetry(telemetryContext(finalObservation.sessionRef));
+            if (finalTelemetry) await this.tracker.telemetry(lease, finalTelemetry, captureBaseline(finalTelemetry)).catch(() => undefined);
+          }
+        } catch { /* interruption telemetry is best effort */ }
         await this.tracker.acknowledgeInterrupt(lease);
         return;
       }
@@ -276,15 +308,35 @@ export class Supervisor {
       if (guidance === null) return;
       for (const item of guidance) {
         await this.refreshPrompts();
-        await this.herdr.prompt(current.paneId, this.prompts.render("guidance", { ticket_id: ticket.frontmatter.id, message: item.message }));
+        currentTicket = await this.tracker.assignment(lease);
+        await this.assignments.refresh(bundle, currentTicket, this.callbackBaseUrl, this.herdr.projectRoot, this.prompts);
+        const updatePath = await this.assignments.appendUpdate(bundle, item);
+        await this.herdr.prompt(current.paneId, this.prompts.render("guidance", {
+          ...bundleValues(currentTicket, this.callbackBaseUrl, this.herdr.projectRoot, bundle),
+          message: item.message, update_path: updatePath,
+        }));
         cursor = Math.max(cursor, item.sequence);
       }
 
       const sessionAppeared = current.sessionRef !== null && current.sessionRef !== knownSessionRef;
       const heartbeatDue = Date.now() - lastHeartbeatAt >= this.options.heartbeatIntervalMs;
       if (guidance.length > 0 || sessionAppeared || heartbeatDue) {
-        try { await this.tracker.heartbeat(lease, { ...current, guidanceCursor: cursor }); }
-        catch (error) { if (error instanceof TrackerError && error.status === 409) return; throw error; }
+        const currentTelemetry = current.sessionRef ? await this.collectTelemetry(telemetryContext(current.sessionRef)) : null;
+        if (currentTelemetry) captureBaseline(currentTelemetry);
+        try {
+          await this.tracker.heartbeat(lease, {
+            ...current, guidanceCursor: cursor,
+            ...(currentTelemetry ? { telemetry: currentTelemetry } : {}),
+            ...(telemetryBaseline ? { telemetryBaseline } : {}),
+          });
+        }
+        catch (error) {
+          if (error instanceof TrackerError && error.status === 409) {
+            if (currentTelemetry) await this.tracker.telemetry(lease, currentTelemetry, captureBaseline(currentTelemetry)).catch(() => undefined);
+            return;
+          }
+          throw error;
+        }
         knownSessionRef = current.sessionRef;
         lastHeartbeatAt = Date.now();
       }
@@ -292,7 +344,7 @@ export class Supervisor {
       if (!control?.waitingForAnswer && !callbackReminderSent && (current.state === "idle" || current.state === "done")) {
         callbackReminderSent = true;
         await this.refreshPrompts();
-        await this.herdr.prompt(current.paneId, buildCallbackReminder(ticket, this.callbackBaseUrl, this.prompts));
+        await this.herdr.prompt(current.paneId, buildCallbackReminder(currentTicket, this.callbackBaseUrl, this.herdr.projectRoot, this.prompts, bundle));
       }
     }
   }

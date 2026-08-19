@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { afterEach, describe, expect, it } from "vitest";
 import { stringify } from "yaml";
-import { DEV_ONLY_WORKFLOW, END_TO_END_WORKFLOW, WorkflowLibrary, STANDARD_WORKFLOW, activityRoute, advanceWorkflow, initializeWorkflow, transitionTo, validateWorkflow } from "./workflow-library.js";
+import { DEV_ONLY_WORKFLOW, END_TO_END_WORKFLOW, WorkflowLibrary, STANDARD_WORKFLOW, activityRoute, advanceWorkflow, beginNodeRun, finishNodeRun, initializeWorkflow, requiredActivityCapability, transitionTo, validateWorkflow } from "./workflow-library.js";
 import { normalizeTicket } from "./validation.js";
 import { PROMPT_NAMES } from "./prompt-library.js";
 
@@ -45,18 +45,45 @@ describe("WorkflowLibrary", () => {
     expect(work.workflow?.current_node).toBe("implementation");
   });
 
-  it("rejects missing edges, missing prompt artifacts, and unsafe actions", () => {
+  it("records human-gate wait time from node entry through the decision", () => {
+    const work = ticket();
+    work.spec_required = true;
+    const document = { definition: STANDARD_WORKFLOW, content: stringify(STANDARD_WORKFLOW), revision: "a".repeat(64), valid: true, errors: [], referenced_prompts: ["specification", "implementation", "review"] };
+    initializeWorkflow(work, document, {}, { stage_enabled: { specification: true } });
+    transitionTo(work, STANDARD_WORKFLOW, "specification-approval", { outcome: "completed", actor: "test" });
+    const entered = "2026-08-14T12:00:00.000Z";
+    const decided = "2026-08-14T12:05:00.000Z";
+    work.workflow!.current_node_entered_at = entered;
+    const gate = STANDARD_WORKFLOW.nodes.find((node) => node.id === "specification-approval")!;
+    const run = beginNodeRun(work, gate, work.workflow!.revision, 1, entered, "human", null);
+    finishNodeRun(work, run.id, "approved", "Approved", null, decided);
+    expect(run.timing).toMatchObject({ active_ms: 0, quota_paused_ms: 0, human_wait_ms: 300_000 });
+  });
+
+  it("rejects missing edges, missing prompt artifacts, and unsafe script paths", () => {
     const invalid = structuredClone(STANDARD_WORKFLOW);
     invalid.nodes[0]!.prompt = "missing";
     invalid.nodes.splice(2, 0, {
-      id: "verify", name: "Verify", type: "script", phase: "implementation", stage: "implementation", repository: "primary", action: "../escape",
+      id: "verify", name: "Verify", type: "script", phase: "implementation", stage: "implementation", repository: "primary",
+      script_file: { relative_to: "selected_repository", path: "../escape.sh" },
+      working_directory: { relative_to: "selected_repository", path: "." },
       outcomes: [], choices: [], exit_codes: [{ id: "success", label: "Success", description: "", target: "done", codes: [0] }],
     });
     expect(validateWorkflow(invalid, new Set(["specification", "implementation", "review"]))).toEqual(expect.arrayContaining([
       expect.stringContaining("prompt missing does not exist"),
-      expect.stringContaining("action must be a safe action name"),
+      expect.stringContaining("script_file.path must be a contained relative path"),
       expect.stringContaining("exactly one default route"),
     ]));
+  });
+
+  it("preserves and validates explicit metric classifications on workflow routes", async () => {
+    const root = await mkdtemp(join(tmpdir(), "factory-workflows-")); roots.push(root);
+    const library = new WorkflowLibrary(root);
+    const initial = await library.get("standard-delivery");
+    expect(initial.definition.nodes.find((node) => node.id === "implementation")?.outcomes[0]?.metric_class).toBe("success");
+    const invalid = structuredClone(initial.definition);
+    invalid.nodes.find((node) => node.id === "implementation")!.outcomes[0]!.metric_class = "sometimes" as "success";
+    expect(validateWorkflow(invalid, new Set(PROMPT_NAMES))).toContain("node implementation: route completed has an invalid metric_class");
   });
 
   it("rejects impossible terminal phase projections and accepts stage bypass reachability", () => {
@@ -92,6 +119,7 @@ describe("WorkflowLibrary", () => {
   it("declares PR requirements, completed feedback targets, and rollback outcomes in bundled workflows", () => {
     expect(STANDARD_WORKFLOW.nodes.find((node) => node.id === "specification")?.pull_request_requirement).toEqual({ scope: "primary", phase: "specification" });
     expect(STANDARD_WORKFLOW.nodes.find((node) => node.id === "done")?.github_watch?.feedback_target).toBe("implementation");
+    expect(requiredActivityCapability(DEV_ONLY_WORKFLOW.nodes.find((node) => node.id === "completion-callback")!)).toBe("repository_action");
     const validation = END_TO_END_WORKFLOW.nodes.find((node) => node.id === "nonprod-validation")!;
     expect(validation.outcomes.map((outcome) => [outcome.id, outcome.target])).toEqual([
       ["validated", "nonprod-rollback"], ["validation_failed", "nonprod-rollback"],
@@ -128,11 +156,36 @@ describe("WorkflowLibrary", () => {
     expect(activityRoute(activity, null)?.id).toBe("failed");
   });
 
+  it("validates ticket-provided Script paths when a workflow is assigned", () => {
+    const definition = structuredClone(STANDARD_WORKFLOW);
+    definition.inputs = [
+      { id: "script-path", label: "Script path", type: "text", default: "tools/deploy.sh" },
+      { id: "working-path", label: "Working path", type: "text", default: "services/api" },
+    ];
+    definition.nodes.splice(3, 0, {
+      id: "deploy", name: "Deploy", type: "script", phase: "implementation", stage: "implementation", repository: "primary",
+      script_file: { relative_to: "primary_repository", path_input: "script-path" },
+      working_directory: { relative_to: "selected_repository", path_input: "working-path" },
+      outcomes: [], choices: [], exit_codes: [
+        { id: "success", label: "Deployed", description: "Deployment succeeded.", target: "review", codes: [0] },
+        { id: "failure", label: "Failed", description: "Deployment failed.", target: "implementation", default: true },
+      ],
+    });
+    definition.nodes.find((node) => node.id === "implementation")!.outcomes[0]!.target = "deploy";
+    expect(validateWorkflow(definition, new Set(PROMPT_NAMES))).toEqual([]);
+    const document = { definition, content: stringify(definition), revision: "f".repeat(64), valid: true, errors: [], referenced_prompts: [] };
+    const work = ticket();
+    initializeWorkflow(work, document, {}, { inputs: { "script-path": "scripts/release.sh", "working-path": "packages/api" } });
+    expect(work.workflow?.inputs).toMatchObject({ "script-path": "scripts/release.sh", "working-path": "packages/api" });
+    expect(() => initializeWorkflow(ticket(), document, {}, { inputs: { "script-path": "../outside.sh", "working-path": "." } })).toThrow("resolved script_file to an invalid relative path");
+  });
+
   it("accepts one trusted inline activity source and rejects ambiguous activity definitions", () => {
     const definition = structuredClone(STANDARD_WORKFLOW);
     definition.nodes.splice(3, 0, {
       id: "deploy", name: "Deploy", type: "script", phase: "implementation", stage: "implementation", repository: "primary",
       inline: { language: "python", code: "print('deploy')" }, outcomes: [], choices: [],
+      working_directory: { relative_to: "selected_repository", path: "." },
       exit_codes: [
         { id: "success", label: "Deployed", description: "Deployment succeeded.", target: "review", codes: [0] },
         { id: "failure", label: "Failed", description: "Deployment failed.", target: "implementation", default: true },
@@ -141,7 +194,7 @@ describe("WorkflowLibrary", () => {
     definition.nodes.find((node) => node.id === "implementation")!.outcomes[0]!.target = "deploy";
     expect(validateWorkflow(definition, new Set(["specification", "implementation", "review"]))).toEqual([]);
 
-    definition.nodes.find((node) => node.id === "deploy")!.action = "deploy";
-    expect(validateWorkflow(definition, new Set(["specification", "implementation", "review"]))).toContain("node deploy: define exactly one repository action or inline activity");
+    definition.nodes.find((node) => node.id === "deploy")!.script_file = { relative_to: "selected_repository", path: "tools/deploy.sh" };
+    expect(validateWorkflow(definition, new Set(["specification", "implementation", "review"]))).toContain("node deploy: define exactly one script file or inline activity");
   });
 });

@@ -13,6 +13,8 @@ export interface RepositoryConfig {
 
 export interface TicketIdConfig { id_prefix: string; next_number: number }
 export interface ProviderConfig { enabled: Provider[] }
+export interface AgentProfileConfig { id: string; label: string; provider: Provider; model: string; reasoning: string }
+export interface AgentProfilesConfig { default: string; profiles: AgentProfileConfig[] }
 export interface JiraConfig { enabled: boolean; site_url: string; project_key: string; issue_type: string }
 export interface GithubConfig { observation_enabled: boolean; observation_interval_minutes: number; ignored_logins: string[] }
 
@@ -22,6 +24,7 @@ export interface TrackerConfig extends Record<string, unknown> {
   updated_at: string;
   tickets: TicketIdConfig;
   providers: ProviderConfig;
+  agent_profiles: AgentProfilesConfig;
   repositories: RepositoryConfig[];
   jira: JiraConfig;
   github: GithubConfig;
@@ -62,6 +65,29 @@ function normalize(raw: unknown): TrackerConfig {
   else if (enabledProviders.length !== configuredProviders.length) errors.push("providers.enabled may contain only claude or codex");
   else if (new Set(enabledProviders).size !== enabledProviders.length) errors.push("providers.enabled must not contain duplicates");
   const providers = { enabled: enabledProviders };
+  const rawAgentProfiles = isRecord(raw.agent_profiles) ? raw.agent_profiles : {};
+  const profileValues = Array.isArray(rawAgentProfiles.profiles) ? rawAgentProfiles.profiles : [
+    { id: "default", label: "Default", provider: "codex", model: "gpt-5.6-sol", reasoning: "high" },
+  ];
+  const profiles: AgentProfileConfig[] = profileValues.map((item, index) => {
+    const profile = isRecord(item) ? item : {};
+    const id = typeof profile.id === "string" ? profile.id.trim() : "";
+    const label = typeof profile.label === "string" ? profile.label.trim() : "";
+    const provider = PROVIDERS.includes(profile.provider as Provider) ? profile.provider as Provider : "codex";
+    const model = typeof profile.model === "string" ? profile.model.trim() : "";
+    const reasoning = typeof profile.reasoning === "string" ? profile.reasoning.trim() : "";
+    if (!/^[a-z][a-z0-9-]{0,63}$/.test(id)) errors.push(`agent_profiles.profiles[${index}].id must be a lowercase artifact id`);
+    if (!label) errors.push(`agent_profiles.profiles[${index}].label is required`);
+    if (!PROVIDERS.includes(profile.provider as Provider)) errors.push(`agent_profiles.profiles[${index}].provider must be claude or codex`);
+    if (!model) errors.push(`agent_profiles.profiles[${index}].model is required`);
+    if (!reasoning) errors.push(`agent_profiles.profiles[${index}].reasoning is required`);
+    return { id, label, provider, model, reasoning };
+  });
+  if (!profiles.length) errors.push("agent_profiles.profiles must contain at least one profile");
+  if (new Set(profiles.map((profile) => profile.id)).size !== profiles.length) errors.push("agent profile ids must be unique");
+  const defaultProfile = typeof rawAgentProfiles.default === "string" ? rawAgentProfiles.default : "default";
+  if (!profiles.some((profile) => profile.id === defaultProfile)) errors.push("agent_profiles.default must reference a configured profile");
+  const agent_profiles = { default: defaultProfile, profiles };
   const rawJira = isRecord(raw.jira) ? raw.jira : {};
   const jira = {
     enabled: rawJira.enabled === true,
@@ -80,7 +106,7 @@ function normalize(raw: unknown): TrackerConfig {
       ? [...new Set(rawGithub.ignored_logins.map((item) => item.trim()).filter(Boolean))] : [],
   };
   if (errors.length) throw new HttpError(422, "Tracker configuration is invalid", errors);
-  return { ...raw, version, revision, updated_at: updatedAt, tickets, providers, repositories, jira, github };
+  return { ...raw, version, revision, updated_at: updatedAt, tickets, providers, agent_profiles, repositories, jira, github };
 }
 
 function serialize(config: TrackerConfig): string {
@@ -122,6 +148,7 @@ export class TrackerConfigStore {
     const config: TrackerConfig = {
       version: 1, revision: 1, updated_at: this.now().toISOString(), tickets: { id_prefix: "AGENT", next_number: 1 },
       providers: { enabled: [...PROVIDERS] }, repositories: [],
+      agent_profiles: { default: "default", profiles: [{ id: "default", label: "Default", provider: "codex", model: "gpt-5.6-sol", reasoning: "high" }] },
       jira: { enabled: false, site_url: "", project_key: "", issue_type: "Task" },
       github: { observation_enabled: false, observation_interval_minutes: 30, ignored_logins: [] },
     };
@@ -131,7 +158,7 @@ export class TrackerConfigStore {
     return config;
   }
 
-  async update(settings: Pick<TrackerConfig, "providers" | "repositories" | "jira" | "github">, expectedRevision: number): Promise<TrackerConfig> {
+  async update(settings: Pick<TrackerConfig, "providers" | "repositories" | "jira" | "github"> & { agent_profiles?: AgentProfilesConfig }, expectedRevision: number): Promise<TrackerConfig> {
     return this.serial(async () => {
       const currentBytes = await readFile(this.path, "utf8").catch(async (error: NodeJS.ErrnoException) => {
         if (error.code !== "ENOENT") throw error;
@@ -148,7 +175,7 @@ export class TrackerConfigStore {
 
   async updateRepositories(repositories: RepositoryConfig[], expectedRevision: number): Promise<TrackerConfig> {
     const current = await this.read();
-    return this.update({ providers: current.providers, repositories, jira: current.jira, github: current.github }, expectedRevision);
+    return this.update({ providers: current.providers, agent_profiles: current.agent_profiles, repositories, jira: current.jira, github: current.github }, expectedRevision);
   }
 
   async previewTicketId(existingIds: Iterable<string> = []): Promise<string> {

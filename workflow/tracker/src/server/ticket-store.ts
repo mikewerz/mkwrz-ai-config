@@ -5,12 +5,12 @@ import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "nod
 import { EventEmitter } from "node:events";
 import { watch, type FSWatcher } from "chokidar";
 import {
-  HttpError, type ActivityCapability, type HerdrObservation, type LoadedTicket, type Phase, type Provider, type PullRequestRef, type RepositoryClaimBlocker, type TicketFrontmatter,
+  HttpError, type ActivityCapability, type HarnessTelemetryRecord, type HarnessTelemetrySnapshot, type HerdrObservation, type LoadedTicket, type Phase, type Provider, type PullRequestRef, type RepositoryClaimBlocker, type TicketFrontmatter, type TokenUsage,
   type TicketSummary, canProviderClaim, canSupervisorOwn, requiredProvider, supervisorReservationActive,
 } from "./domain.js";
 import { appendEvent, ensureInteractionLog, parseDocument, serializeDocument } from "./markdown.js";
 import { normalizeTicket, validateSessionInvariant } from "./validation.js";
-import { beginNodeRun, nodeAttemptCounter, requiredActivityCapability, resolveNodeProvider, transitionTo, workflowNode, workflowNodeEnabled, type WorkflowLibrary, type WorkflowNode } from "./workflow-library.js";
+import { accountNodeRunTiming, activeWorkflowIdentity, beginNodeRun, enterCurrentNode, nodeAttemptCounter, requiredActivityCapability, resolveNodeProvider, runtimeNodeKey, transitionTo, workflowNode, workflowNodeEnabled, type WorkflowLibrary, type WorkflowNode } from "./workflow-library.js";
 
 interface StoreOptions {
   leaseTtlMs?: number;
@@ -35,6 +35,44 @@ function digest(content: string): string {
 function phaseKey(phase: Phase): "specification" | "implementation" | "review" {
   if (phase === "done") throw new HttpError(409, "Done tickets cannot be assigned");
   return phase;
+}
+
+const usageKeys: Array<keyof TokenUsage> = [
+  "input_tokens", "cached_input_tokens", "cache_write_input_tokens",
+  "output_tokens", "reasoning_output_tokens", "total_tokens",
+];
+
+function sameTelemetrySession(left: HarnessTelemetrySnapshot, right: HarnessTelemetrySnapshot): boolean {
+  return left.harness === right.harness && left.session_ref === right.session_ref;
+}
+
+function telemetryRecord(
+  latest: HarnessTelemetrySnapshot,
+  requestedBaseline?: HarnessTelemetrySnapshot,
+  previous?: HarnessTelemetryRecord | null,
+): HarnessTelemetryRecord {
+  if (previous && sameTelemetrySession(previous.latest, latest)
+    && Date.parse(latest.observed_at) < Date.parse(previous.latest.observed_at)) return structuredClone(previous);
+  const baseline = requestedBaseline && sameTelemetrySession(requestedBaseline, latest)
+    ? structuredClone(requestedBaseline)
+    : previous && sameTelemetrySession(previous.baseline, latest)
+      ? structuredClone(previous.baseline)
+      : structuredClone(latest);
+  const usage = baseline.usage && latest.usage
+    ? Object.fromEntries(usageKeys.map((key) => [key, Math.max(0, latest.usage![key] - baseline.usage![key])])) as unknown as TokenUsage
+    : null;
+  const costUsd = baseline.cost.total_usd !== null && latest.cost.total_usd !== null
+    ? Number(Math.max(0, latest.cost.total_usd - baseline.cost.total_usd).toFixed(12))
+    : null;
+  return { baseline, latest: structuredClone(latest), delta: { usage, cost_usd: costUsd } };
+}
+
+function timingState(snapshot: HarnessTelemetrySnapshot, now: Date): { state: "active" | "quota_paused"; pause_limit_id?: string; pause_until?: string | null } {
+  const exhausted = snapshot.rate_limits.find((limit) => limit.used_percent >= 100
+    && (!limit.resets_at || Date.parse(limit.resets_at) > now.getTime()));
+  return exhausted
+    ? { state: "quota_paused", pause_limit_id: exhausted.id, pause_until: exhausted.resets_at }
+    : { state: "active" };
 }
 
 async function markdownFiles(root: string): Promise<string[]> {
@@ -75,6 +113,132 @@ export class TicketStore extends EventEmitter {
   }
 
   setWorkflowLibrary(library: WorkflowLibrary): void { this.workflowLibrary = library; }
+
+  private async settleAutomaticLoaded(current: LoadedTicket & { frontmatter: TicketFrontmatter }): Promise<LoadedTicket & { frontmatter: TicketFrontmatter }> {
+    if (!this.workflowLibrary || !current.frontmatter.workflow || current.frontmatter.execution) return current;
+    const ticket = structuredClone(current.frontmatter);
+    let changed = false;
+    for (let step = 0; step < 100; step += 1) {
+      const identity = activeWorkflowIdentity(ticket);
+      const definition = (await this.workflowLibrary.get(identity.id, identity.revision)).definition;
+      const node = workflowNode(definition, ticket.workflow!.current_node);
+      if (node.type === "read") {
+        const value = ticket.metadata?.[node.metadata_key ?? ""];
+        const route = node.metadata_cases?.find((candidate) => !candidate.default && JSON.stringify(candidate.equals) === JSON.stringify(value))
+          ?? node.metadata_cases?.find((candidate) => candidate.default);
+        if (!route) { ticket.status = "blocked"; changed = true; break; }
+        transitionTo(ticket, definition, route.target, {
+          outcome: route.id, summary: `Metadata ${node.metadata_key} matched ${route.label}.`,
+          handoff: JSON.stringify(value ?? null), actor: "workflow", source_node: node.id,
+        });
+        changed = true; continue;
+      }
+      if (node.type === "write") {
+        ticket.metadata ??= {};
+        ticket.metadata[node.metadata_key!] = structuredClone(node.metadata_value ?? null);
+        transitionTo(ticket, definition, node.next!, {
+          outcome: "completed", summary: `Metadata ${node.metadata_key} was updated.`,
+          handoff: JSON.stringify(node.metadata_value ?? null), actor: "workflow", source_node: node.id,
+        });
+        changed = true; continue;
+      }
+      if (node.type === "fan_out") {
+        const branches = node.branches ?? [];
+        ticket.workflow!.fan_out_stack ??= [];
+        ticket.workflow!.fan_out_stack.push({
+          workflow_id: identity.id, workflow_revision: identity.revision,
+          fan_out_node_id: node.id, fan_in_node_id: node.fan_in!,
+          pending_targets: branches.slice(1).map((branch) => branch.target), inputs: [],
+          source: ticket.workflow!.incoming ? structuredClone(ticket.workflow!.incoming) : null,
+        });
+        const first = branches[0]!;
+        transitionTo(ticket, definition, first.target, {
+          outcome: first.id, summary: `Fan-out started ${branches.length} branches.`,
+          handoff: ticket.workflow!.incoming?.handoff ?? null, output: ticket.workflow!.incoming?.output ?? null,
+          output_log_path: ticket.workflow!.incoming?.output_log_path ?? null, actor: "workflow", source_node: node.id,
+        });
+        changed = true; continue;
+      }
+      if (node.type === "fan_in") {
+        const stack = ticket.workflow!.fan_out_stack ?? [];
+        const frameIndex = stack.findLastIndex((frame) => frame.workflow_id === identity.id && frame.fan_in_node_id === node.id);
+        if (frameIndex < 0) { ticket.status = "blocked"; changed = true; break; }
+        const frame = stack[frameIndex]!;
+        if (ticket.workflow!.incoming) frame.inputs.push(structuredClone(ticket.workflow!.incoming));
+        const nextBranch = frame.pending_targets.shift();
+        if (nextBranch) {
+          const joinKey = runtimeNodeKey(ticket, node.id);
+          ticket.workflow!.node_visits[joinKey] = Math.max(0, (ticket.workflow!.node_visits[joinKey] ?? 1) - 1);
+          const now = this.clock().toISOString();
+          ticket.workflow!.current_node = nextBranch;
+          ticket.workflow!.current_node_entered_at = now;
+          ticket.workflow!.transition_count += 1;
+          ticket.workflow!.incoming = {
+            source_node: frame.fan_out_node_id, target_node: nextBranch, outcome: "fanout_branch",
+            summary: frame.source?.summary ?? "Continuing fan-out branch.", handoff: frame.source?.handoff ?? null,
+            output: frame.source?.output ?? null, output_log_path: frame.source?.output_log_path ?? null,
+            actor: "workflow", created_at: now,
+          };
+          enterCurrentNode(ticket, definition, true);
+        } else {
+          stack.splice(frameIndex, 1);
+          const summaries = frame.inputs.map((input) => `${input.source_node}: ${input.summary ?? input.outcome}`).join("\n");
+          const outputs = frame.inputs.map((input) => input.output).filter((value): value is string => Boolean(value)).join("\n\n");
+          const logs = frame.inputs.map((input) => input.output_log_path).filter((value): value is string => Boolean(value));
+          transitionTo(ticket, definition, node.next!, {
+            outcome: "completed", summary: `Fan-in merged ${frame.inputs.length} branches.`, handoff: summaries || null,
+            output: outputs || null, output_log_path: logs.length ? logs.join("\n") : null,
+            actor: "workflow", source_node: node.id,
+          });
+        }
+        changed = true; continue;
+      }
+      if (node.type === "workflow") {
+        ticket.workflow!.workflow_stack ??= [];
+        ticket.workflow!.workflow_revisions ??= { [ticket.workflow!.id]: ticket.workflow!.revision };
+        if (ticket.workflow!.workflow_stack.length >= 16 || ticket.workflow!.transition_count >= definition.max_transitions) {
+          ticket.status = "blocked"; changed = true; break;
+        }
+        const childDocument = ticket.workflow!.workflow_revisions[node.workflow_id!]
+          ? await this.workflowLibrary.get(node.workflow_id!, ticket.workflow!.workflow_revisions[node.workflow_id!])
+          : await this.workflowLibrary.get(node.workflow_id!);
+        ticket.workflow!.workflow_revisions[node.workflow_id!] = childDocument.revision;
+        ticket.workflow!.workflow_stack.push({ workflow_id: identity.id, workflow_revision: identity.revision, call_node_id: node.id });
+        ticket.workflow!.active_workflow_id = childDocument.definition.id;
+        ticket.workflow!.active_workflow_revision = childDocument.revision;
+        ticket.workflow!.current_node = childDocument.definition.start;
+        ticket.workflow!.current_node_entered_at = this.clock().toISOString();
+        ticket.workflow!.transition_count += 1;
+        enterCurrentNode(ticket, childDocument.definition, true);
+        changed = true; continue;
+      }
+      if (node.type === "terminal" && (ticket.workflow!.workflow_stack?.length ?? 0) > 0) {
+        const frame = ticket.workflow!.workflow_stack!.pop()!;
+        const parent = (await this.workflowLibrary.get(frame.workflow_id, frame.workflow_revision)).definition;
+        const callNode = workflowNode(parent, frame.call_node_id);
+        const statusCode = node.status_code ?? (node.terminal_status === "completed" ? 0 : 1);
+        const routes = callNode.status_codes ?? [];
+        const route = routes.find((candidate) => candidate.codes?.includes(statusCode)) ?? routes.find((candidate) => candidate.default);
+        ticket.workflow!.active_workflow_id = frame.workflow_id;
+        ticket.workflow!.active_workflow_revision = frame.workflow_revision;
+        ticket.workflow!.current_node = frame.call_node_id;
+        if (!route) { ticket.status = "blocked"; changed = true; break; }
+        transitionTo(ticket, parent, route.target, {
+          outcome: route.id, summary: `Workflow ${identity.id} returned status code ${statusCode}.`,
+          handoff: ticket.workflow!.incoming?.handoff ?? null, output: ticket.workflow!.incoming?.output ?? null,
+          output_log_path: ticket.workflow!.incoming?.output_log_path ?? null, actor: "workflow", source_node: frame.call_node_id,
+        });
+        changed = true; continue;
+      }
+      break;
+    }
+    if (!changed) return current;
+    return this.mutateLoaded(current, ticket, current.body, { event: "workflow.advanced", message: "Automatic workflow nodes advanced." }) as Promise<LoadedTicket & { frontmatter: TicketFrontmatter }>;
+  }
+
+  async settleAutomatic(id: string): Promise<LoadedTicket> {
+    return this.serial(async () => this.settleAutomaticLoaded(await this.findValid(id)));
+  }
 
   async persistNodeRunOutput(ticketId: string, runId: string, output: string): Promise<{ path: string; sha256: string; bytes: number }> {
     if (!/^[a-f0-9-]{16,64}$/i.test(runId)) throw new HttpError(422, "Node run id is invalid");
@@ -185,7 +349,8 @@ export class TicketStore extends EventEmitter {
       let workflowStageName: string | null = null;
       if (ticket?.workflow && this.workflowLibrary) {
         try {
-          const definition = (await this.workflowLibrary.get(ticket.workflow.id, ticket.workflow.revision)).definition;
+          const identity = activeWorkflowIdentity(ticket);
+          const definition = (await this.workflowLibrary.get(identity.id, identity.revision)).definition;
           const node = workflowNode(definition, ticket.workflow.current_node);
           provider = resolveNodeProvider(ticket, node);
           workflowNodeId = node.id;
@@ -211,15 +376,17 @@ export class TicketStore extends EventEmitter {
         work_provider: ticket?.work_provider ?? "claude", review_provider: ticket?.review_provider ?? "codex",
         review_required: ticket?.review_required ?? false,
         priority: ticket?.priority ?? 0, provider, revision: ticket?.revision ?? 0,
+        created_at: ticket?.created_at ?? "",
         valid: loaded.valid, errors: loaded.errors, path: loaded.relativePath, claim_blockers: claimBlockers,
         archived_at: ticket?.archived_at ?? null,
+        production_result: ticket?.production_result ?? "unassessed",
         workflow_id: ticket?.workflow?.id ?? null,
         workflow_node_id: workflowNodeId,
         workflow_node_name: workflowNodeName,
         workflow_stage_name: workflowStageName,
       };
     }));
-    return summaries.sort((a, b) => b.priority - a.priority || a.id.localeCompare(b.id));
+    return summaries.sort((a, b) => b.priority - a.priority || a.created_at.localeCompare(b.created_at) || a.id.localeCompare(b.id));
   }
 
   async get(id: string): Promise<LoadedTicket> {
@@ -268,7 +435,7 @@ export class TicketStore extends EventEmitter {
             || (normalized.ticket.status !== "running" && normalized.ticket.status !== "blocked");
           if (incompatible) {
             const run = normalized.ticket.workflow?.node_runs.find((candidate) => candidate.id === priorTicket.execution?.node_run_id);
-            if (run?.status === "running") { run.status = "interrupted"; run.completed_at = this.clock().toISOString(); run.outcome = "external_edit_fenced"; run.summary = "External state edit fenced the active lease."; }
+            if (run?.status === "running") { const now = this.clock().toISOString(); accountNodeRunTiming(run, now); run.status = "interrupted"; run.completed_at = now; run.outcome = "external_edit_fenced"; run.summary = "External state edit fenced the active lease."; }
             normalized.ticket.execution = null;
             if (normalized.ticket.status === "running" || normalized.ticket.status === "blocked") {
               normalized.ticket.status = normalized.ticket.phase === "done" ? "completed" : "ready";
@@ -425,7 +592,8 @@ export class TicketStore extends EventEmitter {
         if (rewindPhase === "review" && !next.review_required) throw new HttpError(422, "Review is not enabled");
         let workflowTarget: WorkflowNode | null = null;
         if (next.workflow && this.workflowLibrary) {
-          const definition = (await this.workflowLibrary.get(next.workflow.id, next.workflow.revision)).definition;
+          const identity = activeWorkflowIdentity(next);
+          const definition = (await this.workflowLibrary.get(identity.id, identity.revision)).definition;
           workflowTarget = definition.nodes.find((node) => node.type === "agent" && node.phase === rewindPhase) ?? null;
           if (!workflowTarget) throw new HttpError(422, `Pinned workflow has no ${rewindPhase} agent node`);
         }
@@ -434,14 +602,15 @@ export class TicketStore extends EventEmitter {
           if (next.execution.interrupt_request) throw new HttpError(409, "Ticket is already waiting for agent interruption");
           next.execution.interrupt_request = {
             target_phase: rewindPhase, requested_at: this.clock().toISOString(),
-            ...(workflowTarget && next.workflow ? { target_node: workflowTarget.id, target_workflow_id: next.workflow.id, target_workflow_revision: next.workflow.revision } : {}),
+            ...(workflowTarget && next.workflow ? { target_node: workflowTarget.id, target_workflow_id: activeWorkflowIdentity(next).id, target_workflow_revision: activeWorkflowIdentity(next).revision } : {}),
           };
           next.phase = validCurrent.frontmatter.phase;
           next.status = validCurrent.frontmatter.status;
           eventMessage = `Ticket edited; interrupt requested before restarting at ${rewindPhase}.`;
         } else {
           if (workflowTarget && next.workflow && this.workflowLibrary) {
-            const definition = (await this.workflowLibrary.get(next.workflow.id, next.workflow.revision)).definition;
+            const identity = activeWorkflowIdentity(next);
+            const definition = (await this.workflowLibrary.get(identity.id, identity.revision)).definition;
             transitionTo(next, definition, workflowTarget.id, { outcome: "operator_rewind", summary: `Operator restarted work at ${workflowTarget.name}.`, actor: "operator" });
           } else { next.phase = rewindPhase; next.status = "ready"; }
           eventMessage = `Ticket edited and rewound to ${rewindPhase}.`;
@@ -489,6 +658,26 @@ export class TicketStore extends EventEmitter {
     return current as LoadedTicket & { frontmatter: TicketFrontmatter };
   }
 
+  private async workflowRequirements(ticket: TicketFrontmatter): Promise<{
+    providers: Provider[]; activities: ActivityCapability[];
+  }> {
+    if (!ticket.workflow || !this.workflowLibrary) return { providers: [], activities: [] };
+    const revisions = ticket.workflow.workflow_revisions ?? { [ticket.workflow.id]: ticket.workflow.revision };
+    const providers = new Set<Provider>();
+    const activities = new Set<ActivityCapability>();
+    for (const [workflowId, revision] of Object.entries(revisions)) {
+      const definition = (await this.workflowLibrary.get(workflowId, revision)).definition;
+      for (const node of definition.nodes) {
+        if (!workflowNodeEnabled(ticket, definition, node)) continue;
+        const provider = resolveNodeProvider(ticket, node, workflowId);
+        if (provider) providers.add(provider);
+        const capability = requiredActivityCapability(node);
+        if (capability) activities.add(capability);
+      }
+    }
+    return { providers: [...providers], activities: [...activities] };
+  }
+
   async claim(
     supervisorId: string,
     provider: Provider,
@@ -498,7 +687,8 @@ export class TicketStore extends EventEmitter {
   ): Promise<LoadedTicket | null> {
     return this.serial(async () => {
       await this.expireLeasesInternal();
-      const tickets = (await this.scanInternal(false)).filter((item): item is LoadedTicket & { frontmatter: TicketFrontmatter } => Boolean(item.valid && item.frontmatter));
+      let tickets = (await this.scanInternal(false)).filter((item): item is LoadedTicket & { frontmatter: TicketFrontmatter } => Boolean(item.valid && item.frontmatter));
+      tickets = await Promise.all(tickets.map((ticket) => this.settleAutomaticLoaded(ticket)));
       const reservation = tickets.find((item) => item.frontmatter.assigned_supervisor === supervisorId && supervisorReservationActive(item.frontmatter));
       const candidates = tickets.filter((item) => item.frontmatter.status === "ready"
         && (!reservation || item.frontmatter.id === reservation.frontmatter.id)
@@ -516,19 +706,11 @@ export class TicketStore extends EventEmitter {
       for (const candidate of candidates) {
         if (!candidate.frontmatter.workflow) { match = candidate; break; }
         if (!this.workflowLibrary) continue;
-        const definition = (await this.workflowLibrary.get(candidate.frontmatter.workflow.id, candidate.frontmatter.workflow.revision)).definition;
-        const required = [...new Set(definition.nodes.flatMap((node) => {
-          if (!workflowNodeEnabled(candidate.frontmatter, definition, node)) return [];
-          const selected = resolveNodeProvider(candidate.frontmatter, node);
-          return selected ? [selected] : [];
-        }))];
-        if (candidate.frontmatter.assigned_supervisor === null && required.some((requiredProvider) => !availableProviders.includes(requiredProvider))) continue;
-        const requiredActivities = [...new Set(definition.nodes.flatMap((node) => {
-          if (!workflowNodeEnabled(candidate.frontmatter, definition, node)) return [];
-          const capability = requiredActivityCapability(node);
-          return capability ? [capability] : [];
-        }))];
-        if (candidate.frontmatter.assigned_supervisor === null && requiredActivities.some((capability) => !activityCapabilities.includes(capability))) continue;
+        const identity = activeWorkflowIdentity(candidate.frontmatter);
+        const definition = (await this.workflowLibrary.get(identity.id, identity.revision)).definition;
+        const requirements = await this.workflowRequirements(candidate.frontmatter);
+        if (candidate.frontmatter.assigned_supervisor === null && requirements.providers.some((requiredProvider) => !availableProviders.includes(requiredProvider))) continue;
+        if (candidate.frontmatter.assigned_supervisor === null && requirements.activities.some((capability) => !activityCapabilities.includes(capability))) continue;
         const node = workflowNode(definition, candidate.frontmatter.workflow.current_node);
         if (node.type === "agent" && resolveNodeProvider(candidate.frontmatter, node) === provider) {
           match = candidate; workflowNodeForClaim = node; break;
@@ -549,11 +731,11 @@ export class TicketStore extends EventEmitter {
       ticket.execution = {
         lease_id: lease, supervisor_id: supervisorId, provider, phase: ticket.phase, attempt: attemptNumber,
         claimed_at: now.toISOString(), last_heartbeat_at: now.toISOString(), lease_expires_at: new Date(now.getTime() + this.leaseTtlMs).toISOString(),
-        observed_herdr_state: null, herdr_observation: null, guidance: [],
+        observed_herdr_state: null, herdr_observation: null, telemetry: null, guidance: [],
         interrupt_request: null,
       };
       if (workflowNodeForClaim && ticket.workflow) {
-        const run = beginNodeRun(ticket, workflowNodeForClaim, ticket.workflow.revision, attemptNumber, now.toISOString(), supervisorId, provider);
+        const run = beginNodeRun(ticket, workflowNodeForClaim, activeWorkflowIdentity(ticket).revision, attemptNumber, now.toISOString(), supervisorId, provider, lease);
         ticket.execution.node_run_id = run.id;
         ticket.execution.node_id = workflowNodeForClaim.id;
         ticket.execution.node_type = "agent";
@@ -585,7 +767,8 @@ export class TicketStore extends EventEmitter {
     return this.serial(async () => {
       if (!this.workflowLibrary) return null;
       await this.expireLeasesInternal();
-      const tickets = (await this.scanInternal(false)).filter((item): item is LoadedTicket & { frontmatter: TicketFrontmatter } => Boolean(item.valid && item.frontmatter));
+      let tickets = (await this.scanInternal(false)).filter((item): item is LoadedTicket & { frontmatter: TicketFrontmatter } => Boolean(item.valid && item.frontmatter));
+      tickets = await Promise.all(tickets.map((ticket) => this.settleAutomaticLoaded(ticket)));
       const reservation = tickets.find((item) => item.frontmatter.assigned_supervisor === supervisorId && supervisorReservationActive(item.frontmatter));
       for (const current of tickets.filter((item) => item.frontmatter.status === "ready" && item.frontmatter.workflow)
         .sort((a, b) => b.frontmatter.priority - a.frontmatter.priority || a.frontmatter.created_at.localeCompare(b.frontmatter.created_at))) {
@@ -593,13 +776,11 @@ export class TicketStore extends EventEmitter {
         if (reservation && reservation.frontmatter.id !== ticket.id) continue;
         if (ticket.assigned_supervisor && ticket.assigned_supervisor !== supervisorId) continue;
         if (ticket.assigned_supervisor_host && ticket.assigned_supervisor_host !== supervisorHost) continue;
-        const definition = (await this.workflowLibrary.get(ticket.workflow!.id, ticket.workflow!.revision)).definition;
-        const required = [...new Set(definition.nodes.flatMap((candidate) => {
-          if (!workflowNodeEnabled(ticket, definition, candidate)) return [];
-          const selected = resolveNodeProvider(ticket, candidate);
-          return selected ? [selected] : [];
-        }))];
-        if (ticket.assigned_supervisor === null && required.some((provider) => !availableProviders.includes(provider))) continue;
+        const identity = activeWorkflowIdentity(ticket);
+        const definition = (await this.workflowLibrary.get(identity.id, identity.revision)).definition;
+        const requirements = await this.workflowRequirements(ticket);
+        if (ticket.assigned_supervisor === null && requirements.providers.some((provider) => !availableProviders.includes(provider))) continue;
+        if (ticket.assigned_supervisor === null && requirements.activities.some((capability) => !activityCapabilities.includes(capability))) continue;
         const node = workflowNode(definition, ticket.workflow!.current_node);
         if (node.type !== "script") continue;
         const capability = requiredActivityCapability(node);
@@ -615,11 +796,12 @@ export class TicketStore extends EventEmitter {
         next.attempts[key].total += 1;
         const attemptCounter = nodeAttemptCounter(next, node.id);
         attemptCounter.total += 1;
-        const run = beginNodeRun(next, node, next.workflow!.revision, attemptCounter.total, now.toISOString(), supervisorId, null);
+        const lease = randomUUID();
+        const run = beginNodeRun(next, node, activeWorkflowIdentity(next).revision, attemptCounter.total, now.toISOString(), supervisorId, null, lease);
         next.execution = {
-          lease_id: randomUUID(), supervisor_id: supervisorId, provider: null, phase: next.phase, attempt: attemptCounter.total,
+          lease_id: lease, supervisor_id: supervisorId, provider: null, phase: next.phase, attempt: attemptCounter.total,
           claimed_at: now.toISOString(), last_heartbeat_at: now.toISOString(), lease_expires_at: new Date(now.getTime() + this.leaseTtlMs).toISOString(),
-          observed_herdr_state: null, herdr_observation: null, guidance: [], interrupt_request: null,
+          observed_herdr_state: null, herdr_observation: null, telemetry: null, guidance: [], interrupt_request: null,
           node_run_id: run.id, node_id: node.id, node_type: node.type,
         };
         return this.mutateLoaded(current, next, current.body, { event: "activity.claimed", message: `${supervisorId} claimed ${node.type} node ${node.id}.` });
@@ -639,6 +821,8 @@ export class TicketStore extends EventEmitter {
     state?: string; paneId?: string; sessionRef?: string; guidanceCursor?: number;
     supervisorHost?: string;
     herdr?: Partial<Omit<HerdrObservation, "state" | "observed_at" | "state_changed_at">>;
+    telemetry?: HarnessTelemetrySnapshot;
+    telemetryBaseline?: HarnessTelemetrySnapshot;
   }): Promise<LoadedTicket> {
     const leased = await this.byLease(leaseId);
     return this.command(leased.frontmatter.id, { event: "work.heartbeat", message: "Lease heartbeat accepted.", silent: true }, (ticket) => {
@@ -647,6 +831,13 @@ export class TicketStore extends EventEmitter {
       if (!ticket.assigned_supervisor_host && observation.supervisorHost) ticket.assigned_supervisor_host = observation.supervisorHost;
       ticket.execution.last_heartbeat_at = now.toISOString();
       ticket.execution.lease_expires_at = new Date(now.getTime() + this.leaseTtlMs).toISOString();
+      const run = ticket.workflow?.node_runs.find((candidate) => candidate.id === ticket.execution?.node_run_id);
+      if (run) accountNodeRunTiming(run, now.toISOString(), observation.telemetry ? timingState(observation.telemetry, now) : undefined);
+      if (observation.telemetry) {
+        const measured = telemetryRecord(observation.telemetry, observation.telemetryBaseline, ticket.execution.telemetry);
+        ticket.execution.telemetry = measured;
+        if (run) run.telemetry = measured;
+      }
       if (observation.state !== undefined) ticket.execution.observed_herdr_state = observation.state;
       if (observation.state !== undefined || observation.paneId !== undefined || observation.herdr !== undefined) {
         const previous = ticket.execution.herdr_observation;
@@ -698,6 +889,27 @@ export class TicketStore extends EventEmitter {
     });
   }
 
+  async recordTelemetry(
+    leaseId: string,
+    latest: HarnessTelemetrySnapshot,
+    baseline?: HarnessTelemetrySnapshot,
+  ): Promise<LoadedTicket> {
+    const tickets = await this.list();
+    const found = tickets.find((item) => item.valid && item.frontmatter
+      && (item.frontmatter.execution?.lease_id === leaseId
+        || item.frontmatter.workflow?.node_runs.some((run) => run.lease_id === leaseId)));
+    if (!found?.frontmatter) throw new HttpError(409, "Telemetry lease is unknown or no longer retained");
+    return this.command(found.frontmatter.id, { event: "work.telemetry", message: "Harness telemetry recorded.", silent: true }, (ticket) => {
+      const run = ticket.workflow?.node_runs.find((candidate) => candidate.lease_id === leaseId);
+      const execution = ticket.execution?.lease_id === leaseId ? ticket.execution : null;
+      if (!run && !execution) throw new HttpError(409, "Telemetry lease is unknown or no longer retained");
+      const measured = telemetryRecord(latest, baseline, execution?.telemetry ?? run?.telemetry);
+      if (execution) execution.telemetry = measured;
+      if (run) run.telemetry = measured;
+      return { ticket };
+    });
+  }
+
   async expireLeases(): Promise<number> { return this.serial(() => this.expireLeasesInternal()); }
 
   private async expireLeasesInternal(): Promise<number> {
@@ -710,11 +922,12 @@ export class TicketStore extends EventEmitter {
       if (execution.interrupt_request) {
         const interrupt = execution.interrupt_request;
         const transitionsWithinWorkflow = Boolean(!interrupt.terminal_status && ticket.workflow && interrupt.target_node && this.workflowLibrary
-          && interrupt.target_workflow_id === ticket.workflow.id && interrupt.target_workflow_revision === ticket.workflow.revision);
+          && interrupt.target_workflow_id === activeWorkflowIdentity(ticket).id && interrupt.target_workflow_revision === activeWorkflowIdentity(ticket).revision);
         const run = ticket.workflow?.node_runs.find((candidate) => candidate.id === execution.node_run_id);
-        if (run?.status === "running") { run.status = "interrupted"; run.completed_at = this.clock().toISOString(); run.outcome = transitionsWithinWorkflow ? "operator_interrupt_timeout" : "interrupt_timeout"; run.summary = "Execution interruption was not acknowledged before lease expiry."; }
+        if (run?.status === "running") { const now = this.clock().toISOString(); accountNodeRunTiming(run, now); run.status = "interrupted"; run.completed_at = now; run.outcome = transitionsWithinWorkflow ? "operator_interrupt_timeout" : "interrupt_timeout"; run.summary = "Execution interruption was not acknowledged before lease expiry."; }
         if (transitionsWithinWorkflow && ticket.workflow && interrupt.target_node && this.workflowLibrary) {
-          const definition = (await this.workflowLibrary.get(ticket.workflow.id, ticket.workflow.revision)).definition;
+          const identity = activeWorkflowIdentity(ticket);
+          const definition = (await this.workflowLibrary.get(identity.id, identity.revision)).definition;
           transitionTo(ticket, definition, interrupt.target_node, {
             outcome: "operator_interrupt_timeout", summary: "The prior execution was fenced after its interrupt acknowledgement timed out.", actor: "workflow",
           });
@@ -729,7 +942,7 @@ export class TicketStore extends EventEmitter {
       }
       const key = phaseKey(ticket.phase);
       const run = ticket.workflow?.node_runs.find((candidate) => candidate.id === execution.node_run_id);
-      if (run?.status === "running") { run.status = "failed"; run.completed_at = this.clock().toISOString(); run.outcome = "lease_lost"; run.summary = "Lease expired without a callback."; }
+      if (run?.status === "running") { const now = this.clock().toISOString(); accountNodeRunTiming(run, now); run.status = "failed"; run.completed_at = now; run.outcome = "lease_lost"; run.summary = "Lease expired without a callback."; }
       const attemptCounter = nodeAttemptCounter(ticket, execution.node_id);
       attemptCounter.consecutive_lease_losses += 1;
       ticket.attempts[key].consecutive_lease_losses = attemptCounter.consecutive_lease_losses;

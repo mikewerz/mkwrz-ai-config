@@ -11,7 +11,12 @@ const roots: string[] = [];
 const execute = promisify(execFile);
 afterEach(async () => { await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true }))); });
 
-function claim(root: string, activity: { action?: string; inline?: { language: "shell" | "python" | "javascript"; code: string } } = { action: "verify" }): ClaimedTicket {
+function claim(root: string, activity: {
+  action?: string;
+  script_file?: { relative_to: "selected_repository" | "primary_repository" | "project_root"; path?: string; path_input?: string };
+  working_directory?: { relative_to: "selected_repository" | "primary_repository" | "project_root"; path?: string; path_input?: string };
+  inline?: { language: "shell" | "python" | "javascript"; code: string };
+} = { action: "verify" }): ClaimedTicket {
   return {
     id: "AGENT-0001", path: join(root, "ticket.md"), markdown: "# Work",
     frontmatter: {
@@ -60,6 +65,49 @@ describe("repository activities", () => {
     await expect(runRepositoryActivity(root, claim(root, { inline: { language: "shell", code: "printf failure >&2; exit 7" } }))).resolves.toMatchObject({
       success: false, output: "failure", exit_code: 7,
     });
+  });
+
+  it("resolves ticket-provided script and working-directory paths against independent bases", async () => {
+    const root = await mkdtemp(join(tmpdir(), "factory-paths-")); roots.push(root);
+    const primary = join(root, "demo");
+    const selected = join(root, "shared");
+    await mkdir(join(primary, "tools"), { recursive: true });
+    await mkdir(join(selected, "services", "api"), { recursive: true });
+    const script = join(primary, "tools", "deploy.sh");
+    await writeFile(script, "#!/bin/sh\nprintf '%s\\n%s\\n%s' \"$PWD\" \"$AGENTIC_SCRIPT_PATH\" \"$AGENTIC_WORKING_DIRECTORY\"\n");
+    await chmod(script, 0o700);
+    const ticket = claim(root, {
+      script_file: { relative_to: "primary_repository", path_input: "deploy_script" },
+      working_directory: { relative_to: "selected_repository", path_input: "deploy_directory" },
+    });
+    ticket.frontmatter.repositories = [{ id: "demo", primary: true }, { id: "shared", primary: false }];
+    ticket.frontmatter.workflow = {
+      id: "paths", revision: "workflow-revision", current_node: "deploy",
+      inputs: { deploy_script: "tools/deploy.sh", deploy_directory: "services/api" }, incoming: null,
+    };
+    ticket.workflow_node = {
+      ...ticket.workflow_node!, id: "deploy", name: "Deploy", type: "script", phase: "implementation", repository: "shared",
+      script_file: { relative_to: "primary_repository", path_input: "deploy_script" },
+      working_directory: { relative_to: "selected_repository", path_input: "deploy_directory" },
+      outcomes: [], choices: [], exit_codes: [{ id: "success", label: "Success", description: "Done.", target: "done", codes: [0] }],
+    };
+
+    const result = await runRepositoryActivity(root, ticket);
+    const expectedScript = await realpath(script);
+    const expectedWorkingDirectory = await realpath(join(selected, "services", "api"));
+    expect(result).toMatchObject({ success: true, script_path: expectedScript, working_directory: expectedWorkingDirectory });
+    expect(result.output).toBe(`${expectedWorkingDirectory}\n${expectedScript}\n${expectedWorkingDirectory}`);
+  });
+
+  it("rejects ticket-provided paths that escape their configured base", async () => {
+    const root = await mkdtemp(join(tmpdir(), "factory-path-escape-")); roots.push(root);
+    await mkdir(join(root, "demo"), { recursive: true });
+    const ticket = claim(root, {
+      script_file: { relative_to: "selected_repository", path_input: "script" },
+      working_directory: { relative_to: "selected_repository", path: "." },
+    });
+    ticket.frontmatter.workflow = { id: "paths", revision: "revision", current_node: "verify", inputs: { script: "../outside.sh" }, incoming: null };
+    await expect(runRepositoryActivity(root, ticket)).rejects.toThrow("script path escapes selected_repository");
   });
 
   it("cancels a running inline activity when its workflow lease is interrupted", async () => {

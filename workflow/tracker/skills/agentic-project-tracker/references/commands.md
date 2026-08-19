@@ -20,6 +20,8 @@ python3 scripts/tracker.py ticket list --workflow-id end-to-end --workflow-stage
 python3 scripts/tracker.py ticket list --workflow-node "Deploy and validate non-production" --provider claude
 python3 scripts/tracker.py ticket show AGENT-0001
 python3 scripts/tracker.py ticket run-output AGENT-0001 node-run-uuid
+python3 scripts/tracker.py ticket metadata-list AGENT-0001
+python3 scripts/tracker.py ticket metadata-get AGENT-0001 deploy.status
 ```
 
 `runtime` reports active leases and Herdr observations. `supervisor list` reports online/offline presence, project roots, providers, detected Script activity capabilities, and ticket reservations. Neither lifecycle observation proves phase completion.
@@ -51,6 +53,18 @@ python3 scripts/tracker.py ticket answer-question AGENT-0001 question-uuid --rev
 
 Comments do not steer active work. Guidance is queued for the running conversation. Answering an agent question also queues the answer as guidance and may return question-blocked execution to running.
 
+## Workflow metadata
+
+```bash
+python3 scripts/tracker.py ticket metadata-list AGENT-0001
+python3 scripts/tracker.py ticket metadata-get AGENT-0001 deploy.status
+python3 scripts/tracker.py ticket metadata-set AGENT-0001 deploy.status --revision 7 --value-json '"ready"'
+python3 scripts/tracker.py ticket metadata-set AGENT-0001 deploy.result --revision 8 --value-json-file /tmp/result.json
+python3 scripts/tracker.py ticket metadata-delete AGENT-0001 deploy.result --revision 9
+```
+
+Metadata keys are literal names and values may be any JSON value accepted by the tracker. Read the ticket immediately before setting or deleting a value, then use the returned revision. Metadata is appropriate for small workflow decisions and counters; use Script output artifacts or repositories for logs and large domain artifacts.
+
 ## Workflow controls
 
 ```bash
@@ -63,11 +77,14 @@ python3 scripts/tracker.py ticket reopen AGENT-0001 --revision 14 --phase implem
 python3 scripts/tracker.py ticket release-supervisor AGENT-0001 --revision 11
 python3 scripts/tracker.py ticket fail AGENT-0001 --revision 11 --message "Operator stopped the work."
 python3 scripts/tracker.py ticket cancel AGENT-0001 --revision 11 --message "No longer required."
-python3 scripts/tracker.py ticket archive AGENT-0001 --revision 15
-python3 scripts/tracker.py ticket unarchive AGENT-0001 --revision 16
+python3 scripts/tracker.py ticket archive AGENT-0001 --revision 15 --production-result succeeded --production-note "Healthy after rollout."
+python3 scripts/tracker.py ticket production-assessment AGENT-0001 --revision 16 --production-result rolled_back --production-note "A delayed alert required rollback."
+python3 scripts/tracker.py ticket unarchive AGENT-0001 --revision 17
 ```
 
 Always inspect the ticket immediately before these commands. For `ticket decide`, use only a choice ID exposed by the current `workflow_node.choices`; include `--message` when that choice requires a comment. Do not guess a revision or silently repeat a conflicted transition.
+
+Production assessment is independent of workflow completion. A completed ticket may be marked `succeeded`, `failed`, `rolled_back`, `not_deployed`, or returned to `unassessed`; the designation and note remain editable after archival. Archive may record the assessment atomically, or it may omit `--production-result` when the outcome is not known yet.
 
 For a running assignment, successful `fail` or `cancel` means the tracker requested terminal interruption; it does not mean the agent has already stopped. Reread the ticket until the supervisor acknowledges the request and the terminal state is recorded. An unacknowledged interruption may time out into blocked work requiring operator attention.
 

@@ -2,8 +2,8 @@ import { createHash, randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { resolve } from "node:path";
 import express, { type NextFunction, type Request, type Response } from "express";
-import { stringify as stringifyYaml } from "yaml";
-import { ACTIVITY_CAPABILITIES, HttpError, PHASES, PROVIDERS, type ActivityCapability, type Phase, type PullRequestRef, type TicketFrontmatter } from "./domain.js";
+import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
+import { ACTIVITY_CAPABILITIES, HttpError, PHASES, PRODUCTION_RESULTS, PROVIDERS, isProgressed, type ActivityCapability, type HarnessTelemetrySnapshot, type JsonValue, type Phase, type ProductionResult, type PullRequestRef, type ResolvedAgentProfile, type TicketFrontmatter } from "./domain.js";
 import { TicketStore, mergePullRequests } from "./ticket-store.js";
 import { SupervisorRegistry, type SupervisorPresenceInput } from "./supervisor-registry.js";
 import { TrackerConfigStore, type RepositoryConfig } from "./config-store.js";
@@ -11,8 +11,9 @@ import { parseDocument, serializeDocument } from "./markdown.js";
 import { JiraCloudClient } from "./jira.js";
 import { GithubObserver } from "./github-observer.js";
 import { PromptLibrary } from "./prompt-library.js";
-import { normalizeTicket } from "./validation.js";
-import { WorkflowLibrary, activityRoute, advanceWorkflow, beginNodeRun, enterCurrentNode, finishNodeRun, initializeWorkflow, nodeAttemptCounter, resolveNodeProvider, transitionTo, workflowNode, workflowRoute, workflowRoutes } from "./workflow-library.js";
+import { normalizeTicket, telemetrySnapshot } from "./validation.js";
+import { WorkflowLibrary, accountNodeRunTiming, activeWorkflowIdentity, activityRoute, advanceWorkflow, beginNodeRun, enterCurrentNode, finishNodeRun, initializeWorkflow, nodeAttemptCounter, resolveNodeProvider, resolvedAgentProfile, runtimeNodeKey, transitionTo, workflowNode, workflowRoute, workflowRoutes, type WorkflowDocument } from "./workflow-library.js";
+import { buildMetrics, type MetricsFilters } from "./metrics.js";
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
@@ -47,6 +48,14 @@ function heartbeatHerdr(value: unknown) {
   };
 }
 
+function heartbeatTelemetry(value: unknown, field: string): HarnessTelemetrySnapshot | undefined {
+  if (value === undefined || value === null) return undefined;
+  const errors: string[] = [];
+  const parsed = telemetrySnapshot(value, field, errors);
+  if (!parsed || errors.length) throw new HttpError(422, `Invalid ${field}`, errors);
+  return parsed;
+}
+
 function bodyDigest(value: unknown): string {
   return createHash("sha256").update(JSON.stringify(value)).digest("hex");
 }
@@ -72,6 +81,22 @@ function expectedRevision(request: Request): number | undefined {
 function message(value: unknown, field = "message"): string {
   if (typeof value !== "string" || value.trim() === "") throw new HttpError(422, `${field} must be a non-empty string`);
   return value.trim();
+}
+
+function metadataKey(value: unknown): string {
+  const key = message(value, "metadata key");
+  if (!/^[A-Za-z][A-Za-z0-9_.-]{0,127}$/.test(key)) throw new HttpError(422, "metadata key must start with a letter and contain only letters, numbers, dot, underscore, or hyphen");
+  return key;
+}
+
+function productionResult(value: unknown): ProductionResult {
+  if (!PRODUCTION_RESULTS.includes(value as never)) throw new HttpError(422, "production_result is invalid");
+  return value as ProductionResult;
+}
+
+function csvQuery(value: unknown): string[] {
+  const source = Array.isArray(value) ? value.join(",") : typeof value === "string" ? value : "";
+  return [...new Set(source.split(",").map((item) => item.trim()).filter(Boolean))];
 }
 
 interface AgentQuestionInput { question: string; options: string[] }
@@ -127,7 +152,8 @@ export function createApp(
   const workJson = async (loaded: Awaited<ReturnType<TicketStore["get"]>>) => {
     const ticket = loaded.frontmatter;
     if (!ticket?.workflow) return ticketJson(loaded);
-    const definition = (await workflowLibrary.get(ticket.workflow.id, ticket.workflow.revision)).definition;
+    const identity = activeWorkflowIdentity(ticket);
+    const definition = (await workflowLibrary.get(identity.id, identity.revision)).definition;
     const node = workflowNode(definition, ticket.workflow.current_node);
     const promptRevision = node.prompt ? ticket.workflow.prompt_revisions[node.prompt] : undefined;
     const prompt = node.prompt ? await promptLibrary.get(node.prompt, promptRevision) : null;
@@ -135,8 +161,33 @@ export function createApp(
       ...ticketJson(loaded),
       workflow_definition: definition,
       workflow_node: node,
+      resolved_agent_profile: resolvedAgentProfile(ticket, node),
       node_prompt: prompt ? { id: prompt.name, revision: prompt.revision, content: prompt.content } : null,
     };
+  };
+
+  const workflowArtifacts = async (root: WorkflowDocument) => {
+    const config = await configStore.read();
+    const revisions: Record<string, string> = {};
+    const promptRevisions: Record<string, string> = {};
+    const profiles: Record<string, ResolvedAgentProfile> = {};
+    const visited = new Set<string>();
+    const visit = async (document: WorkflowDocument): Promise<void> => {
+      if (visited.has(document.definition.id)) return;
+      visited.add(document.definition.id); revisions[document.definition.id] = document.revision;
+      for (const node of document.definition.nodes) {
+        if (node.prompt && !promptRevisions[node.prompt]) promptRevisions[node.prompt] = (await promptLibrary.get(node.prompt)).revision;
+        if (node.type === "agent" && node.agent_profile) {
+          const alias = node.agent_profile === "default" ? config.agent_profiles.default : node.agent_profile;
+          const profile = config.agent_profiles.profiles.find((candidate) => candidate.id === alias);
+          if (node.agent_profile && !profile) throw new HttpError(422, `Agent profile ${alias} does not exist`);
+          if (profile) profiles[`${document.definition.id}/${node.id}`] = { alias, provider: profile.provider, model: profile.model, reasoning: profile.reasoning };
+        }
+        if (node.type === "workflow" && node.workflow_id) await visit(await workflowLibrary.get(node.workflow_id));
+      }
+    };
+    await visit(root);
+    return { revisions, promptRevisions, profiles };
   };
 
   app.get("/api/health", async (_request, response) => {
@@ -164,6 +215,7 @@ export function createApp(
     const current = await configStore.read();
     const config = await configStore.update({
       providers: isRecord(request.body.providers) ? request.body.providers as never : current.providers,
+      agent_profiles: isRecord(request.body.agent_profiles) ? request.body.agent_profiles as never : current.agent_profiles,
       repositories: request.body.repositories as RepositoryConfig[],
       jira: isRecord(request.body.jira) ? request.body.jira as never : current.jira,
       github: isRecord(request.body.github) ? request.body.github as never : current.github,
@@ -200,7 +252,12 @@ export function createApp(
   app.get("/api/workflows/:id", async (request, response) => response.json({ workflow: await workflowLibrary.get(String(request.params.id)) }));
   app.post("/api/workflows", async (request, response) => {
     const promptIds = new Set((await promptLibrary.list()).filter((prompt) => prompt.valid).map((prompt) => prompt.name));
-    const workflow = await workflowLibrary.save(message(request.body?.content, "content"), undefined, promptIds);
+    const content = message(request.body?.content, "content");
+    const parsed = parseYaml(content) as { id?: unknown };
+    const workflowIds = new Set((await workflowLibrary.list()).map((item) => item.definition.id));
+    if (typeof parsed?.id === "string") workflowIds.add(parsed.id);
+    const profileIds = new Set((await configStore.read()).agent_profiles.profiles.map((profile) => profile.id).concat("default"));
+    const workflow = await workflowLibrary.save(content, undefined, promptIds, workflowIds, profileIds);
     store.emit("changed", { type: "workflows.changed", id: workflow.definition.id, revision: workflow.revision });
     response.status(201).json({ workflow });
   });
@@ -208,7 +265,9 @@ export function createApp(
     const content = message(request.body?.content, "content");
     const expected = message(request.body?.expected_revision, "expected_revision");
     const promptIds = new Set((await promptLibrary.list()).filter((prompt) => prompt.valid).map((prompt) => prompt.name));
-    const workflow = await workflowLibrary.save(content, expected, promptIds);
+    const workflowIds = new Set((await workflowLibrary.list()).map((item) => item.definition.id));
+    const profileIds = new Set((await configStore.read()).agent_profiles.profiles.map((profile) => profile.id).concat("default"));
+    const workflow = await workflowLibrary.save(content, expected, promptIds, workflowIds, profileIds);
     if (workflow.definition.id !== String(request.params.id)) throw new HttpError(422, "Workflow id cannot be changed during update");
     store.emit("changed", { type: "workflows.changed", id: workflow.definition.id, revision: workflow.revision });
     response.json({ workflow });
@@ -218,6 +277,23 @@ export function createApp(
     // Keep malformed files repairable, but omit valid pre-workflow tickets from
     // the V3 operator queue. Direct ticket APIs remain available for recovery.
     response.json({ tickets: tickets.filter((ticket) => !ticket.valid || ticket.workflow_id !== null) });
+  });
+  app.get("/api/metrics", async (request, response) => {
+    const from = typeof request.query.from === "string" && request.query.from ? request.query.from : undefined;
+    const to = typeof request.query.to === "string" && request.query.to ? request.query.to : undefined;
+    if (from && Number.isNaN(Date.parse(from))) throw new HttpError(422, "from must be an ISO date or timestamp");
+    if (to && Number.isNaN(Date.parse(to))) throw new HttpError(422, "to must be an ISO date or timestamp");
+    const requestedProduction = typeof request.query.production_result === "string" && request.query.production_result
+      ? productionResult(request.query.production_result) : undefined;
+    const filters: MetricsFilters = {
+      ...(from ? { from } : {}), ...(to ? { to } : {}), labels: csvQuery(request.query.labels),
+      label_mode: request.query.label_mode === "all" ? "all" : "any",
+      ...(typeof request.query.workflow_id === "string" && request.query.workflow_id ? { workflow_id: request.query.workflow_id } : {}),
+      ...(typeof request.query.workflow_revision === "string" && request.query.workflow_revision ? { workflow_revision: request.query.workflow_revision } : {}),
+      repositories: csvQuery(request.query.repositories),
+      ...(requestedProduction ? { production_result: requestedProduction } : {}),
+    };
+    response.json(await buildMetrics(store, workflowLibrary, filters));
   });
   app.get("/api/tickets/:id/runs/:run/output", async (request, response) => {
     response.type("text/plain").send(await store.nodeRunOutput(String(request.params.id), String(request.params.run)));
@@ -237,7 +313,7 @@ export function createApp(
         last_heartbeat_at: execution.last_heartbeat_at, lease_expires_at: execution.lease_expires_at,
         consecutive_lease_losses: attemptCounter.consecutive_lease_losses,
         pane_id: conversation?.herdr_pane_id ?? ticket.agents[key].herdr_pane_id, session_ref: conversation?.session_ref ?? ticket.agents[key].session_ref,
-        herdr: execution.herdr_observation,
+        herdr: execution.herdr_observation, telemetry: execution.telemetry,
       }];
     });
     response.json({ agents });
@@ -294,11 +370,13 @@ export function createApp(
       const normalized = normalizeTicket(document.frontmatter);
       if (normalized.errors.length) throw new HttpError(422, "Ticket is invalid", normalized.errors);
       const workflow = await workflowLibrary.get(typeof request.body?.workflow_id === "string" ? request.body.workflow_id : "standard-delivery");
-      const revisions: Record<string, string> = {};
-      for (const promptId of workflow.referenced_prompts) revisions[promptId] = (await promptLibrary.get(promptId)).revision;
+      const artifacts = await workflowArtifacts(workflow);
       const inputs = isRecord(request.body?.workflow_inputs) ? request.body.workflow_inputs as Record<string, boolean | string> : undefined;
       const stageEnabled = isRecord(request.body?.stage_enabled) ? request.body.stage_enabled as Record<string, boolean> : undefined;
-      initializeWorkflow(normalized.ticket, workflow, revisions, { ...(inputs ? { inputs } : {}), ...(stageEnabled ? { stage_enabled: stageEnabled } : {}) });
+      initializeWorkflow(normalized.ticket, workflow, artifacts.promptRevisions, {
+        ...(inputs ? { inputs } : {}), ...(stageEnabled ? { stage_enabled: stageEnabled } : {}),
+        workflow_revisions: artifacts.revisions, resolved_agent_profiles: artifacts.profiles,
+      });
       markdown = serializeDocument(normalized.ticket, document.body);
     }
     const created = await store.create(markdown, typeof request.body?.filename === "string" ? request.body.filename : undefined);
@@ -311,7 +389,7 @@ export function createApp(
   app.get("/api/tickets/:id", async (request, response) => {
     const id = String(request.params.id);
     let loaded = await store.get(id);
-    if (loaded.valid && loaded.frontmatter?.jira && loaded.frontmatter.status === "pending") {
+    if (loaded.valid && loaded.frontmatter?.jira && loaded.frontmatter.status === "pending" && !isProgressed(loaded.frontmatter)) {
       try {
         const config = await configStore.read();
         const remote = await jiraClient.issue(config.jira, loaded.frontmatter.jira.key);
@@ -327,6 +405,32 @@ export function createApp(
     }
     response.json(await workJson(loaded));
   });
+  app.get("/api/tickets/:id/metadata", async (request, response) => {
+    const loaded = await store.get(String(request.params.id));
+    if (!loaded.valid || !loaded.frontmatter) throw new HttpError(422, "Ticket is invalid", loaded.errors);
+    response.json({ metadata: loaded.frontmatter.metadata ?? {}, revision: loaded.frontmatter.revision });
+  });
+  app.get("/api/tickets/:id/metadata/:key", async (request, response) => {
+    const loaded = await store.get(String(request.params.id));
+    if (!loaded.valid || !loaded.frontmatter) throw new HttpError(422, "Ticket is invalid", loaded.errors);
+    const key = metadataKey(request.params.key);
+    response.json({ key, value: loaded.frontmatter.metadata?.[key] ?? null, exists: Object.hasOwn(loaded.frontmatter.metadata ?? {}, key), revision: loaded.frontmatter.revision });
+  });
+  app.put("/api/tickets/:id/metadata/:key", async (request, response) => {
+    const key = metadataKey(request.params.key);
+    if (!("value" in (request.body ?? {})) || request.body.value === undefined) throw new HttpError(422, "value is required and must be JSON-compatible");
+    const updated = await store.command(String(request.params.id), {
+      event: "ticket.metadata_written", message: `Metadata ${key} was updated.`, expectedRevision: expectedRevision(request),
+    }, (ticket) => { ticket.metadata ??= {}; ticket.metadata[key] = request.body.value as JsonValue; return { ticket }; });
+    response.json(ticketJson(await store.settleAutomatic(updated.frontmatter!.id)));
+  });
+  app.delete("/api/tickets/:id/metadata/:key", async (request, response) => {
+    const key = metadataKey(request.params.key);
+    const updated = await store.command(String(request.params.id), {
+      event: "ticket.metadata_deleted", message: `Metadata ${key} was deleted.`, expectedRevision: expectedRevision(request),
+    }, (ticket) => { if (ticket.metadata) delete ticket.metadata[key]; return { ticket }; });
+    response.json(ticketJson(await store.settleAutomatic(updated.frontmatter!.id)));
+  });
   app.put("/api/tickets/:id", async (request, response) => {
     const mode = request.body?.mode === "rewind" ? "rewind" : "keep_phase";
     const phase = PHASES.includes(request.body?.rewind_phase) ? request.body.rewind_phase as Phase : undefined;
@@ -341,7 +445,7 @@ export function createApp(
     let loaded = await store.get(id);
     if (!loaded.valid || !loaded.frontmatter) throw new HttpError(422, "Ticket is invalid", loaded.errors);
     if (loaded.frontmatter.revision !== expectedRevision(request)) throw new HttpError(409, "Ticket revision changed", loaded);
-    if (loaded.frontmatter.jira) {
+    if (loaded.frontmatter.jira && !isProgressed(loaded.frontmatter)) {
       const config = await configStore.read();
       const remote = await jiraClient.issue(config.jira, loaded.frontmatter.jira.key);
       loaded = await store.command(id, { event: "jira.resynced", message: `Pending ticket refreshed from ${remote.jira.key}.`, expectedRevision: loaded.frontmatter.revision }, (ticket, body) => {
@@ -352,20 +456,46 @@ export function createApp(
     const readyTicket = loaded.frontmatter;
     if (!readyTicket) throw new HttpError(422, "Ticket is invalid", loaded.errors);
     const pinned = readyTicket.workflow
-      ? (await workflowLibrary.get(readyTicket.workflow.id, readyTicket.workflow.revision)).definition : null;
-    response.json(ticketJson(await store.command(id, { event: "ticket.ready", message: "Ticket marked ready.", expectedRevision: loaded.frontmatter!.revision }, (ticket) => {
+      ? (await workflowLibrary.get(activeWorkflowIdentity(readyTicket).id, activeWorkflowIdentity(readyTicket).revision)).definition : null;
+    const marked = await store.command(id, { event: "ticket.ready", message: "Ticket marked ready.", expectedRevision: loaded.frontmatter!.revision }, (ticket) => {
       if (ticket.status !== "pending") throw new HttpError(409, "Only pending tickets can be marked ready");
-      if (pinned && ticket.workflow) enterCurrentNode(ticket, pinned);
+      if (pinned && ticket.workflow) {
+        const firstVisit = (ticket.workflow.node_visits[ticket.workflow.current_node] ?? 0) === 0;
+        enterCurrentNode(ticket, pinned, firstVisit);
+      }
       else ticket.status = "ready";
       return { ticket };
-    })));
+    });
+    response.json(ticketJson(await store.settleAutomatic(marked.frontmatter!.id)));
+  });
+
+  app.post("/api/tickets/:id/priority", async (request, response) => {
+    const priority = request.body?.priority;
+    if (!Number.isInteger(priority)) throw new HttpError(422, "priority must be an integer");
+    response.json(ticketJson(await store.command(
+      String(request.params.id),
+      { event: "ticket.priority_changed", message: `Ticket priority changed to P${priority}.`, expectedRevision: expectedRevision(request) },
+      (ticket) => { ticket.priority = Number(priority); return { ticket }; },
+    )));
+  });
+
+  app.post("/api/tickets/:id/draft", async (request, response) => {
+    response.json(ticketJson(await store.command(
+      String(request.params.id),
+      { event: "ticket.returned_to_draft", message: "Ready ticket returned to draft.", expectedRevision: expectedRevision(request) },
+      (ticket) => {
+        if (ticket.status !== "ready" || ticket.execution) throw new HttpError(409, "Only an unclaimed ready ticket can be returned to draft");
+        ticket.status = "pending";
+        return { ticket };
+      },
+    )));
   });
 
   app.post("/api/tickets/:id/decide", async (request, response) => {
     const id = String(request.params.id);
     const loaded = await store.get(id);
     if (!loaded.valid || !loaded.frontmatter?.workflow) throw new HttpError(409, "Ticket does not have a V3 workflow");
-    const definition = (await workflowLibrary.get(loaded.frontmatter.workflow.id, loaded.frontmatter.workflow.revision)).definition;
+    const definition = (await workflowLibrary.get(activeWorkflowIdentity(loaded.frontmatter).id, activeWorkflowIdentity(loaded.frontmatter).revision)).definition;
     const current = workflowNode(definition, loaded.frontmatter.workflow.current_node);
     if (current.type !== "human_gate" || loaded.frontmatter.status !== "waiting_approval") throw new HttpError(409, "Ticket is not waiting at a human gate");
     const decision = message(request.body?.decision, "decision");
@@ -376,7 +506,7 @@ export function createApp(
     const summary = note || choice.label;
     response.json(ticketJson(await store.command(id, { event: "gate.decided", message: `${current.name}: ${summary}`, expectedRevision: expectedRevision(request) }, (ticket) => {
       const now = new Date().toISOString();
-      const run = beginNodeRun(ticket, current, ticket.workflow!.revision, ticket.workflow!.node_visits[current.id] ?? 1, now, "human", null);
+      const run = beginNodeRun(ticket, current, activeWorkflowIdentity(ticket).revision, ticket.workflow!.node_visits[runtimeNodeKey(ticket, current.id)] ?? 1, ticket.workflow!.current_node_entered_at ?? now, "human", null);
       finishNodeRun(ticket, run.id, decision, summary, null, now, note || null);
       advanceWorkflow(ticket, definition, decision, summary, note || null, "human");
       return { ticket };
@@ -388,7 +518,7 @@ export function createApp(
     const loaded = await store.get(id);
     if (!loaded.valid || !loaded.frontmatter?.workflow) throw new HttpError(409, "Ticket does not have a V3 workflow");
     if (loaded.frontmatter.status !== "pending" || loaded.frontmatter.execution) throw new HttpError(409, "Customize a ticket workflow before marking the ticket ready");
-    const source = await workflowLibrary.get(loaded.frontmatter.workflow.id, loaded.frontmatter.workflow.revision);
+    const source = await workflowLibrary.get(activeWorkflowIdentity(loaded.frontmatter).id, activeWorkflowIdentity(loaded.frontmatter).revision);
     const artifactId = `ticket-${loaded.frontmatter.id.toLowerCase().replaceAll(/[^a-z0-9-]/g, "-")}`.slice(0, 64);
     const definition = structuredClone(source.definition);
     definition.id = artifactId; definition.name = `${loaded.frontmatter.title} workflow`;
@@ -445,7 +575,7 @@ export function createApp(
     const id = String(request.params.id);
     const loaded = await store.get(id);
     const definition = loaded.frontmatter?.workflow
-      ? (await workflowLibrary.get(loaded.frontmatter.workflow.id, loaded.frontmatter.workflow.revision)).definition : null;
+      ? (await workflowLibrary.get(activeWorkflowIdentity(loaded.frontmatter).id, activeWorkflowIdentity(loaded.frontmatter).revision)).definition : null;
     response.json(ticketJson(await store.command(id, { event: "specification.approved", message: "Specification approved.", expectedRevision: expectedRevision(request) }, (ticket) => {
       if (ticket.phase !== "specification" || ticket.status !== "waiting_approval") throw new HttpError(409, "Ticket is not waiting for specification approval");
       if (definition && ticket.workflow) advanceWorkflow(ticket, definition, "approved");
@@ -458,7 +588,7 @@ export function createApp(
     const feedback = message(request.body?.message);
     const loaded = await store.get(String(request.params.id));
     const definition = loaded.frontmatter?.workflow
-      ? (await workflowLibrary.get(loaded.frontmatter.workflow.id, loaded.frontmatter.workflow.revision)).definition : null;
+      ? (await workflowLibrary.get(activeWorkflowIdentity(loaded.frontmatter).id, activeWorkflowIdentity(loaded.frontmatter).revision)).definition : null;
     response.json(ticketJson(await store.command(
       String(request.params.id), { event: "specification.changes_requested", message: feedback, expectedRevision: expectedRevision(request) },
       (ticket) => {
@@ -533,7 +663,9 @@ export function createApp(
     const id = String(request.params.id);
     const loaded = await store.get(id);
     if (!loaded.valid || !loaded.frontmatter) throw new HttpError(422, "Ticket is invalid", loaded.errors);
-    if (loaded.frontmatter.status !== "pending" || !loaded.frontmatter.jira) throw new HttpError(409, "Only pending Jira-backed tickets can be resynced");
+    if (loaded.frontmatter.status !== "pending" || isProgressed(loaded.frontmatter) || !loaded.frontmatter.jira) {
+      throw new HttpError(409, "Only an initial pending Jira-backed ticket can be resynced");
+    }
     const config = await configStore.read();
     const remote = await jiraClient.issue(config.jira, loaded.frontmatter.jira.key);
     response.json(ticketJson(await store.command(id, { event: "jira.resynced", message: `Pending ticket refreshed from ${remote.jira.key}.`, expectedRevision: expectedRevision(request) }, (ticket, body) => {
@@ -546,18 +678,44 @@ export function createApp(
 
   app.post("/api/tickets/:id/archive", async (request, response) => response.json(ticketJson(await store.command(
     String(request.params.id), { event: "ticket.archived", message: "Completed ticket archived.", expectedRevision: expectedRevision(request) },
-    (ticket) => { if (ticket.phase !== "done" || ticket.status !== "completed") throw new HttpError(409, "Only completed tickets can be archived"); ticket.archived_at = new Date().toISOString(); return { ticket }; },
+    (ticket) => {
+      if (ticket.phase !== "done" || ticket.status !== "completed") throw new HttpError(409, "Only completed tickets can be archived");
+      if (request.body?.production_result !== undefined) {
+        ticket.production_result = productionResult(request.body.production_result);
+        ticket.production_assessed_at = ticket.production_result === "unassessed" ? null : new Date().toISOString();
+        ticket.production_assessment_note = typeof request.body.production_assessment_note === "string" && request.body.production_assessment_note.trim()
+          ? request.body.production_assessment_note.trim() : null;
+      }
+      ticket.archived_at = new Date().toISOString(); return { ticket };
+    },
   ))));
   app.post("/api/tickets/:id/unarchive", async (request, response) => response.json(ticketJson(await store.command(
     String(request.params.id), { event: "ticket.unarchived", message: "Ticket returned to the completed queue.", expectedRevision: expectedRevision(request) },
     (ticket) => { if (!ticket.archived_at) throw new HttpError(409, "Ticket is not archived"); ticket.archived_at = null; return { ticket }; },
   ))));
+  app.post("/api/tickets/:id/production-assessment", async (request, response) => {
+    const result = productionResult(request.body?.production_result);
+    const note = typeof request.body?.production_assessment_note === "string" && request.body.production_assessment_note.trim()
+      ? request.body.production_assessment_note.trim() : null;
+    response.json(ticketJson(await store.command(
+      String(request.params.id), {
+        event: "ticket.production_assessed", message: `Production result set to ${result}.`, expectedRevision: expectedRevision(request),
+      },
+      (ticket) => {
+        if (ticket.phase !== "done" || ticket.status !== "completed") throw new HttpError(409, "Only completed tickets can be assessed for production");
+        ticket.production_result = result;
+        ticket.production_assessed_at = result === "unassessed" ? null : new Date().toISOString();
+        ticket.production_assessment_note = note;
+        return { ticket };
+      },
+    )));
+  });
 
   app.post("/api/tickets/:id/retry", async (request, response) => {
     const id = String(request.params.id);
     const loaded = await store.get(id);
     const definition = loaded.frontmatter?.workflow
-      ? (await workflowLibrary.get(loaded.frontmatter.workflow.id, loaded.frontmatter.workflow.revision)).definition : null;
+      ? (await workflowLibrary.get(activeWorkflowIdentity(loaded.frontmatter).id, activeWorkflowIdentity(loaded.frontmatter).revision)).definition : null;
     response.json(ticketJson(await store.command(
       id, { event: "ticket.retried", message: "Current workflow node returned to ready.", expectedRevision: expectedRevision(request) },
       (ticket) => {
@@ -569,7 +727,7 @@ export function createApp(
       if (definition && ticket.workflow) {
         const node = workflowNode(definition, ticket.workflow.current_node);
         if (ticket.workflow.transition_count > definition.max_transitions) throw new HttpError(409, "Workflow transition limit requires migration to another node or workflow");
-        if (node.max_visits && (ticket.workflow.node_visits[node.id] ?? 0) > node.max_visits) throw new HttpError(409, `Node ${node.name} exceeded its visit limit; migrate the ticket before retrying`);
+        if (node.max_visits && (ticket.workflow.node_visits[runtimeNodeKey(ticket, node.id)] ?? 0) > node.max_visits) throw new HttpError(409, `Node ${node.name} exceeded its visit limit; migrate the ticket before retrying`);
         nodeAttemptCounter(ticket, node.id).consecutive_lease_losses = 0;
         enterCurrentNode(ticket, definition, false);
       } else ticket.status = "ready";
@@ -582,7 +740,7 @@ export function createApp(
     const id = String(request.params.id);
     const loaded = await store.get(id);
     const definition = loaded.frontmatter?.workflow
-      ? (await workflowLibrary.get(loaded.frontmatter.workflow.id, loaded.frontmatter.workflow.revision)).definition : null;
+      ? (await workflowLibrary.get(activeWorkflowIdentity(loaded.frontmatter).id, activeWorkflowIdentity(loaded.frontmatter).revision)).definition : null;
     response.json(ticketJson(await store.command(
       id, { event: "supervisor.released", message: "Pinned supervisor released by operator; eligible work may be reassigned.", expectedRevision: expectedRevision(request) },
       (ticket) => {
@@ -600,7 +758,7 @@ export function createApp(
       if ((ticket.status === "failed" || ticket.status === "blocked") && ticket.phase !== "done") {
         const node = definition && ticket.workflow ? workflowNode(definition, ticket.workflow.current_node) : null;
         const bounded = Boolean(definition && ticket.workflow && (ticket.workflow.transition_count > definition.max_transitions
-          || node?.max_visits && (ticket.workflow.node_visits[node.id] ?? 0) > node.max_visits));
+          || node?.max_visits && (ticket.workflow.node_visits[runtimeNodeKey(ticket, node.id)] ?? 0) > node.max_visits));
         if (!bounded && !ticket.questions.some((item) => item.answer === null)) {
           ticket.status = "ready";
           ticket.attempts[ticket.phase].consecutive_lease_losses = 0;
@@ -617,7 +775,7 @@ export function createApp(
     if (!PHASES.includes(phase) || phase === "done") throw new HttpError(422, "An applicable phase is required");
     const current = await store.get(String(request.params.id));
     const definition = current.frontmatter?.workflow
-      ? (await workflowLibrary.get(current.frontmatter.workflow.id, current.frontmatter.workflow.revision)).definition : null;
+      ? (await workflowLibrary.get(activeWorkflowIdentity(current.frontmatter).id, activeWorkflowIdentity(current.frontmatter).revision)).definition : null;
     const targetNode = definition?.nodes.find((node) => node.type === "agent" && node.phase === phase) ?? null;
     if (definition && !targetNode) throw new HttpError(422, `Pinned workflow has no ${phase} agent node`);
     response.json(ticketJson(await store.command(
@@ -629,7 +787,7 @@ export function createApp(
           if (ticket.execution.interrupt_request) throw new HttpError(409, "Ticket is already waiting for agent interruption");
           ticket.execution.interrupt_request = {
             target_phase: phase, requested_at: new Date().toISOString(),
-            ...(targetNode && ticket.workflow ? { target_node: targetNode.id, target_workflow_id: ticket.workflow.id, target_workflow_revision: ticket.workflow.revision } : {}),
+            ...(targetNode && ticket.workflow ? { target_node: targetNode.id, target_workflow_id: activeWorkflowIdentity(ticket).id, target_workflow_revision: activeWorkflowIdentity(ticket).revision } : {}),
           };
         } else {
           if (definition && targetNode && ticket.workflow) {
@@ -710,11 +868,17 @@ export function createApp(
     response.json({ tickets: await Promise.all(active.map(workJson)) });
   });
 
+  app.get("/api/work/:lease/assignment", async (request, response) => {
+    response.json(await workJson(await store.byLease(String(request.params.lease))));
+  });
+
   app.post("/api/work/:lease/heartbeat", async (request, response) => {
     const leaseId = String(request.params.lease);
     const leased = await store.byLease(leaseId);
     const supervisorHost = registry.hostnameFor(leased.execution.supervisor_id);
     const herdr = heartbeatHerdr(request.body?.herdr_observation);
+    const telemetry = heartbeatTelemetry(request.body?.telemetry, "telemetry");
+    const telemetryBaseline = heartbeatTelemetry(request.body?.telemetry_baseline, "telemetry_baseline");
     const updated = await store.heartbeat(leaseId, {
       ...(supervisorHost ? { supervisorHost } : {}),
       ...(typeof request.body?.observed_state === "string" ? { state: request.body.observed_state } : {}),
@@ -722,14 +886,44 @@ export function createApp(
       ...(typeof request.body?.session_ref === "string" ? { sessionRef: request.body.session_ref } : {}),
       ...(Number.isInteger(request.body?.guidance_cursor) ? { guidanceCursor: Number(request.body.guidance_cursor) } : {}),
       ...(herdr ? { herdr } : {}),
+      ...(telemetry ? { telemetry } : {}),
+      ...(telemetryBaseline ? { telemetryBaseline } : {}),
     });
     response.json({ active: true, ticket: ticketJson(updated) });
+  });
+
+  app.post("/api/work/:lease/telemetry", async (request, response) => {
+    const telemetry = heartbeatTelemetry(request.body?.telemetry, "telemetry");
+    if (!telemetry) throw new HttpError(422, "telemetry is required");
+    const baseline = heartbeatTelemetry(request.body?.telemetry_baseline, "telemetry_baseline");
+    const updated = await store.recordTelemetry(String(request.params.lease), telemetry, baseline);
+    response.json({ recorded: true, ticket: ticketJson(updated) });
   });
 
   app.get("/api/work/:lease/guidance", async (request, response) => {
     const leased = await store.byLease(String(request.params.lease));
     const after = Number(request.query.after ?? 0);
     response.json({ guidance: leased.execution.guidance.filter((item) => item.sequence > after) });
+  });
+  app.get("/api/work/:lease/metadata", async (request, response) => {
+    const leased = await store.byLease(String(request.params.lease));
+    response.json({ metadata: leased.frontmatter.metadata ?? {} });
+  });
+  app.get("/api/work/:lease/metadata/:key", async (request, response) => {
+    const leased = await store.byLease(String(request.params.lease));
+    const key = metadataKey(request.params.key);
+    response.json({ key, value: leased.frontmatter.metadata?.[key] ?? null, exists: Object.hasOwn(leased.frontmatter.metadata ?? {}, key) });
+  });
+  app.put("/api/work/:lease/metadata/:key", async (request, response) => {
+    const lease = String(request.params.lease);
+    const leased = await store.byLease(lease);
+    const key = metadataKey(request.params.key);
+    if (!("value" in (request.body ?? {})) || request.body.value === undefined) throw new HttpError(422, "value is required and must be JSON-compatible");
+    const updated = await store.command(leased.frontmatter.id, { event: "agent.metadata_written", message: `Agent updated metadata ${key}.` }, (ticket) => {
+      if (ticket.execution?.lease_id !== lease) throw new HttpError(409, "Lease is stale or fenced");
+      ticket.metadata ??= {}; ticket.metadata[key] = request.body.value as JsonValue; return { ticket };
+    });
+    response.json({ key, value: updated.frontmatter?.metadata?.[key] ?? null });
   });
 
   app.get("/api/work/:lease/control", async (request, response) => {
@@ -769,7 +963,7 @@ export function createApp(
         const run = ticket.workflow?.node_runs.find((candidate) => candidate.id === ticket.execution?.node_run_id);
         const interruptionOutcome = interrupt.terminal_status ? `operator_${interrupt.terminal_status}` : "operator_interrupt";
         const interruptionSummary = interrupt.terminal_reason ?? "Active node interrupted by operator.";
-        if (run?.status === "running") { run.status = "interrupted"; run.completed_at = new Date().toISOString(); run.outcome = interruptionOutcome; run.summary = interruptionSummary; }
+        if (run?.status === "running") { const now = new Date().toISOString(); accountNodeRunTiming(run, now); run.status = "interrupted"; run.completed_at = now; run.outcome = interruptionOutcome; run.summary = interruptionSummary; }
         if (interrupt.terminal_status) {
           ticket.status = interrupt.terminal_status;
         } else if (migrationTarget && interrupt.target_node) {
@@ -800,7 +994,8 @@ export function createApp(
       throw new HttpError(409, "Lease is not a deterministic activity");
     }
     if (leased.execution.interrupt_request) throw new HttpError(409, "Lease is awaiting activity interruption");
-    const definition = (await workflowLibrary.get(leased.frontmatter.workflow.id, leased.frontmatter.workflow.revision)).definition;
+    const identity = activeWorkflowIdentity(leased.frontmatter);
+    const definition = (await workflowLibrary.get(identity.id, identity.revision)).definition;
     const node = workflowNode(definition, leased.frontmatter.workflow.current_node);
     const exitCode = Number.isInteger(request.body?.exit_code) ? Number(request.body.exit_code) : null;
     const route = activityRoute(node, exitCode);
@@ -808,22 +1003,39 @@ export function createApp(
     const outcome = route.id;
     const summary = typeof request.body?.summary === "string" && request.body.summary.trim()
       ? request.body.summary.trim() : `${node.name}: ${route.label}.`;
-    const fullOutput = typeof request.body?.output === "string" ? request.body.output.slice(-1_000_000) : null;
-    const outputArtifact = fullOutput === null || !leased.execution.node_run_id ? undefined
-      : await store.persistNodeRunOutput(leased.frontmatter.id, leased.execution.node_run_id, fullOutput);
-    const output = fullOutput?.slice(-512) ?? null;
+    const stdout = typeof request.body?.stdout === "string" ? request.body.stdout.slice(-1_000_000)
+      : typeof request.body?.output === "string" ? request.body.output.slice(-1_000_000) : null;
+    const persistStdout = node.script_output?.persist_stdout !== false;
+    const outputArtifact = !persistStdout || stdout === null || !leased.execution.node_run_id ? undefined
+      : await store.persistNodeRunOutput(leased.frontmatter.id, leased.execution.node_run_id, stdout);
+    const tailLines = node.script_output?.prompt_tail_lines ?? 0;
+    const promptOutput = stdout && tailLines > 0 ? stdout.split(/\r?\n/).slice(-tailLines).join("\n") : null;
+    const output = stdout?.slice(-512) ?? null;
+    const outputLogPath = outputArtifact && leased.execution.node_run_id
+      ? `/api/tickets/${encodeURIComponent(leased.frontmatter.id)}/runs/${encodeURIComponent(leased.execution.node_run_id)}/output`
+      : null;
+    const scriptPath = typeof request.body?.script_path === "string" && request.body.script_path.trim()
+      ? request.body.script_path.trim() : null;
+    const workingDirectory = typeof request.body?.working_directory === "string" && request.body.working_directory.trim()
+      ? request.body.working_directory.trim() : null;
     const result = { accepted: true, ticket_id: leased.frontmatter.id, outcome };
     await store.command(leased.frontmatter.id, { event: `activity.${outcome}`, message: summary }, (ticket) => {
       if (ticket.execution?.lease_id !== leaseId || !ticket.execution.node_run_id) throw new HttpError(409, "Lease is stale or fenced");
       if (ticket.execution.interrupt_request) throw new HttpError(409, "Lease is awaiting activity interruption");
-      finishNodeRun(ticket, ticket.execution.node_run_id, outcome, summary, output, new Date().toISOString(), null, outputArtifact);
-      advanceWorkflow(ticket, definition, outcome, summary, null, "script");
       nodeAttemptCounter(ticket, node.id).consecutive_lease_losses = 0;
+      finishNodeRun(ticket, ticket.execution.node_run_id, outcome, summary, output, new Date().toISOString(), null, outputArtifact);
+      const run = ticket.workflow?.node_runs.find((candidate) => candidate.id === ticket.execution?.node_run_id);
+      if (run) {
+        run.script_path = scriptPath;
+        run.working_directory = workingDirectory;
+      }
+      advanceWorkflow(ticket, definition, outcome, summary, null, "script", promptOutput, outputLogPath);
       ticket.attempts[leased.frontmatter.phase as "specification" | "implementation" | "review"].consecutive_lease_losses = 0;
       ticket.execution = null;
       ticket.last_callback = { lease_id: leaseId, digest: bodyDigest(request.body), response: result };
       return { ticket };
     });
+    await store.settleAutomatic(leased.frontmatter.id);
     response.json(result);
   });
 
@@ -865,7 +1077,7 @@ export function createApp(
     const leased = await store.byLease(leaseId);
     const summary = kind === "complete" ? message(request.body?.summary, "summary") : message(request.body?.reason, "reason");
     const workflowDefinition = leased.frontmatter.workflow
-      ? (await workflowLibrary.get(leased.frontmatter.workflow.id, leased.frontmatter.workflow.revision)).definition : null;
+      ? (await workflowLibrary.get(activeWorkflowIdentity(leased.frontmatter).id, activeWorkflowIdentity(leased.frontmatter).revision)).definition : null;
     const workflowCurrent = workflowDefinition && leased.frontmatter.workflow
       ? workflowNode(workflowDefinition, leased.frontmatter.workflow.current_node) : null;
     const requestedOutcome = typeof request.body?.outcome === "string" && request.body.outcome.trim()
@@ -904,6 +1116,7 @@ export function createApp(
         }
         const runId = ticket.execution.node_run_id;
         if (!runId) throw new HttpError(409, "V3 execution is missing its node-run fence");
+        nodeAttemptCounter(ticket, workflowCurrent.id).consecutive_lease_losses = 0;
         finishNodeRun(ticket, runId, String(requestedOutcome), summary, null, new Date().toISOString(), handoff);
         if (workflowRoute(workflowCurrent, String(requestedOutcome))) advanceWorkflow(ticket, workflowDefinition, String(requestedOutcome), summary, handoff, `agent:${ticket.execution.provider}`);
         else if (kind === "fail") ticket.status = "failed";
@@ -930,11 +1143,12 @@ export function createApp(
       } else throw new HttpError(409, "Done tickets cannot complete work");
       const key = leased.frontmatter.phase as "specification" | "implementation" | "review";
       ticket.attempts[key].consecutive_lease_losses = 0;
-      nodeAttemptCounter(ticket, leased.execution.node_id).consecutive_lease_losses = 0;
+      if (!workflowCurrent) nodeAttemptCounter(ticket, leased.execution.node_id).consecutive_lease_losses = 0;
       ticket.execution = null;
       ticket.last_callback = { lease_id: leaseId, digest: payloadDigest, response: result };
       return { ticket };
     });
+    await store.settleAutomatic(leased.frontmatter.id);
     response.json(result);
   };
   app.post("/api/work/:lease/complete", (request, response, next) => void terminalCallback(request, response, "complete").catch(next));

@@ -1,9 +1,9 @@
-import { PHASES, PROVIDERS, STATUSES, defaultReviewProvider, type AgentRef, type AttemptCounter, type Execution, type HerdrObservation, type Phase, type PullRequestRef, type TicketFrontmatter, type TicketQuestion, type WorkflowRuntime } from "./domain.js";
+import { PHASES, PRODUCTION_RESULTS, PROVIDERS, STATUSES, defaultReviewProvider, type AgentRef, type AttemptCounter, type Execution, type HarnessTelemetryRecord, type HarnessTelemetrySnapshot, type HerdrObservation, type JsonValue, type NodeRunTiming, type Phase, type PullRequestRef, type ResolvedAgentProfile, type TicketFrontmatter, type TicketQuestion, type TokenUsage, type WorkflowRuntime, type WorkflowTransitionContext } from "./domain.js";
 
 const phaseStatuses: Record<Phase, Set<string>> = {
   specification: new Set(["pending", "ready", "running", "blocked", "waiting_approval", "failed", "cancelled"]),
   implementation: new Set(["pending", "ready", "running", "blocked", "waiting_approval", "failed", "cancelled"]),
-  review: new Set(["ready", "running", "blocked", "waiting_approval", "failed", "cancelled"]),
+  review: new Set(["pending", "ready", "running", "blocked", "waiting_approval", "failed", "cancelled"]),
   done: new Set(["completed", "failed", "cancelled"]),
 };
 
@@ -12,6 +12,25 @@ const emptyAttempt = (): AttemptCounter => ({ total: 0, consecutive_lease_losses
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function jsonValue(value: unknown, field: string, errors: string[], depth = 0): JsonValue | undefined {
+  if (depth > 12) { errors.push(`${field} exceeds maximum nesting depth`); return undefined; }
+  if (value === null || typeof value === "string" || typeof value === "boolean" || (typeof value === "number" && Number.isFinite(value))) return value;
+  if (Array.isArray(value)) {
+    const result = value.map((item, index) => jsonValue(item, `${field}[${index}]`, errors, depth + 1));
+    return result.some((item) => item === undefined) ? undefined : result as JsonValue[];
+  }
+  if (isRecord(value)) {
+    const result: Record<string, JsonValue> = {};
+    for (const [key, item] of Object.entries(value)) {
+      const normalized = jsonValue(item, `${field}.${key}`, errors, depth + 1);
+      if (normalized !== undefined) result[key] = normalized;
+    }
+    return result;
+  }
+  errors.push(`${field} must be JSON-compatible`);
+  return undefined;
 }
 
 function asString(value: unknown, field: string, errors: string[]): string {
@@ -48,6 +67,117 @@ function optionalString(value: unknown, field: string, errors: string[]): string
   if (value === null || value === undefined) return null;
   if (typeof value !== "string") { errors.push(`${field} must be a string or null`); return null; }
   return value;
+}
+
+function optionalNumber(value: unknown, field: string, errors: string[]): number | null {
+  if (value === null || value === undefined) return null;
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) { errors.push(`${field} must be a non-negative number or null`); return null; }
+  return value;
+}
+
+function nodeTiming(value: unknown, run: Record<string, unknown>, index: number, errors: string[]): NodeRunTiming {
+  const stateDefault = run.node_type === "human_gate" ? "human_wait" : "active";
+  if (!isRecord(value)) {
+    const started = Date.parse(String(run.started_at ?? ""));
+    const completed = run.completed_at ? Date.parse(String(run.completed_at)) : Number.NaN;
+    const elapsed = Number.isFinite(started) && Number.isFinite(completed) ? Math.max(0, completed - started) : 0;
+    return {
+      active_ms: stateDefault === "active" ? elapsed : 0,
+      quota_paused_ms: 0,
+      human_wait_ms: stateDefault === "human_wait" ? elapsed : 0,
+      state: stateDefault,
+      last_accounted_at: run.completed_at ? null : typeof run.started_at === "string" ? run.started_at : null,
+      pause_limit_id: null,
+      pause_until: null,
+    };
+  }
+  const field = `workflow.node_runs[${index}].timing`;
+  const state = ["active", "quota_paused", "human_wait"].includes(String(value.state))
+    ? value.state as NodeRunTiming["state"] : (errors.push(`${field}.state is invalid`), stateDefault);
+  return {
+    active_ms: optionalNumber(value.active_ms, `${field}.active_ms`, errors) ?? 0,
+    quota_paused_ms: optionalNumber(value.quota_paused_ms, `${field}.quota_paused_ms`, errors) ?? 0,
+    human_wait_ms: optionalNumber(value.human_wait_ms, `${field}.human_wait_ms`, errors) ?? 0,
+    state,
+    last_accounted_at: value.last_accounted_at === null || value.last_accounted_at === undefined ? null : timestamp(value.last_accounted_at, `${field}.last_accounted_at`, errors),
+    pause_limit_id: optionalString(value.pause_limit_id, `${field}.pause_limit_id`, errors),
+    pause_until: value.pause_until === null || value.pause_until === undefined ? null : timestamp(value.pause_until, `${field}.pause_until`, errors),
+  };
+}
+
+function tokenUsage(value: unknown, field: string, errors: string[]): TokenUsage | null {
+  if (value === null || value === undefined) return null;
+  if (!isRecord(value)) { errors.push(`${field} must be an object or null`); return null; }
+  const read = (key: keyof TokenUsage) => optionalNumber(value[key], `${field}.${key}`, errors) ?? 0;
+  return {
+    input_tokens: read("input_tokens"), cached_input_tokens: read("cached_input_tokens"),
+    cache_write_input_tokens: read("cache_write_input_tokens"), output_tokens: read("output_tokens"),
+    reasoning_output_tokens: read("reasoning_output_tokens"), total_tokens: read("total_tokens"),
+  };
+}
+
+export function telemetrySnapshot(value: unknown, field: string, errors: string[]): HarnessTelemetrySnapshot | null {
+  if (value === null || value === undefined) return null;
+  if (!isRecord(value)) { errors.push(`${field} must be an object`); return null; }
+  const source = isRecord(value.source) ? value.source : (errors.push(`${field}.source must be an object`), {});
+  const model = isRecord(value.model) ? value.model : (errors.push(`${field}.model must be an object`), {});
+  const reasoning = isRecord(value.reasoning) ? value.reasoning : (errors.push(`${field}.reasoning must be an object`), {});
+  const cost = isRecord(value.cost) ? value.cost : (errors.push(`${field}.cost must be an object`), {});
+  const context = isRecord(value.context) ? value.context : (errors.push(`${field}.context must be an object`), {});
+  if (value.schema_version !== 1) errors.push(`${field}.schema_version must be 1`);
+  const observedIds = Array.isArray(model.observed_ids) && model.observed_ids.every((item) => typeof item === "string")
+    ? [...new Set(model.observed_ids as string[])] : (errors.push(`${field}.model.observed_ids must be a string array`), []);
+  const costKind = ["reported", "estimated", "unavailable"].includes(String(cost.kind))
+    ? cost.kind as HarnessTelemetrySnapshot["cost"]["kind"] : (errors.push(`${field}.cost.kind is invalid`), "unavailable");
+  const limits = Array.isArray(value.rate_limits) ? value.rate_limits.map((item, index) => {
+    if (!isRecord(item)) { errors.push(`${field}.rate_limits[${index}] must be an object`); return null; }
+    return {
+      id: asString(item.id, `${field}.rate_limits[${index}].id`, errors),
+      name: optionalString(item.name, `${field}.rate_limits[${index}].name`, errors),
+      used_percent: optionalNumber(item.used_percent, `${field}.rate_limits[${index}].used_percent`, errors) ?? 0,
+      window_minutes: optionalNumber(item.window_minutes, `${field}.rate_limits[${index}].window_minutes`, errors),
+      resets_at: item.resets_at === null || item.resets_at === undefined ? null : timestamp(item.resets_at, `${field}.rate_limits[${index}].resets_at`, errors),
+    };
+  }).filter((item): item is NonNullable<typeof item> => item !== null) : (errors.push(`${field}.rate_limits must be an array`), []);
+  const attributes: HarnessTelemetrySnapshot["attributes"] = {};
+  if (!isRecord(value.attributes)) errors.push(`${field}.attributes must be an object`);
+  else for (const [key, attribute] of Object.entries(value.attributes)) {
+    if (attribute === null || typeof attribute === "string" || typeof attribute === "boolean" || typeof attribute === "number" && Number.isFinite(attribute)) attributes[key] = attribute;
+    else errors.push(`${field}.attributes.${key} must be a scalar JSON value`);
+  }
+  const enabled = reasoning.enabled === null || reasoning.enabled === undefined ? null
+    : typeof reasoning.enabled === "boolean" ? reasoning.enabled : (errors.push(`${field}.reasoning.enabled must be a boolean or null`), null);
+  const totalUsd = optionalNumber(cost.total_usd, `${field}.cost.total_usd`, errors);
+  if (costKind === "unavailable" && totalUsd !== null) errors.push(`${field}.cost.total_usd must be null when cost is unavailable`);
+  if (costKind !== "unavailable" && totalUsd === null) errors.push(`${field}.cost.total_usd is required for ${costKind} cost`);
+  return {
+    schema_version: 1,
+    harness: asString(value.harness, `${field}.harness`, errors),
+    session_ref: optionalString(value.session_ref, `${field}.session_ref`, errors),
+    observed_at: timestamp(value.observed_at, `${field}.observed_at`, errors),
+    source: { kind: asString(source.kind, `${field}.source.kind`, errors), detail: optionalString(source.detail, `${field}.source.detail`, errors) },
+    model: { id: optionalString(model.id, `${field}.model.id`, errors), provider: optionalString(model.provider, `${field}.model.provider`, errors), observed_ids: observedIds },
+    reasoning: { effort: optionalString(reasoning.effort, `${field}.reasoning.effort`, errors), enabled, source: optionalString(reasoning.source, `${field}.reasoning.source`, errors) },
+    usage: tokenUsage(value.usage, `${field}.usage`, errors),
+    cost: { total_usd: totalUsd, kind: costKind },
+    context: {
+      used_tokens: optionalNumber(context.used_tokens, `${field}.context.used_tokens`, errors),
+      window_tokens: optionalNumber(context.window_tokens, `${field}.context.window_tokens`, errors),
+      used_percent: optionalNumber(context.used_percent, `${field}.context.used_percent`, errors),
+    },
+    rate_limits: limits, attributes,
+  };
+}
+
+function telemetryRecord(value: unknown, field: string, errors: string[]): HarnessTelemetryRecord | null {
+  if (value === null || value === undefined) return null;
+  if (!isRecord(value)) { errors.push(`${field} must be an object or null`); return null; }
+  const baseline = telemetrySnapshot(value.baseline, `${field}.baseline`, errors);
+  const latest = telemetrySnapshot(value.latest, `${field}.latest`, errors);
+  const delta = isRecord(value.delta) ? value.delta : (errors.push(`${field}.delta must be an object`), {});
+  if (!baseline || !latest) return null;
+  if (baseline.harness !== latest.harness || baseline.session_ref !== latest.session_ref) errors.push(`${field} baseline and latest must identify the same harness session`);
+  return { baseline, latest, delta: { usage: tokenUsage(delta.usage, `${field}.delta.usage`, errors), cost_usd: optionalNumber(delta.cost_usd, `${field}.delta.cost_usd`, errors) } };
 }
 
 function herdrObservation(value: unknown, errors: string[]): HerdrObservation | null {
@@ -138,6 +268,7 @@ function execution(value: unknown, errors: string[]): Execution | null {
     observed_herdr_state: value.observed_herdr_state === null || value.observed_herdr_state === undefined
       ? null : asString(value.observed_herdr_state, "execution.observed_herdr_state", errors),
     herdr_observation: herdrObservation(value.herdr_observation, errors),
+    telemetry: telemetryRecord(value.telemetry, "execution.telemetry", errors),
     guidance,
     interrupt_request: interruptRequest,
     ...(typeof value.node_run_id === "string" ? { node_run_id: value.node_run_id } : {}),
@@ -147,7 +278,7 @@ function execution(value: unknown, errors: string[]): Execution | null {
   };
 }
 
-function workflowRuntime(value: unknown, errors: string[]): WorkflowRuntime | null {
+function workflowRuntime(value: unknown, errors: string[], now: string): WorkflowRuntime | null {
   if (value === null || value === undefined) return null;
   if (!isRecord(value)) { errors.push("workflow must be an object or null"); return null; }
   const visits: Record<string, number> = {};
@@ -170,14 +301,16 @@ function workflowRuntime(value: unknown, errors: string[]): WorkflowRuntime | nu
   }
   const nodeRuns = Array.isArray(value.node_runs) ? value.node_runs.filter(isRecord).map((run, index) => ({
     id: asString(run.id, `workflow.node_runs[${index}].id`, errors),
+    ...(typeof run.workflow_id === "string" ? { workflow_id: run.workflow_id } : {}),
     workflow_revision: asString(run.workflow_revision, `workflow.node_runs[${index}].workflow_revision`, errors),
     node_id: asString(run.node_id, `workflow.node_runs[${index}].node_id`, errors),
-    node_type: (["agent", "script", "verification", "human_gate", "terminal"].includes(String(run.node_type)) ? run.node_type : "agent") as "agent" | "script" | "verification" | "human_gate" | "terminal",
+    node_type: (["agent", "script", "verification", "human_gate", "read", "write", "workflow", "fan_out", "fan_in", "terminal"].includes(String(run.node_type)) ? run.node_type : "agent") as NonNullable<TicketFrontmatter["workflow"]>["node_runs"][number]["node_type"],
     visit: Number.isInteger(run.visit) ? Number(run.visit) : 1,
     attempt: Number.isInteger(run.attempt) ? Number(run.attempt) : 1,
     status: (["running", "completed", "failed", "interrupted"].includes(String(run.status)) ? run.status : "failed") as "running" | "completed" | "failed" | "interrupted",
     supervisor_id: optionalString(run.supervisor_id, `workflow.node_runs[${index}].supervisor_id`, errors),
     provider: PROVIDERS.includes(run.provider as never) ? run.provider as AgentRef["provider"] : null,
+    lease_id: optionalString(run.lease_id, `workflow.node_runs[${index}].lease_id`, errors),
     started_at: timestamp(run.started_at, `workflow.node_runs[${index}].started_at`, errors),
     completed_at: run.completed_at === null ? null : timestamp(run.completed_at, `workflow.node_runs[${index}].completed_at`, errors),
     outcome: optionalString(run.outcome, `workflow.node_runs[${index}].outcome`, errors),
@@ -189,7 +322,11 @@ function workflowRuntime(value: unknown, errors: string[]): WorkflowRuntime | nu
     output_bytes: run.output_bytes === null || run.output_bytes === undefined ? null
       : Number.isInteger(run.output_bytes) && Number(run.output_bytes) >= 0 ? Number(run.output_bytes)
         : (errors.push(`workflow.node_runs[${index}].output_bytes must be a non-negative integer or null`), null),
+    script_path: optionalString(run.script_path, `workflow.node_runs[${index}].script_path`, errors),
+    working_directory: optionalString(run.working_directory, `workflow.node_runs[${index}].working_directory`, errors),
     input_revision: Number.isInteger(run.input_revision) ? Number(run.input_revision) : 0,
+    telemetry: telemetryRecord(run.telemetry, `workflow.node_runs[${index}].telemetry`, errors),
+    timing: nodeTiming(run.timing, run, index, errors),
   })) : [];
   const inputs: Record<string, boolean | string> = {};
   if (isRecord(value.inputs)) {
@@ -212,14 +349,62 @@ function workflowRuntime(value: unknown, errors: string[]): WorkflowRuntime | nu
     outcome: asString(value.incoming.outcome, "workflow.incoming.outcome", errors),
     summary: optionalString(value.incoming.summary, "workflow.incoming.summary", errors),
     handoff: optionalString(value.incoming.handoff, "workflow.incoming.handoff", errors),
+    output: optionalString(value.incoming.output, "workflow.incoming.output", errors),
+    output_log_path: optionalString(value.incoming.output_log_path, "workflow.incoming.output_log_path", errors),
     actor: asString(value.incoming.actor, "workflow.incoming.actor", errors),
     created_at: timestamp(value.incoming.created_at, "workflow.incoming.created_at", errors),
   };
+  const workflowRevisions: Record<string, string> = {};
+  if (isRecord(value.workflow_revisions)) for (const [id, revision] of Object.entries(value.workflow_revisions)) {
+    if (typeof revision === "string" && /^[a-f0-9]{64}$/.test(revision)) workflowRevisions[id] = revision;
+    else errors.push(`workflow.workflow_revisions.${id} must be a SHA-256 digest`);
+  }
+  const resolvedProfiles: Record<string, ResolvedAgentProfile> = {};
+  if (isRecord(value.resolved_agent_profiles)) for (const [key, item] of Object.entries(value.resolved_agent_profiles)) {
+    if (!isRecord(item) || !PROVIDERS.includes(item.provider as never)) { errors.push(`workflow.resolved_agent_profiles.${key} is invalid`); continue; }
+    resolvedProfiles[key] = {
+      alias: typeof item.alias === "string" ? item.alias : "legacy",
+      provider: item.provider as ResolvedAgentProfile["provider"],
+      model: typeof item.model === "string" ? item.model : null,
+      reasoning: typeof item.reasoning === "string" ? item.reasoning : null,
+    };
+  }
+  const workflowStack = Array.isArray(value.workflow_stack) ? value.workflow_stack.filter(isRecord).map((frame, index) => ({
+    workflow_id: asString(frame.workflow_id, `workflow.workflow_stack[${index}].workflow_id`, errors),
+    workflow_revision: asString(frame.workflow_revision, `workflow.workflow_stack[${index}].workflow_revision`, errors),
+    call_node_id: asString(frame.call_node_id, `workflow.workflow_stack[${index}].call_node_id`, errors),
+  })) : [];
+  const fanOutStack = Array.isArray(value.fan_out_stack) ? value.fan_out_stack.filter(isRecord).map((frame, index) => ({
+    workflow_id: asString(frame.workflow_id, `workflow.fan_out_stack[${index}].workflow_id`, errors),
+    workflow_revision: asString(frame.workflow_revision, `workflow.fan_out_stack[${index}].workflow_revision`, errors),
+    fan_out_node_id: asString(frame.fan_out_node_id, `workflow.fan_out_stack[${index}].fan_out_node_id`, errors),
+    fan_in_node_id: asString(frame.fan_in_node_id, `workflow.fan_out_stack[${index}].fan_in_node_id`, errors),
+    pending_targets: Array.isArray(frame.pending_targets) ? frame.pending_targets.map(String) : [],
+    inputs: Array.isArray(frame.inputs) ? frame.inputs.filter(isRecord).map((item) => ({
+      source_node: String(item.source_node ?? ""), target_node: String(item.target_node ?? ""), outcome: String(item.outcome ?? ""),
+      summary: typeof item.summary === "string" ? item.summary : null, handoff: typeof item.handoff === "string" ? item.handoff : null,
+      output: typeof item.output === "string" ? item.output : null, output_log_path: typeof item.output_log_path === "string" ? item.output_log_path : null,
+      actor: typeof item.actor === "string" ? item.actor : "workflow", created_at: typeof item.created_at === "string" ? item.created_at : now,
+    } satisfies WorkflowTransitionContext)) : [],
+    source: isRecord(frame.source) ? {
+      source_node: String(frame.source.source_node ?? ""), target_node: String(frame.source.target_node ?? ""), outcome: String(frame.source.outcome ?? ""),
+      summary: typeof frame.source.summary === "string" ? frame.source.summary : null, handoff: typeof frame.source.handoff === "string" ? frame.source.handoff : null,
+      output: typeof frame.source.output === "string" ? frame.source.output : null, output_log_path: typeof frame.source.output_log_path === "string" ? frame.source.output_log_path : null,
+      actor: typeof frame.source.actor === "string" ? frame.source.actor : "workflow", created_at: typeof frame.source.created_at === "string" ? frame.source.created_at : now,
+    } : null,
+  })) : [];
   return {
     id: asString(value.id, "workflow.id", errors), revision: asString(value.revision, "workflow.revision", errors),
     current_node: asString(value.current_node, "workflow.current_node", errors),
+    started_at: typeof value.started_at === "string" ? timestamp(value.started_at, "workflow.started_at", errors) : nodeRuns[0]?.started_at ?? now,
+    completed_at: value.completed_at === null || value.completed_at === undefined ? null : timestamp(value.completed_at, "workflow.completed_at", errors),
+    current_node_entered_at: typeof value.current_node_entered_at === "string" ? timestamp(value.current_node_entered_at, "workflow.current_node_entered_at", errors) : incoming?.created_at ?? nodeRuns.at(-1)?.completed_at ?? nodeRuns.at(-1)?.started_at ?? now,
     transition_count: Number.isInteger(value.transition_count) && Number(value.transition_count) >= 0 ? Number(value.transition_count) : (errors.push("workflow.transition_count must be a non-negative integer"), 0),
     node_visits: visits, node_attempts: nodeAttempts, node_runs: nodeRuns, prompt_revisions: promptRevisions, inputs, stage_enabled: stageEnabled, incoming,
+    active_workflow_id: typeof value.active_workflow_id === "string" ? value.active_workflow_id : asString(value.id, "workflow.id", errors),
+    active_workflow_revision: typeof value.active_workflow_revision === "string" ? value.active_workflow_revision : asString(value.revision, "workflow.revision", errors),
+    workflow_revisions: Object.keys(workflowRevisions).length ? workflowRevisions : { [String(value.id ?? "")]: String(value.revision ?? "") },
+    workflow_stack: workflowStack, fan_out_stack: fanOutStack, resolved_agent_profiles: resolvedProfiles,
   };
 }
 
@@ -264,7 +449,7 @@ export function normalizeTicket(raw: Record<string, unknown>, now = new Date().t
 
   const rawAttempts = isRecord(raw.attempts) ? raw.attempts : {};
   const currentExecution = execution(raw.execution, errors);
-  const workflow = workflowRuntime(raw.workflow, errors);
+  const workflow = workflowRuntime(raw.workflow, errors, now);
   if (workflow && !/^[a-f0-9]{64}$/.test(workflow.revision)) errors.push("workflow.revision must be a SHA-256 digest");
   if (status === "running" && !currentExecution) errors.push("running tickets require execution");
   if (currentExecution && currentExecution.phase !== phase) errors.push("execution does not match ticket phase/provider");
@@ -316,6 +501,22 @@ export function normalizeTicket(raw: Record<string, unknown>, now = new Date().t
   }
   const archivedAt = raw.archived_at === null || raw.archived_at === undefined ? null : timestamp(raw.archived_at, "archived_at", errors);
   if (archivedAt && (phase !== "done" || status !== "completed")) errors.push("only completed tickets may be archived");
+  const productionResult = PRODUCTION_RESULTS.includes(raw.production_result as never) ? raw.production_result as TicketFrontmatter["production_result"] : "unassessed";
+  if (raw.production_result !== undefined && !PRODUCTION_RESULTS.includes(raw.production_result as never)) errors.push("production_result is invalid");
+  const productionAssessedAt = raw.production_assessed_at === null || raw.production_assessed_at === undefined
+    ? null : timestamp(raw.production_assessed_at, "production_assessed_at", errors);
+  const productionAssessmentNote = optionalString(raw.production_assessment_note, "production_assessment_note", errors);
+  if (productionResult === "unassessed" && productionAssessedAt) errors.push("unassessed production_result cannot have production_assessed_at");
+  if (productionResult !== "unassessed" && !productionAssessedAt) errors.push("assessed production_result requires production_assessed_at");
+
+  const metadata: Record<string, JsonValue> = {};
+  if (raw.metadata !== undefined && !isRecord(raw.metadata)) errors.push("metadata must be an object");
+  else if (isRecord(raw.metadata)) for (const [key, value] of Object.entries(raw.metadata)) {
+    if (!/^[A-Za-z][A-Za-z0-9_.-]{0,127}$/.test(key)) { errors.push(`metadata key ${key} is invalid`); continue; }
+    const normalized = jsonValue(value, `metadata.${key}`, errors);
+    if (normalized !== undefined) metadata[key] = normalized;
+  }
+  if (Buffer.byteLength(JSON.stringify(metadata)) > 65_536) errors.push("metadata must not exceed 64 KiB");
 
   const admitted = raw.phase === undefined || raw.status === undefined || raw.revision === undefined;
   const ticket: TicketFrontmatter = {
@@ -342,7 +543,11 @@ export function normalizeTicket(raw: Record<string, unknown>, now = new Date().t
     },
     pull_requests: pullRequests,
     questions,
+    metadata,
     jira,
+    production_result: productionResult,
+    production_assessed_at: productionAssessedAt,
+    production_assessment_note: productionAssessmentNote,
     archived_at: archivedAt,
     revision: Number.isInteger(raw.revision) && Number(raw.revision) > 0 ? Number(raw.revision) : 1,
     event_sequence: Number.isInteger(raw.event_sequence) && Number(raw.event_sequence) >= 0 ? Number(raw.event_sequence) : 0,

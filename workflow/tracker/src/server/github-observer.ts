@@ -1,7 +1,7 @@
 import { HttpError, type PullRequestObservation, type PullRequestRef } from "./domain.js";
 import type { TrackerConfigStore } from "./config-store.js";
 import type { TicketStore } from "./ticket-store.js";
-import { advanceWorkflow, transitionTo, workflowNode, workflowRoute, type WorkflowLibrary } from "./workflow-library.js";
+import { activeWorkflowIdentity, advanceWorkflow, transitionTo, workflowNode, workflowRoute, type WorkflowLibrary } from "./workflow-library.js";
 
 interface GithubUser { login?: string; type?: string }
 interface GithubComment { id: number; body?: string; user?: GithubUser }
@@ -78,7 +78,7 @@ export class GithubObserver {
     if (!current.valid || !ticket) throw new HttpError(422, "Ticket is invalid", current.errors);
     if (ticket.archived_at) throw new HttpError(409, "Archived tickets are not observed");
     const workflowDefinition = ticket.workflow && this.workflows
-      ? (await this.workflows.get(ticket.workflow.id, ticket.workflow.revision)).definition : null;
+      ? (await this.workflows.get(activeWorkflowIdentity(ticket).id, activeWorkflowIdentity(ticket).revision)).definition : null;
     const currentNode = workflowDefinition && ticket.workflow ? workflowNode(workflowDefinition, ticket.workflow.current_node) : null;
     const watchedGate = ticket.status === "waiting_approval" && currentNode?.type === "human_gate" && currentNode.github_watch
       ? { node: currentNode, watch: currentNode.github_watch } : null;

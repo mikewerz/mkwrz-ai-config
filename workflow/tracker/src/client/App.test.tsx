@@ -9,7 +9,7 @@ import { App } from "./App.js";
 const summary = {
   id: "APT-42", title: "UI ticket", phase: "implementation", status: "running",
   work_provider: "claude", review_provider: "codex", review_required: true,
-  priority: 50, provider: "claude", revision: 7, valid: true, errors: [], path: "APT-42.md", claim_blockers: [], archived_at: null, workflow_id: "standard-delivery",
+  priority: 50, provider: "claude", revision: 7, created_at: "2026-08-14T11:00:00Z", valid: true, errors: [], path: "APT-42.md", claim_blockers: [], archived_at: null, workflow_id: "standard-delivery",
 };
 
 const execution = {
@@ -97,6 +97,32 @@ const workflowFixture = {
   revision: "workflow-r1", valid: true, errors: [], referenced_prompts: ["specification", "implementation", "review"],
 };
 
+const metricsFixture = {
+  generated_at: "2026-08-18T13:00:00.000Z", filters: { labels: [], label_mode: "any", repositories: [] },
+  available: { labels: ["dashboard"], workflows: [{ id: "standard-delivery", revision: "workflow-r1" }], repositories: ["demo"] },
+  totals: {
+    tickets: 1, completed: 1, archived: 0, total_tokens: 1_100, known_cost_usd: 0.02,
+    active_ms: 90_000, quota_paused_ms: 30_000, human_wait_ms: 60_000,
+    production: { unassessed: 0, succeeded: 1, failed: 0, rolled_back: 0, not_deployed: 0 },
+    production_assessed: 1, production_success_rate: 1,
+  },
+  coverage: { agent_runs: 1, token_runs: 1, cost_runs: 1, estimated_cost_runs: 0, complete_token_tickets: 1, complete_cost_tickets: 1 },
+  summaries: Object.fromEntries(["ticket_duration_ms", "active_time_ms", "human_wait_ms", "quota_pause_ms", "tokens_per_ticket", "cost_per_ticket_usd"].map((key) => [key, { count: 1, min: 1, q1: 1, median: 1, q3: 1, max: 1, mean: 1, p90: 1, p95: 1 }])),
+  workflows: [{
+    workflow_id: "standard-delivery", workflow_revision: "workflow-r1", ticket_count: 1,
+    nodes: [{
+      workflow_id: "standard-delivery", workflow_revision: "workflow-r1", node_id: "implementation", node_name: "Implementation", node_type: "agent",
+      ticket_count: 1, runs: 1, completed: 1, running: 0, interrupted: 0, bypassed: 0, lease_lost: 0,
+      classifications: { success: 1, failure: 0, neutral: 0, unclassified: 0 }, success_rate: 1,
+      wall_ms: { count: 1, min: 90_000, q1: 90_000, median: 90_000, q3: 90_000, max: 90_000, mean: 90_000, p90: 90_000, p95: 90_000 },
+      active_ms: 90_000, quota_paused_ms: 30_000, human_wait_ms: 0, total_tokens: 1_100, known_cost_usd: 0.02,
+      telemetry_coverage: { token_runs: 1, cost_runs: 1, total_runs: 1 },
+      branches: [{ outcome: "completed", label: "Completed", target: "done", metric_class: "success", count: 1, rate: 1 }],
+    }],
+  }],
+  profiles: [{ alias: "default", provider: "claude", model: "opus", reasoning: "high", runs: 1, success: 1, failure: 0, success_rate: 1, total_tokens: 1_100, known_cost_usd: 0.02, token_runs: 1, cost_runs: 1, wall_ms: { count: 1, min: 90_000, q1: 90_000, median: 90_000, q3: 90_000, max: 90_000, mean: 90_000, p90: 90_000, p95: 90_000 } }],
+};
+
 class FakeEventSource { addEventListener() {} close() {} }
 
 function installLocalStorage(): Storage {
@@ -131,13 +157,14 @@ describe("operator UI", () => {
     vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const path = String(input);
       if ((path === "/api/tickets" || path === "/api/tickets?include_archived=true") && !init?.method) {
-        const ticket = { ...summary, phase: current.frontmatter.phase, status: current.frontmatter.status, claim_blockers: claimBlockers, archived_at: current.frontmatter.archived_at };
+        const ticket = { ...summary, phase: current.frontmatter.phase, status: current.frontmatter.status, priority: current.frontmatter.priority, revision: current.frontmatter.revision, claim_blockers: claimBlockers, archived_at: current.frontmatter.archived_at };
         return Response.json({ tickets: current.frontmatter.archived_at && path === "/api/tickets" ? [] : [ticket] });
       }
       if (path === "/api/runtime" && !init?.method) return Response.json({ agents: current.frontmatter.execution ? [{
         ticket_id: current.id, title: current.frontmatter.title, phase: current.frontmatter.phase, status: current.frontmatter.status,
         provider: "claude", attempt: 2, claimed_at: execution.claimed_at, last_heartbeat_at: execution.last_heartbeat_at,
         lease_expires_at: execution.lease_expires_at, consecutive_lease_losses: 0, pane_id: "w1:p1", session_ref: "session-1", herdr: execution.herdr_observation,
+        telemetry: current.frontmatter.execution.telemetry ?? null,
       }] : [] });
       if (path === "/api/supervisors" && !init?.method) return Response.json({ supervisors: [{
         supervisor_id: "coordinator-vm", instance_id: "instance-1", hostname: "worker-vm",
@@ -146,6 +173,7 @@ describe("operator UI", () => {
         last_seen_at: "2026-08-14T12:01:30Z", status: "online",
         assigned_ticket: { id: "APT-42", title: "UI ticket", phase: current.frontmatter.phase, status: current.frontmatter.status },
       }] });
+      if (path.startsWith("/api/metrics") && !init?.method) return Response.json(metricsFixture);
       if (path === "/api/config" && !init?.method) return Response.json({ config: trackerConfig });
       if (path === "/api/prompts" && !init?.method) return Response.json({ prompts });
       if (path === "/api/prompts" && init?.method === "POST") {
@@ -186,6 +214,18 @@ describe("operator UI", () => {
       if (path === "/api/tickets/APT-42" && !init?.method) return Response.json(current);
       if (path === "/api/tickets/APT-42" && init?.method === "PUT") {
         current = { ...current, markdown: String(JSON.parse(String(init.body)).markdown) };
+        return Response.json(current);
+      }
+      if (path === "/api/tickets/APT-42/priority" && init?.method === "POST") {
+        const payload = JSON.parse(String(init.body));
+        current.frontmatter.priority = payload.priority;
+        current.frontmatter.revision += 1;
+        return Response.json(current);
+      }
+      if (path === "/api/tickets/APT-42/draft" && init?.method === "POST") {
+        current.frontmatter.status = "pending";
+        current.frontmatter.execution = null;
+        current.frontmatter.revision += 1;
         return Response.json(current);
       }
       if (path.startsWith("/api/tickets/APT-42/questions/") && path.endsWith("/answer") && init?.method === "POST") {
@@ -247,6 +287,59 @@ describe("operator UI", () => {
     expect(screen.queryByRole("button", { name: "Save ticket" })).not.toBeInTheDocument();
   });
 
+  it("shows exact harness model, reasoning, node usage, and ticket cost coverage", async () => {
+    const snapshot = {
+      schema_version: 1, harness: "claude", session_ref: "claude-session", observed_at: new Date().toISOString(),
+      source: { kind: "session_log", detail: "session.jsonl" }, model: { id: "claude-sonnet-4-5", provider: "anthropic", observed_ids: ["claude-sonnet-4-5"] },
+      reasoning: { effort: "high", enabled: true, source: "session" },
+      usage: { input_tokens: 900, cached_input_tokens: 100, cache_write_input_tokens: 0, output_tokens: 100, reasoning_output_tokens: 0, total_tokens: 1100 },
+      cost: { total_usd: 0.02, kind: "reported" }, context: { used_tokens: 1100, window_tokens: 100000, used_percent: 1.1 },
+      rate_limits: [], attributes: { cli_version: "1.2.3" },
+    };
+    const telemetry = { baseline: { ...snapshot, usage: { ...snapshot.usage, input_tokens: 0, cached_input_tokens: 0, output_tokens: 0, total_tokens: 0 }, cost: { total_usd: 0, kind: "reported" } }, latest: snapshot, delta: { usage: snapshot.usage, cost_usd: 0.02 } };
+    current.frontmatter.execution.telemetry = telemetry;
+    current.frontmatter.workflow = {
+      id: "standard-delivery", revision: "workflow-r1", current_node: "implementation", transition_count: 1,
+      started_at: new Date(Date.now() - 120_000).toISOString(), completed_at: null, current_node_entered_at: new Date(Date.now() - 120_000).toISOString(),
+      node_visits: { implementation: 1 }, node_attempts: {}, prompt_revisions: {}, inputs: {}, stage_enabled: {}, incoming: null,
+      node_runs: [{ id: "run-1", node_id: "implementation", node_type: "agent", visit: 1, attempt: 1, status: "running", outcome: null, summary: null, started_at: new Date(Date.now() - 60_000).toISOString(), completed_at: null, lease_id: "lease-1", telemetry, timing: { active_ms: 30_000, quota_paused_ms: 30_000, human_wait_ms: 0, state: "quota_paused", last_accounted_at: new Date().toISOString(), pause_limit_id: "five_hour", pause_until: new Date(Date.now() + 60_000).toISOString() } }],
+    };
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: /UI ticket/i }));
+    expect((await screen.findAllByText("claude-sonnet-4-5")).length).toBeGreaterThan(0);
+    expect(screen.getAllByText("high").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("1.1K").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("$0.02").length).toBeGreaterThan(0);
+    expect(screen.getByText(/Cost coverage: 1\/1/)).toBeInTheDocument();
+    expect(screen.getByText("Quota paused")).toBeInTheDocument();
+    expect(screen.getAllByText(/30s quota paused/).length).toBeGreaterThan(0);
+  });
+
+  it("orders the queue by priority and allows priority changes while a ticket is live", async () => {
+    render(<App />);
+    expect(await screen.findByRole("heading", { name: /Priority order/i })).toBeInTheDocument();
+    fireEvent.click(await screen.findByRole("button", { name: /UI ticket/i }));
+    const priority = await screen.findByLabelText("Ticket priority");
+    expect(priority).toHaveValue(50);
+    fireEvent.change(priority, { target: { value: "75" } });
+    fireEvent.click(screen.getByRole("button", { name: "Update" }));
+    await waitFor(() => expect(fetch).toHaveBeenCalledWith("/api/tickets/APT-42/priority", expect.objectContaining({
+      method: "POST", body: expect.stringContaining('"priority":75'),
+    })));
+    expect(await screen.findByLabelText("Ticket priority")).toHaveValue(75);
+  });
+
+  it("returns an unclaimed ready ticket to the editable draft state", async () => {
+    current.frontmatter.status = "ready";
+    current.frontmatter.execution = null;
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: /UI ticket/i }));
+    fireEvent.click(await screen.findByRole("button", { name: "Return to draft" }));
+    await waitFor(() => expect(fetch).toHaveBeenCalledWith("/api/tickets/APT-42/draft", expect.objectContaining({ method: "POST" })));
+    expect(await screen.findByRole("heading", { name: "Edit work ticket" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Mark ready" })).toBeInTheDocument();
+  });
+
   it("shows supervisor host, root, agents, and ticket reservation on the health page", async () => {
     render(<App />);
     fireEvent.click(await screen.findByRole("button", { name: /Supervisor health/i }));
@@ -255,6 +348,17 @@ describe("operator UI", () => {
     expect(screen.getByText("/srv/projects")).toBeInTheDocument();
     expect(screen.getByText("Claude")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /APT-42 · UI ticket/i })).toBeInTheDocument();
+  });
+
+  it("shows revision-aware workflow reliability, distributions, and production outcomes on the metrics page", async () => {
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: "Metrics" }));
+    expect(await screen.findByRole("heading", { name: "Factory metrics" })).toBeInTheDocument();
+    expect(screen.getByText("Nodes and branches")).toBeInTheDocument();
+    expect(screen.getByText("Production outcomes")).toBeInTheDocument();
+    expect(screen.getAllByText("100%", { exact: false }).length).toBeGreaterThan(0);
+    expect(screen.getByText("Completed → Done")).toBeInTheDocument();
+    expect(screen.getByText(/complete cost/)).toBeInTheDocument();
   });
 
   it("edits and saves the YAML-backed repository catalog through structured fields", async () => {
@@ -275,12 +379,12 @@ describe("operator UI", () => {
   });
 
   it("hides disabled providers from new tickets without depending on supervisor presence", async () => {
-    trackerConfig.providers.enabled = ["codex"];
+    trackerConfig.providers.enabled = ["claude", "codex"];
     render(<App />);
     fireEvent.click(await screen.findByRole("button", { name: /New ticket/i }));
     const workAgent = await screen.findByLabelText("Work agent");
-    expect(workAgent).toHaveValue("codex");
-    expect(within(workAgent).queryByRole("option", { name: "Claude" })).not.toBeInTheDocument();
+    expect(workAgent).toHaveValue("claude");
+    expect(within(workAgent).getByRole("option", { name: "Claude" })).toBeInTheDocument();
     expect(within(workAgent).getByRole("option", { name: "Codex" })).toBeInTheDocument();
   });
 
@@ -332,7 +436,7 @@ describe("operator UI", () => {
     expect(within(graph).getAllByRole("button")[0]).toHaveTextContent("Specification");
     expect(graph.querySelectorAll(".factory-connector").length).toBeGreaterThan(0);
     expect(graph.querySelectorAll(".factory-connector.loop").length).toBeGreaterThan(0);
-    expect(screen.getByRole("heading", { name: "Conditions" })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "Conditions & parameters" })).toBeInTheDocument();
     expect(screen.getByRole("heading", { name: "Stages" })).toBeInTheDocument();
     expect(screen.getByLabelText("Outcome 1 label")).toHaveValue("Specification completed");
     expect(screen.getByLabelText("Outcome 1 target").tagName).toBe("SELECT");
@@ -353,16 +457,18 @@ describe("operator UI", () => {
     fireEvent.change(screen.getByLabelText("Workflow name"), { target: { value: "Release factory" } });
     fireEvent.click(screen.getByRole("button", { name: "＋ Script" }));
     expect(within(screen.getByLabelText("Workflow graph")).getByRole("button", { name: /Script/ })).toBeInTheDocument();
-    fireEvent.change(screen.getByLabelText("Action name"), { target: { value: "verify-release" } });
+    expect(screen.getByLabelText("Script path")).toHaveValue(".agents/actions/run.sh");
+    fireEvent.change(screen.getByLabelText("Script path"), { target: { value: "tools/verify-release.sh" } });
+    expect(screen.getByText(/tools\/verify-release\.sh runs from selected repository \/ \./i)).toBeInTheDocument();
     fireEvent.change(screen.getByLabelText("Activity source"), { target: { value: "inline" } });
     const expectedEnvironment = [
-      "AGENTIC_TICKET_ID", "AGENTIC_TICKET_PATH", "AGENTIC_PROJECT_ROOT", "AGENTIC_NODE_ID", "AGENTIC_NODE_NAME",
+      "AGENTIC_TICKET_ID", "AGENTIC_TICKET_PATH", "AGENTIC_PROJECT_ROOT", "AGENTIC_SCRIPT_PATH", "AGENTIC_WORKING_DIRECTORY", "AGENTIC_NODE_ID", "AGENTIC_NODE_NAME",
       "AGENTIC_NODE_RUN_ID", "AGENTIC_WORKFLOW_NODE_TYPE", "AGENTIC_ATTEMPT", "AGENTIC_WORKFLOW_ID",
       "AGENTIC_WORKFLOW_REVISION", "AGENTIC_WORKFLOW_PHASE", "AGENTIC_REPOSITORY_ID", "AGENTIC_REPOSITORY_PATH",
       "AGENTIC_PRIMARY_REPOSITORY_ID", "AGENTIC_PRIMARY_REPOSITORY_PATH", "AGENTIC_CURRENT_BRANCH", "AGENTIC_DEFAULT_BRANCH",
       "AGENTIC_HEAD_SHA", "AGENTIC_REMOTE_URL", "AGENTIC_REPOSITORIES_JSON", "AGENTIC_PULL_REQUESTS_JSON",
       "AGENTIC_CONTEXT_JSON", "AGENTIC_INCOMING_NODE", "AGENTIC_INCOMING_OUTCOME", "AGENTIC_INCOMING_SUMMARY",
-      "AGENTIC_INCOMING_HANDOFF",
+      "AGENTIC_INCOMING_HANDOFF", "AGENTIC_INCOMING_OUTPUT", "AGENTIC_INCOMING_OUTPUT_LOG",
     ];
     const expectCompleteEnvironmentHeader = () => {
       const code = (screen.getByLabelText("Inline code") as HTMLTextAreaElement).value;
@@ -381,7 +487,7 @@ describe("operator UI", () => {
     fireEvent.change(screen.getByLabelText("Inline language"), { target: { value: "shell" } });
     expect(screen.getByLabelText("Inline code")).toHaveValue("import sys\nsys.exit(0)");
     fireEvent.change(screen.getByLabelText("Inline language"), { target: { value: "python" } });
-    expect(screen.getByText(/runs inside the selected repository/)).toBeInTheDocument();
+    expect(screen.getByText(/runs with the supervisor process credentials from the configured working directory/)).toBeInTheDocument();
     expect(screen.getByLabelText("Outcome 1 exit codes")).toHaveValue("0");
     expect(screen.getByLabelText("Outcome 2 exit codes")).toHaveValue("All other / error");
     fireEvent.click(screen.getByRole("button", { name: "Create workflow" }));
@@ -438,8 +544,6 @@ describe("operator UI", () => {
     expect(screen.getByLabelText("Review agent")).toHaveValue("codex");
     fireEvent.change(screen.getByLabelText("Work agent"), { target: { value: "codex" } });
     expect(screen.getByLabelText("Review agent")).toHaveValue("claude");
-    fireEvent.change(screen.getByLabelText("Work agent"), { target: { value: "claude" } });
-    expect(screen.getByLabelText("Review agent")).toHaveValue("codex");
     expect(screen.getByLabelText("Review agent")).toBeDisabled();
   });
 

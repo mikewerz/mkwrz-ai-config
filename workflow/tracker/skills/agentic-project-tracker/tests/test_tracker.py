@@ -40,6 +40,7 @@ class StubHandler(BaseHTTPRequestHandler):
     do_GET = handle_request
     do_POST = handle_request
     do_PUT = handle_request
+    do_DELETE = handle_request
 
     def log_message(self, _format: str, *_args: object) -> None:
         return
@@ -105,6 +106,26 @@ class TrackerClientTest(unittest.TestCase):
             "ticket_id": "APT-1", "run_id": "run/1", "output": "full\nscript output\n",
         })
 
+    def test_reads_sets_and_deletes_ticket_metadata(self) -> None:
+        StubHandler.responses[("GET", "/api/tickets/APT-1/metadata")] = (200, {"metadata": {"deploy": {"environment": "qa"}}})
+        StubHandler.responses[("GET", "/api/tickets/APT-1/metadata/deploy.status")] = (200, {"key": "deploy.status", "value": "ready"})
+        StubHandler.responses[("PUT", "/api/tickets/APT-1/metadata/deploy.status")] = (200, {"id": "APT-1"})
+        StubHandler.responses[("DELETE", "/api/tickets/APT-1/metadata/deploy.status")] = (200, {"id": "APT-1"})
+
+        self.assertEqual(self.run_cli("ticket", "metadata-list", "APT-1").returncode, 0)
+        self.assertEqual(self.run_cli("ticket", "metadata-get", "APT-1", "deploy.status").returncode, 0)
+        set_result = self.run_cli(
+            "ticket", "metadata-set", "APT-1", "deploy.status", "--revision", "4",
+            "--value-json", '{"state":"ready","attempt":2}',
+        )
+        self.assertEqual(set_result.returncode, 0, set_result.stderr)
+        delete_result = self.run_cli("ticket", "metadata-delete", "APT-1", "deploy.status", "--revision", "5")
+        self.assertEqual(delete_result.returncode, 0, delete_result.stderr)
+        self.assertEqual(StubHandler.received[2]["body"], {
+            "expected_revision": 4, "value": {"state": "ready", "attempt": 2},
+        })
+        self.assertEqual(StubHandler.received[3]["body"], {"expected_revision": 5})
+
     def test_sends_revisioned_guidance_payload(self) -> None:
         StubHandler.responses[("POST", "/api/tickets/APT-1/guidance")] = (200, {"id": "APT-1"})
         result = self.run_cli("ticket", "guidance", "APT-1", "--revision", "7", "--message", "Preserve the API.")
@@ -158,6 +179,27 @@ class TrackerClientTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(StubHandler.received[0]["body"], {
             "expected_revision": 9, "decision": "changes_requested", "message": "Cover rollback.",
+        })
+
+    def test_archives_with_a_production_assessment_and_can_revise_it_later(self) -> None:
+        StubHandler.responses[("POST", "/api/tickets/APT-1/archive")] = (200, {"id": "APT-1"})
+        archived = self.run_cli(
+            "ticket", "archive", "APT-1", "--revision", "15", "--production-result", "succeeded",
+            "--production-note", "Healthy after rollout.",
+        )
+        self.assertEqual(archived.returncode, 0, archived.stderr)
+        self.assertEqual(StubHandler.received[0]["body"], {
+            "expected_revision": 15, "production_result": "succeeded", "production_assessment_note": "Healthy after rollout.",
+        })
+
+        StubHandler.responses[("POST", "/api/tickets/APT-1/production-assessment")] = (200, {"id": "APT-1"})
+        revised = self.run_cli(
+            "ticket", "production-assessment", "APT-1", "--revision", "16", "--production-result", "rolled_back",
+            "--production-note", "Delayed alert.",
+        )
+        self.assertEqual(revised.returncode, 0, revised.stderr)
+        self.assertEqual(StubHandler.received[1]["body"], {
+            "expected_revision": 16, "production_result": "rolled_back", "production_assessment_note": "Delayed alert.",
         })
 
     def test_surfaces_revision_conflict_without_retry(self) -> None:

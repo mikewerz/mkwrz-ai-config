@@ -4,6 +4,9 @@ import { promisify } from "node:util";
 import type { AgentObservation, Provider } from "./types.js";
 
 const exec = promisify(execFile);
+const PANE_BUSY_RETRY_INTERVAL_MS = 500;
+const PANE_BUSY_RETRY_TIMEOUT_MS = 10_000;
+const sleep = (milliseconds: number) => new Promise((resolve) => setTimeout(resolve, milliseconds));
 
 export interface CommandRunner {
   run(args: string[]): Promise<unknown>;
@@ -68,6 +71,16 @@ export function resumeArguments(provider: Provider, sessionRef: string | null): 
   return ["resume", sessionRef];
 }
 
+export function launchArguments(provider: Provider, sessionRef: string | null, model?: string | null, reasoning?: string | null): string[] {
+  const modelArgs = model ? ["--model", model] : [];
+  if (provider === "codex") {
+    const reasoningArgs = reasoning ? ["-c", `model_reasoning_effort=${JSON.stringify(reasoning)}`] : [];
+    return sessionRef ? ["resume", sessionRef, ...modelArgs, ...reasoningArgs] : [...modelArgs, ...reasoningArgs];
+  }
+  const reasoningArgs = reasoning ? ["--effort", reasoning] : [];
+  return [...modelArgs, ...reasoningArgs, ...resumeArguments(provider, sessionRef)];
+}
+
 export function agentName(ticketId: string, provider: Provider, conversation: string): string {
   const compact = ticketId.toLowerCase().replaceAll(/[^a-z0-9]/g, "").slice(0, 7) || "ticket";
   const identity = createHash("sha256").update(ticketId).digest("hex").slice(0, 10);
@@ -78,17 +91,30 @@ export function agentName(ticketId: string, provider: Provider, conversation: st
 export class HerdrController {
   constructor(private readonly runner: CommandRunner, readonly projectRoot: string) {}
 
-  async ensureAgent(ticketId: string, provider: Provider, conversation: string, existingPane: string | null, sessionRef: string | null): Promise<AgentObservation> {
+  private async startAgent(args: string[]): Promise<void> {
+    const deadline = Date.now() + PANE_BUSY_RETRY_TIMEOUT_MS;
+    while (true) {
+      try {
+        await this.runner.run(args);
+        return;
+      } catch (error) {
+        if (commandErrorCode(error) !== "agent_pane_busy" || Date.now() >= deadline) throw error;
+        await sleep(Math.min(PANE_BUSY_RETRY_INTERVAL_MS, deadline - Date.now()));
+      }
+    }
+  }
+
+  async ensureAgent(ticketId: string, provider: Provider, conversation: string, existingPane: string | null, sessionRef: string | null, profile?: { model: string | null; reasoning: string | null } | null): Promise<AgentObservation> {
     if (existingPane) {
       try { return await this.observe(existingPane); } catch { /* restore into saved pane */ }
-      await this.runner.run(["agent", "start", agentName(ticketId, provider, conversation), "--kind", provider, "--pane", existingPane, "--", ...resumeArguments(provider, sessionRef)]);
+      await this.startAgent(["agent", "start", agentName(ticketId, provider, conversation), "--kind", provider, "--pane", existingPane, "--", ...launchArguments(provider, sessionRef, profile?.model, profile?.reasoning)]);
       return this.observe(existingPane);
     }
     const created = resultRecord(await this.runner.run(["workspace", "create", "--cwd", this.projectRoot, "--label", ticketId, "--no-focus"]));
     const rootPane = created.root_pane as { pane_id?: unknown } | undefined;
     const paneId = typeof rootPane?.pane_id === "string" ? rootPane.pane_id : null;
     if (!paneId) throw new Error("Herdr workspace creation did not return a root pane ID");
-    await this.runner.run(["agent", "start", agentName(ticketId, provider, conversation), "--kind", provider, "--pane", paneId, "--", ...resumeArguments(provider, sessionRef)]);
+    await this.startAgent(["agent", "start", agentName(ticketId, provider, conversation), "--kind", provider, "--pane", paneId, "--", ...launchArguments(provider, sessionRef, profile?.model, profile?.reasoning)]);
     return this.observe(paneId);
   }
 

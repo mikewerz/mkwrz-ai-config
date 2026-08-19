@@ -17,6 +17,7 @@ from urllib.request import Request, urlopen
 PROVIDERS = ("claude", "codex")
 REVIEW_PROVIDERS = ("claude", "codex")
 PHASES = ("specification", "implementation", "review")
+PRODUCTION_RESULTS = ("unassessed", "succeeded", "failed", "rolled_back", "not_deployed")
 DEFAULT_URL = os.environ.get("AGENTIC_PROJECT_TRACKER_URL", "http://127.0.0.1:4310")
 
 
@@ -114,6 +115,17 @@ def selected_text(args: argparse.Namespace, name: str) -> str:
     return value if name == "content" else value.strip()
 
 
+def optional_text(args: argparse.Namespace, name: str) -> str | None:
+    direct = getattr(args, name, None)
+    file_path = getattr(args, f"{name}_file", None)
+    if direct is None and file_path is None:
+        return None
+    value = read_text(file_path) if file_path is not None else direct
+    if not isinstance(value, str) or not value.strip():
+        raise ClientFailure(f"{name.replace('_', ' ')} must not be empty")
+    return value.strip()
+
+
 def add_text_input(parser: argparse.ArgumentParser, name: str, help_text: str) -> None:
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument(f"--{name.replace('_', '-')}", dest=name, help=help_text)
@@ -135,6 +147,10 @@ def post(client: TrackerClient, path: str, payload: dict[str, Any]) -> tuple[int
 
 def put(client: TrackerClient, path: str, payload: dict[str, Any]) -> tuple[int, Any]:
     return client.request("PUT", path, payload)
+
+
+def delete(client: TrackerClient, path: str, payload: dict[str, Any]) -> tuple[int, Any]:
+    return client.request("DELETE", path, payload)
 
 
 def cmd_health(client: TrackerClient, _args: argparse.Namespace) -> tuple[int, Any]:
@@ -196,6 +212,35 @@ def cmd_ticket_run_output(client: TrackerClient, args: argparse.Namespace) -> tu
     return status, {"ticket_id": args.id, "run_id": args.run_id, "output": output}
 
 
+def cmd_ticket_metadata_list(client: TrackerClient, args: argparse.Namespace) -> tuple[int, Any]:
+    return get(client, f"/api/tickets/{encoded(args.id)}/metadata")
+
+
+def cmd_ticket_metadata_get(client: TrackerClient, args: argparse.Namespace) -> tuple[int, Any]:
+    return get(client, f"/api/tickets/{encoded(args.id)}/metadata/{encoded(args.key)}")
+
+
+def metadata_value(args: argparse.Namespace) -> Any:
+    source = read_text(args.value_json_file) if args.value_json_file is not None else args.value_json
+    try:
+        return json.loads(source)
+    except json.JSONDecodeError as error:
+        raise ClientFailure(f"Invalid metadata JSON: {error}") from error
+
+
+def cmd_ticket_metadata_set(client: TrackerClient, args: argparse.Namespace) -> tuple[int, Any]:
+    return put(client, f"/api/tickets/{encoded(args.id)}/metadata/{encoded(args.key)}", {
+        "expected_revision": args.revision,
+        "value": metadata_value(args),
+    })
+
+
+def cmd_ticket_metadata_delete(client: TrackerClient, args: argparse.Namespace) -> tuple[int, Any]:
+    return delete(client, f"/api/tickets/{encoded(args.id)}/metadata/{encoded(args.key)}", {
+        "expected_revision": args.revision,
+    })
+
+
 def cmd_ticket_next_id(client: TrackerClient, _args: argparse.Namespace) -> tuple[int, Any]:
     return get(client, "/api/tickets/next-id")
 
@@ -235,6 +280,30 @@ def cmd_ticket_simple_action(client: TrackerClient, args: argparse.Namespace) ->
     return post(client, f"/api/tickets/{encoded(args.id)}/{args.api_action}", {
         "expected_revision": args.revision,
     })
+
+
+def production_payload(args: argparse.Namespace) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "expected_revision": args.revision,
+        "production_result": args.production_result,
+    }
+    note = optional_text(args, "production_note")
+    if note is not None:
+        payload["production_assessment_note"] = note
+    return payload
+
+
+def cmd_ticket_archive(client: TrackerClient, args: argparse.Namespace) -> tuple[int, Any]:
+    payload: dict[str, Any] = {"expected_revision": args.revision}
+    if args.production_result is not None:
+        payload.update(production_payload(args))
+    elif optional_text(args, "production_note") is not None:
+        raise ClientFailure("--production-note requires --production-result")
+    return post(client, f"/api/tickets/{encoded(args.id)}/archive", payload)
+
+
+def cmd_ticket_production_assessment(client: TrackerClient, args: argparse.Namespace) -> tuple[int, Any]:
+    return post(client, f"/api/tickets/{encoded(args.id)}/production-assessment", production_payload(args))
 
 
 def cmd_ticket_message_action(client: TrackerClient, args: argparse.Namespace) -> tuple[int, Any]:
@@ -348,6 +417,26 @@ def build_parser() -> argparse.ArgumentParser:
     add_ticket_id(ticket_run_output)
     ticket_run_output.add_argument("run_id", help="Node run ID returned by ticket show.")
     set_handler(ticket_run_output, cmd_ticket_run_output)
+    ticket_metadata_list = ticket_commands.add_parser("metadata-list", help="Read all durable workflow metadata for a ticket.")
+    add_ticket_id(ticket_metadata_list)
+    set_handler(ticket_metadata_list, cmd_ticket_metadata_list)
+    ticket_metadata_get = ticket_commands.add_parser("metadata-get", help="Read one durable workflow metadata value.")
+    add_ticket_id(ticket_metadata_get)
+    ticket_metadata_get.add_argument("key", help="Metadata key.")
+    set_handler(ticket_metadata_get, cmd_ticket_metadata_get)
+    ticket_metadata_set = ticket_commands.add_parser("metadata-set", help="Set one JSON workflow metadata value.")
+    add_ticket_id(ticket_metadata_set)
+    ticket_metadata_set.add_argument("key", help="Metadata key.")
+    add_revision(ticket_metadata_set)
+    value_input = ticket_metadata_set.add_mutually_exclusive_group(required=True)
+    value_input.add_argument("--value-json", help="JSON value, such as true, 7, a quoted string, an array, or an object.")
+    value_input.add_argument("--value-json-file", metavar="PATH", help="Read a JSON value from PATH, or - for stdin.")
+    set_handler(ticket_metadata_set, cmd_ticket_metadata_set)
+    ticket_metadata_delete = ticket_commands.add_parser("metadata-delete", help="Delete one workflow metadata value.")
+    add_ticket_id(ticket_metadata_delete)
+    ticket_metadata_delete.add_argument("key", help="Metadata key.")
+    add_revision(ticket_metadata_delete)
+    set_handler(ticket_metadata_delete, cmd_ticket_metadata_delete)
     set_handler(ticket_commands.add_parser("next-id", help="Preview the next tracker-local ID."), cmd_ticket_next_id)
 
     ticket_create = ticket_commands.add_parser("create", help="Create a ticket from Markdown.")
@@ -382,7 +471,6 @@ def build_parser() -> argparse.ArgumentParser:
         ("ready", "ready", "Mark a pending valid ticket ready."),
         ("retry", "retry", "Return failed or needs-attention work to ready."),
         ("release-supervisor", "release-supervisor", "Release inactive supervisor affinity."),
-        ("archive", "archive", "Archive a completed ticket."),
         ("unarchive", "unarchive", "Return an archived ticket to the completed queue."),
         ("jira-export", "jira/export", "Create a Jira issue for a local ticket."),
         ("jira-resync", "jira/resync", "Refresh a pending Jira-backed ticket."),
@@ -391,6 +479,22 @@ def build_parser() -> argparse.ArgumentParser:
         add_ticket_id(action)
         add_revision(action)
         set_handler(action, cmd_ticket_simple_action, api_action=api_action)
+
+    archive = ticket_commands.add_parser("archive", help="Archive a completed ticket, optionally recording its production result.")
+    add_ticket_id(archive); add_revision(archive)
+    archive.add_argument("--production-result", choices=PRODUCTION_RESULTS)
+    archive_note = archive.add_mutually_exclusive_group()
+    archive_note.add_argument("--production-note")
+    archive_note.add_argument("--production-note-file", metavar="PATH")
+    set_handler(archive, cmd_ticket_archive)
+
+    assessment = ticket_commands.add_parser("production-assessment", help="Set or revise a completed ticket's production result.")
+    add_ticket_id(assessment); add_revision(assessment)
+    assessment.add_argument("--production-result", choices=PRODUCTION_RESULTS, required=True)
+    assessment_note = assessment.add_mutually_exclusive_group()
+    assessment_note.add_argument("--production-note")
+    assessment_note.add_argument("--production-note-file", metavar="PATH")
+    set_handler(assessment, cmd_ticket_production_assessment)
 
     for command, api_action, help_text in (
         ("comment", "comment", "Append durable operator context."),

@@ -13,6 +13,19 @@ let store: TicketStore;
 beforeEach(async () => { root = await mkdtemp(join(tmpdir(), "agentic-api-")); store = new TicketStore(root, { watch: false }); await store.start(); });
 afterEach(async () => { await store.close(); await rm(root, { recursive: true, force: true }); });
 
+function telemetry(totalTokens: number, totalUsd: number) {
+  return {
+    schema_version: 1, harness: "claude", session_ref: "claude-session", observed_at: "2026-08-18T12:00:00.000Z",
+    source: { kind: "session_log", detail: "claude-session.jsonl" },
+    model: { id: "claude-sonnet-4-5", provider: "anthropic", observed_ids: ["claude-sonnet-4-5"] },
+    reasoning: { effort: "high", enabled: true, source: "session" },
+    usage: { input_tokens: totalTokens - 10, cached_input_tokens: 0, cache_write_input_tokens: 0, output_tokens: 10, reasoning_output_tokens: 0, total_tokens: totalTokens },
+    cost: { total_usd: totalUsd, kind: "reported" },
+    context: { used_tokens: 20, window_tokens: 100_000, used_percent: 0.02 }, rate_limits: [],
+    attributes: { cli_version: "test" },
+  };
+}
+
 describe("health endpoint", () => {
   it("returns service status", async () => {
     const app = createApp(store, join(root, "missing-client"));
@@ -46,13 +59,75 @@ describe("health endpoint", () => {
 });
 
 describe("tracker API", () => {
+  it("persists provider-neutral telemetry deltas and accepts a final snapshot after callback", async () => {
+    const app = createApp(store, join(root, "missing-client"));
+    const created = await request(app).post("/api/tickets").send({ markdown: ticketMarkdown({ spec_required: false, review_required: false }) }).expect(201);
+    await request(app).post("/api/tickets/APT-0001/ready").send({ expected_revision: created.body.frontmatter.revision }).expect(200);
+    const claim = await request(app).post("/api/work/claim").send({ supervisor_id: "vm", provider: "claude", available_providers: ["claude"] }).expect(200);
+    const lease = claim.body.frontmatter.execution.lease_id;
+    const baseline = telemetry(100, 1);
+    const heartbeat = await request(app).post(`/api/work/${lease}/heartbeat`).send({
+      pane_id: "w1:p1", session_ref: "claude-session", telemetry: telemetry(160, 1.2), telemetry_baseline: baseline,
+    }).expect(200);
+    expect(heartbeat.body.ticket.frontmatter.execution.telemetry).toMatchObject({
+      latest: { model: { id: "claude-sonnet-4-5" }, reasoning: { effort: "high" } },
+      delta: { usage: { total_tokens: 60 }, cost_usd: 0.2 },
+    });
+    expect((await request(app).get("/api/runtime").expect(200)).body.agents[0]).toMatchObject({
+      ticket_id: "APT-0001", telemetry: { latest: { model: { id: "claude-sonnet-4-5" } }, delta: { usage: { total_tokens: 60 } } },
+    });
+    await request(app).post(`/api/work/${lease}/complete`).send({
+      summary: "Implemented", outcome: "completed", pull_requests: [{ repository: "demo", url: "https://github.com/example/demo/pull/42" }],
+    }).expect(200);
+    const late = await request(app).post(`/api/work/${lease}/telemetry`).send({ telemetry: telemetry(200, 1.5), telemetry_baseline: baseline }).expect(200);
+    const run = late.body.ticket.frontmatter.workflow.node_runs.find((item: { lease_id: string }) => item.lease_id === lease);
+    expect(run.telemetry).toMatchObject({ delta: { usage: { total_tokens: 100 }, cost_usd: 0.5 } });
+    expect(late.body.ticket.frontmatter.execution).toBeNull();
+    const stale = telemetry(170, 1.25);
+    stale.observed_at = "2026-08-17T12:00:00.000Z";
+    const unchanged = await request(app).post(`/api/work/${lease}/telemetry`).send({ telemetry: stale, telemetry_baseline: baseline }).expect(200);
+    expect(unchanged.body.ticket.frontmatter.workflow.node_runs.find((item: { lease_id: string }) => item.lease_id === lease).telemetry.delta).toMatchObject({ usage: { total_tokens: 100 }, cost_usd: 0.5 });
+    await request(app).post(`/api/work/${lease}/telemetry`).send({ telemetry: { nope: true } }).expect(422);
+  }, 15_000);
+
+  it("reprioritizes tickets in any state and returns unclaimed ready work to draft without adding a workflow visit", async () => {
+    const app = createApp(store, join(root, "missing-client"));
+    const first = await request(app).post("/api/tickets").send({ markdown: ticketMarkdown({ id: "APT-0001", priority: 10, spec_required: false, review_required: false }) }).expect(201);
+    await request(app).post("/api/tickets").send({ markdown: ticketMarkdown({ id: "APT-0002", priority: 20, spec_required: false, review_required: false }) }).expect(201);
+
+    const reprioritized = await request(app).post("/api/tickets/APT-0001/priority").send({
+      expected_revision: first.body.frontmatter.revision, priority: 30,
+    }).expect(200);
+    expect(reprioritized.body.frontmatter.priority).toBe(30);
+    expect((await request(app).get("/api/tickets").expect(200)).body.tickets.map((ticket: { id: string }) => ticket.id)).toEqual(["APT-0001", "APT-0002"]);
+    await request(app).post("/api/tickets/APT-0001/priority").send({
+      expected_revision: reprioritized.body.frontmatter.revision, priority: 1.5,
+    }).expect(422);
+
+    const ready = await request(app).post("/api/tickets/APT-0001/ready").send({ expected_revision: reprioritized.body.frontmatter.revision }).expect(200);
+    const visits = ready.body.frontmatter.workflow.node_visits.implementation;
+    const draft = await request(app).post("/api/tickets/APT-0001/draft").send({ expected_revision: ready.body.frontmatter.revision }).expect(200);
+    expect(draft.body.frontmatter).toMatchObject({ phase: "implementation", status: "pending", execution: null });
+    expect(draft.body.frontmatter.workflow.node_visits.implementation).toBe(visits);
+    await request(app).post("/api/work/claim").send({ supervisor_id: "vm", provider: "claude", available_providers: ["claude"] }).expect(204);
+
+    const readyAgain = await request(app).post("/api/tickets/APT-0001/ready").send({ expected_revision: draft.body.frontmatter.revision }).expect(200);
+    expect(readyAgain.body.frontmatter.workflow.node_visits.implementation).toBe(visits);
+    const claimed = await request(app).post("/api/work/claim").send({ supervisor_id: "vm", provider: "claude", available_providers: ["claude"] }).expect(200);
+    const runningPriority = await request(app).post("/api/tickets/APT-0001/priority").send({
+      expected_revision: claimed.body.frontmatter.revision, priority: -5,
+    }).expect(200);
+    expect(runningPriority.body.frontmatter).toMatchObject({ status: "running", priority: -5, execution: { lease_id: claimed.body.frontmatter.execution.lease_id } });
+    await request(app).post("/api/tickets/APT-0001/draft").send({ expected_revision: runningPriority.body.frontmatter.revision }).expect(409);
+  }, 15_000);
+
   it("executes a custom activity, human gate, and agent node through declared outcomes", async () => {
     const app = createApp(store, join(root, "missing-client"));
     const workflow = {
       version: 2, id: "factory-test", name: "Factory test", description: "Typed-node acceptance path", start: "verify", max_transitions: 10,
       inputs: [], stages: [{ id: "work", name: "Work", phase: "implementation", skippable: false, default_enabled: true }, { id: "done", name: "Done", phase: "done", skippable: false, default_enabled: true }],
       nodes: [
-        { id: "verify", name: "Verify repository", type: "script", phase: "implementation", stage: "work", repository: "primary", inline: { language: "javascript", code: "process.stdout.write('verified')" }, outcomes: [], choices: [], exit_codes: [{ id: "success", label: "Verified", description: "Verification passed.", target: "approval", codes: [0] }, { id: "failure", label: "Failed", description: "Verification failed.", target: "failed", default: true }] },
+        { id: "verify", name: "Verify repository", type: "script", phase: "implementation", stage: "work", repository: "primary", inline: { language: "javascript", code: "process.stdout.write('verified')" }, script_output: { persist_stdout: true, prompt_tail_lines: 2 }, outcomes: [], choices: [], exit_codes: [{ id: "success", label: "Verified", description: "Verification passed.", target: "approval", codes: [0] }, { id: "failure", label: "Failed", description: "Verification failed.", target: "failed", default: true }] },
         { id: "approval", name: "Human approval", type: "human_gate", phase: "implementation", stage: "work", outcomes: [], choices: [{ id: "approved", label: "Approve", description: "Continue delivery.", target: "deliver" }, { id: "rejected", label: "Reject", description: "Stop delivery.", target: "failed", comment_required: true }], exit_codes: [] },
         { id: "deliver", name: "Deliver", type: "agent", phase: "implementation", stage: "work", prompt: "implementation", provider: "codex", conversation_key: "work", outcomes: [{ id: "completed", label: "Delivered", description: "Delivery is complete.", target: "done" }], choices: [], exit_codes: [] },
         { id: "done", name: "Done", type: "terminal", phase: "done", stage: "done", terminal_status: "completed", outcomes: [], choices: [], exit_codes: [] },
@@ -61,6 +136,8 @@ describe("tracker API", () => {
     };
     await request(app).post("/api/workflows").send({ content: stringify(workflow) }).expect(201);
     const created = await request(app).post("/api/tickets").send({ markdown: ticketMarkdown({ spec_required: false, review_required: false }), workflow_id: "factory-test" }).expect(201);
+    await request(app).put("/api/tickets/APT-0001/metadata/environment").send({ expected_revision: created.body.frontmatter.revision, value: { name: "nonprod", retries: 2 } }).expect(200);
+    expect((await request(app).get("/api/tickets/APT-0001/metadata/environment").expect(200)).body).toMatchObject({ exists: true, value: { name: "nonprod", retries: 2 } });
     const seeded = await store.command("APT-0001", { event: "test.seed_losses", message: "Seed prior activity lease losses." }, (ticket) => {
       ticket.workflow!.node_attempts.verify = { total: 2, consecutive_lease_losses: 2 }; return { ticket };
     });
@@ -68,21 +145,25 @@ describe("tracker API", () => {
     await request(app).post("/api/work/claim-activity").send({ supervisor_id: "factory-vm", available_providers: ["claude"], activity_capabilities: ["inline_javascript"] }).expect(204);
     const activity = await request(app).post("/api/work/claim-activity").send({ supervisor_id: "factory-vm", available_providers: ["codex"], activity_capabilities: ["inline_javascript"] }).expect(200);
     expect(activity.body.workflow_node).toMatchObject({ id: "verify", type: "script", inline: { language: "javascript", code: "process.stdout.write('verified')" } });
-    const activityResult = await request(app).post(`/api/work/${activity.body.frontmatter.execution.lease_id}/activity-result`).send({ success: true, summary: "Verified", output: "ok", exit_code: 0 }).expect(200);
+    const activityResult = await request(app).post(`/api/work/${activity.body.frontmatter.execution.lease_id}/activity-result`).send({
+      success: true, summary: "Verified", output: "combined", stdout: "one\ntwo\nthree", stderr: "warning", exit_code: 0,
+      script_path: null, working_directory: "/srv/projects/demo",
+    }).expect(200);
     expect(activityResult.body.outcome).toBe("success");
     const waiting = await request(app).get("/api/tickets/APT-0001").expect(200);
     expect(waiting.body.frontmatter.workflow.node_attempts.verify.consecutive_lease_losses).toBe(0);
     const activityRun = waiting.body.frontmatter.workflow.node_runs[0];
-    expect(activityRun).toMatchObject({ output: "ok", output_bytes: 2, output_sha256: expect.any(String), output_path: expect.any(String) });
-    expect((await request(app).get(`/api/tickets/APT-0001/runs/${activityRun.id}/output`).expect(200)).text).toBe("ok");
-    expect(waiting.body.frontmatter).toMatchObject({ status: "waiting_approval", workflow: { current_node: "approval" } });
+    expect(activityRun).toMatchObject({ output: "one\ntwo\nthree", output_bytes: 13, output_sha256: expect.any(String), output_path: expect.any(String), script_path: null, working_directory: "/srv/projects/demo" });
+    expect((await request(app).get(`/api/tickets/APT-0001/runs/${activityRun.id}/output`).expect(200)).text).toBe("one\ntwo\nthree");
+    expect(waiting.body.frontmatter).toMatchObject({ status: "waiting_approval", workflow: { current_node: "approval", incoming: { output: "two\nthree", output_log_path: expect.stringContaining(`/runs/${activityRun.id}/output`) } } });
     await request(app).post("/api/tickets/APT-0001/decide").send({ expected_revision: waiting.body.frontmatter.revision, decision: "rejected" }).expect(422);
     await request(app).post("/api/tickets/APT-0001/decide").send({ expected_revision: waiting.body.frontmatter.revision, decision: "approved" }).expect(200);
     const assignment = await request(app).post("/api/work/claim").send({ supervisor_id: "factory-vm", provider: "codex", available_providers: ["codex"], activity_capabilities: ["inline_javascript"] }).expect(200);
     expect(assignment.body).toMatchObject({ workflow_node: { id: "deliver", conversation_key: "work" }, node_prompt: { id: "implementation" } });
+    await request(app).put(`/api/work/${assignment.body.frontmatter.execution.lease_id}/metadata/release`).send({ value: "candidate" }).expect(200);
     await request(app).post(`/api/work/${assignment.body.frontmatter.execution.lease_id}/complete`).send({ summary: "Delivered", handoff: "Ready for release notes.", outcome: "completed" }).expect(200);
     const complete = await request(app).get("/api/tickets/APT-0001").expect(200);
-    expect(complete.body.frontmatter).toMatchObject({ phase: "done", status: "completed", workflow: { current_node: "done" } });
+    expect(complete.body.frontmatter).toMatchObject({ phase: "done", status: "completed", metadata: { environment: { name: "nonprod", retries: 2 }, release: "candidate" }, workflow: { current_node: "done" } });
     expect(complete.body.frontmatter.workflow.node_runs.map((run: { outcome: string }) => run.outcome)).toEqual(["success", "approved", "completed"]);
     expect(complete.body.frontmatter.workflow).toMatchObject({ incoming: { source_node: "deliver", target_node: "done", outcome: "completed", handoff: "Ready for release notes." } });
   }, 15_000);
@@ -118,6 +199,35 @@ describe("tracker API", () => {
     expect((await request(app).get("/api/tickets/APT-0001").expect(200)).body.frontmatter).toMatchObject({ status: "completed", workflow: { current_node: "done" } });
   });
 
+  it("pins an agent profile alias to provider, model, and reasoning for the ticket", async () => {
+    const app = createApp(store, join(root, "missing-client"));
+    const initial = (await request(app).get("/api/config").expect(200)).body.config;
+    const configured = (await request(app).put("/api/config").send({
+      expected_revision: initial.revision, providers: { enabled: ["claude", "codex"] }, repositories: [],
+      agent_profiles: { default: "complex", profiles: [{ id: "complex", label: "Complex", provider: "codex", model: "gpt-5.6-sol", reasoning: "high" }] },
+      jira: initial.jira, github: initial.github,
+    }).expect(200)).body.config;
+    const workflow = {
+      version: 2, id: "profile-test", name: "Profile test", description: "Pinned runtime profile", start: "work", max_transitions: 5,
+      inputs: [], stages: [{ id: "work", name: "Work", phase: "implementation", skippable: false, default_enabled: true }, { id: "done", name: "Done", phase: "done", skippable: false, default_enabled: true }],
+      nodes: [
+        { id: "work", name: "Work", type: "agent", phase: "implementation", stage: "work", prompt: "implementation", agent_profile: "default", conversation_key: "work", outcomes: [{ id: "completed", label: "Completed", description: "Work completed.", target: "done" }], choices: [], exit_codes: [] },
+        { id: "done", name: "Done", type: "terminal", phase: "done", stage: "done", terminal_status: "completed", status_code: 0, outcomes: [], choices: [], exit_codes: [] },
+      ],
+    };
+    await request(app).post("/api/workflows").send({ content: stringify(workflow) }).expect(201);
+    const created = await request(app).post("/api/tickets").send({ markdown: ticketMarkdown({ spec_required: false, review_required: false }), workflow_id: "profile-test" }).expect(201);
+    await request(app).put("/api/config").send({
+      expected_revision: configured.revision, providers: { enabled: ["claude", "codex"] }, repositories: [],
+      agent_profiles: { default: "complex", profiles: [{ id: "complex", label: "Complex", provider: "claude", model: "claude-opus-4-6", reasoning: "max" }] },
+      jira: configured.jira, github: configured.github,
+    }).expect(200);
+    await request(app).post("/api/tickets/APT-0001/ready").send({ expected_revision: created.body.frontmatter.revision }).expect(200);
+    await request(app).post("/api/work/claim").send({ supervisor_id: "vm", provider: "claude", available_providers: ["claude", "codex"] }).expect(204);
+    const claim = await request(app).post("/api/work/claim").send({ supervisor_id: "vm", provider: "codex", available_providers: ["claude", "codex"] }).expect(200);
+    expect(claim.body.resolved_agent_profile).toEqual({ alias: "complex", provider: "codex", model: "gpt-5.6-sol", reasoning: "high" });
+  }, 15_000);
+
   it("admits the bundled agent-skill ticket template", async () => {
     const app = createApp(store, join(root, "missing-client"));
     const markdown = await readFile("skills/agentic-project-tracker/assets/ticket-template.md", "utf8");
@@ -142,7 +252,9 @@ describe("tracker API", () => {
     const preview = await request(app).post("/api/prompts/implementation/preview").send({
       content: "Implement {{ticket_id}} and call {{callback_base}}complete.", phase: "implementation",
     }).expect(200);
-    expect(preview.body.rendered).toContain("You own ticket AGENT-0042");
+    expect(preview.body.rendered).toContain("You are assigned ticket AGENT-0042");
+    expect(preview.body.rendered).toContain("/START_HERE.md");
+    expect(preview.body.rendered).toContain("# Durable node.md preview");
     expect(preview.body.rendered).toContain("Implement AGENT-0042");
 
     const updated = await request(app).put("/api/prompts/implementation").send({
@@ -311,7 +423,7 @@ describe("tracker API", () => {
     }).expect(200);
     const second = await request(app).post("/api/work/claim").send({ supervisor_id: "worker-b", instance_id: "process-b", provider: "claude", available_providers: ["claude"] }).expect(200);
     expect(second.body.frontmatter.id).toBe("APT-0002");
-  });
+  }, 15_000);
 
   it("waits for active execution interruption before cancelling and releasing repository ownership", async () => {
     const app = createApp(store, join(root, "missing-client"));
@@ -522,6 +634,13 @@ describe("tracker API", () => {
     }).expect(200);
     expect(continued.body.frontmatter).toMatchObject({ phase: "implementation", status: "running" });
     expect(continued.body.frontmatter.execution.guidance[0].message).toContain("Reread the authoritative ticket");
+    const refreshedAssignment = await request(app).get(`/api/work/${lease}/assignment`).expect(200);
+    expect(refreshedAssignment.body.markdown).toContain("Continue with the revised requirement.");
+    expect(refreshedAssignment.body).toMatchObject({
+      workflow_node: { type: "agent" },
+      node_prompt: { id: "implementation" },
+    });
+    await request(app).get("/api/work/stale-lease/assignment").expect(409);
     const guidance = await request(app).get(`/api/work/${lease}/guidance?after=0`).expect(200);
     expect(guidance.body.guidance[0].message).toContain("revision");
 
@@ -616,7 +735,7 @@ describe("tracker API", () => {
 
   it("retains questions, supports multiple PRs per repository, and archives completed work", async () => {
     const app = createApp(store, join(root, "missing-client"));
-    await request(app).post("/api/tickets").send({ markdown: ticketMarkdown({ spec_required: false, review_required: false }) }).expect(201);
+    await request(app).post("/api/tickets").send({ markdown: ticketMarkdown({ spec_required: false, review_required: false, labels: ["release"] }) }).expect(201);
     await request(app).post("/api/tickets/APT-0001/ready").send({ expected_revision: 1 }).expect(200);
     const claim = await request(app).post("/api/work/claim").send({ supervisor_id: "vm", provider: "claude" }).expect(200);
     const lease = claim.body.frontmatter.execution.lease_id;
@@ -637,10 +756,19 @@ describe("tracker API", () => {
     await request(app).post(`/api/work/${lease}/complete`).send({ summary: "Implemented", pull_requests: prs }).expect(200);
     let completed = await request(app).get("/api/tickets/APT-0001").expect(200);
     expect(completed.body.frontmatter.pull_requests).toHaveLength(2);
-    const archived = await request(app).post("/api/tickets/APT-0001/archive").send({ expected_revision: completed.body.frontmatter.revision }).expect(200);
+    let archived = await request(app).post("/api/tickets/APT-0001/archive").send({
+      expected_revision: completed.body.frontmatter.revision, production_result: "succeeded", production_assessment_note: "Healthy after rollout.",
+    }).expect(200);
     expect(archived.body.frontmatter.archived_at).toEqual(expect.any(String));
+    expect(archived.body.frontmatter).toMatchObject({ production_result: "succeeded", production_assessment_note: "Healthy after rollout.", production_assessed_at: expect.any(String) });
     expect((await request(app).get("/api/tickets").expect(200)).body.tickets).toHaveLength(0);
     expect((await request(app).get("/api/tickets?include_archived=true").expect(200)).body.tickets).toHaveLength(1);
+    archived = await request(app).post("/api/tickets/APT-0001/production-assessment").send({
+      expected_revision: archived.body.frontmatter.revision, production_result: "rolled_back", production_assessment_note: "Rollback followed a delayed alert.",
+    }).expect(200);
+    expect(archived.body.frontmatter).toMatchObject({ production_result: "rolled_back", production_assessment_note: "Rollback followed a delayed alert." });
+    const metrics = await request(app).get("/api/metrics?labels=release&label_mode=all&production_result=rolled_back").expect(200);
+    expect(metrics.body.totals).toMatchObject({ tickets: 1, archived: 1, production: { rolled_back: 1 } });
     completed = await request(app).post("/api/tickets/APT-0001/unarchive").send({ expected_revision: archived.body.frontmatter.revision }).expect(200);
     expect(completed.body.frontmatter.archived_at).toBeNull();
   });

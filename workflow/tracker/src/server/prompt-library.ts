@@ -161,6 +161,8 @@ ${PROJECT_ROOT_INSTRUCTION}
 - Selected outcome: {{incoming_outcome}}
 - Previous result: {{incoming_summary}}
 - Actionable handoff: {{incoming_handoff}}
+- Prior node output (configured tail): {{incoming_output}}
+- Full prior output log: {{incoming_output_log}}
 
 Treat this as context from the preceding durable boundary. Reconcile it with the authoritative ticket and existing repository or PR state; do not blindly repeat already-completed work.
 
@@ -186,6 +188,11 @@ Choose an outcome by its exact ID only after its described condition is true. Do
 
 Herdr state is observational and never advances the workflow. Send JSON with \`Content-Type: application/json\` to the lease-fenced callback URLs below.
 
+Ticket-scoped workflow metadata:
+- Read all: \`GET {{callback_base}}metadata\`
+- Read one key: \`GET {{callback_base}}metadata/<key>\`
+- Write one JSON value: \`PUT {{callback_base}}metadata/<key>\` with \`{"value":<any JSON value>}\`
+
 Progress note; continue working:
 - \`POST {{callback_base}}comment\`
 - \`{"message":"A concise durable progress note or decision."}\`
@@ -207,7 +214,31 @@ Unable to continue this node:
 
 Before becoming idle, you must have sent \`ask\`, \`complete\`, or \`fail\`. A comment is not a terminal callback.`;
 
-const ASSIGNMENT_DEFAULT = PRE_MERGE_PROMPT_ASSIGNMENT_DEFAULT.replace(
+export const PRE_DURABLE_BUNDLE_ASSIGNMENT_DEFAULT = PRE_MERGE_PROMPT_ASSIGNMENT_DEFAULT.replace(
+  "Never merge a pull request automatically.",
+  "Never merge a pull request unless the current node instructions explicitly authorize it and their preconditions are satisfied.",
+);
+
+const ASSIGNMENT_DEFAULT = `# Work assignment
+
+You are assigned ticket {{ticket_id}} at workflow node **{{node_name}}** (\`{{node_id}}\`).
+
+Your first action is to read the complete durable assignment at this exact path:
+
+\`{{start_here_path}}\`
+
+The assignment directory is \`{{assignment_directory}}\`. Repository work starts from \`{{project_root}}\`.
+
+Use your normal tools, credentials, judgment, planning, and subagents. Work autonomously inside the current node. Before becoming idle, use the callback helper at this exact path to ask, complete, or fail:
+
+\`{{callback_helper_path}}\`
+
+Do not rely on this bootstrap message as the complete contract. The generated files contain the ticket, incoming handoff, node instructions, allowed outcomes, and callback schemas.`;
+
+const PRE_WORKFLOW_DATA_ASSIGNMENT_DEFAULT = PRE_MERGE_PROMPT_ASSIGNMENT_DEFAULT
+  .replace("- Prior node output (configured tail): {{incoming_output}}\n- Full prior output log: {{incoming_output_log}}\n", "")
+  .replace("Ticket-scoped workflow metadata:\n- Read all: `GET {{callback_base}}metadata`\n- Read one key: `GET {{callback_base}}metadata/<key>`\n- Write one JSON value: `PUT {{callback_base}}metadata/<key>` with `{\"value\":<any JSON value>}`\n\n", "");
+const PRE_WORKFLOW_DATA_CURRENT_ASSIGNMENT_DEFAULT = PRE_WORKFLOW_DATA_ASSIGNMENT_DEFAULT.replace(
   "Never merge a pull request automatically.",
   "Never merge a pull request unless the current node instructions explicitly authorize it and their preconditions are satisfied.",
 );
@@ -259,7 +290,7 @@ export const PRE_V3_CALLBACK_REMINDER_DEFAULT = PRE_TYPED_OUTCOME_CALLBACK_REMIN
   .replace(',"outcome":"changes_requested"', ',"decision":"changes_requested"')
   .replace('\n- Legacy V2 review callbacks accepted: {"summary":"Review result.","decision":"approved"} or {"summary":"Blocking findings.","decision":"changes_requested"}', "");
 
-const CALLBACK_REMINDER_DEFAULT = `# Callback required
+export const PRE_DURABLE_BUNDLE_CALLBACK_REMINDER_DEFAULT = `# Callback required
 
 Ticket {{ticket_id}} is still leased for {{phase}} at workflow node **{{node_name}}** (\`{{node_id}}\`). Herdr became idle or done, but the tracker received no terminal callback. The earlier contract may have been lost during context compaction.
 
@@ -279,9 +310,25 @@ Send one JSON request with \`Content-Type: application/json\`:
 
 Use \`summary\` as the durable record. Use \`handoff\` for information the next node must act on; omit it if none. A comment does not release this lease.`;
 
+const CALLBACK_REMINDER_DEFAULT = `# Callback required
+
+Ticket {{ticket_id}} is still leased at workflow node **{{node_name}}** (\`{{node_id}}\`), but no terminal callback was received. The earlier paths may have been lost during context compaction.
+
+Reread the durable assignment at this exact path:
+
+\`{{start_here_path}}\`
+
+Then use the callback helper at this exact path before becoming idle:
+
+\`{{callback_helper_path}}\`
+
+Run \`{{callback_helper_path}} schema complete\` to recover the completion payload contract and allowed outcome example. The full callback documentation is in \`{{assignment_directory}}/callbacks.md\`.`;
+
 export const PRE_PROMPT_ENGINEERING_SPECIFICATION_DEFAULT = `${REPOSITORY_START_GUIDANCE}\n\nCreate or update the task specification in the primary repository. Commit and push it on the task branch you choose, then open or update an evolving draft PR. Complete with a summary and the primary repository PR URL.`;
 export const PRE_PROMPT_ENGINEERING_IMPLEMENTATION_DEFAULT = `${REPOSITORY_START_GUIDANCE}\n\nImplement the ticket autonomously. You own repository inspection, Git branches, changes, verification, commits, pushes, and draft PRs. Complete with a summary and all known repository PR URLs.`;
 export const PRE_PROMPT_ENGINEERING_REVIEW_DEFAULT = "Perform an independent review and add useful PR comments. Report approved or changes_requested. Do not repair the implementation; repairs return to the implementation conversation.";
+
+export const PRE_DURABLE_BUNDLE_GUIDANCE_DEFAULT = "Human guidance for {{ticket_id}}: {{message}}\nReread the authoritative ticket before continuing.";
 
 const DEFAULTS: Record<PromptName, string> = {
   assignment: ASSIGNMENT_DEFAULT,
@@ -323,7 +370,13 @@ After merging, verify the resulting PR state and report the merged repository an
   "release-ticket": `Create the release ticket required by the team's delivery process using the authoritative work ticket, implementation PRs, validation evidence, and incoming handoff. Inspect repository or organizational conventions before deciding the destination, fields, links, rollout notes, and rollback information.
 
 Do not invent missing release-critical details. Ask focused questions when a required value cannot be derived safely. Complete only after the release ticket exists, then include its identifier and URL, the material release details captured, and any remaining human action in the durable summary and handoff.`,
-  guidance: "Human guidance for {{ticket_id}}: {{message}}\nReread the authoritative ticket before continuing.",
+  guidance: `# Assignment update
+
+New durable guidance for {{ticket_id}} was written to:
+
+\`{{update_path}}\`
+
+Read that file, then reread \`{{start_here_path}}\` and the refreshed \`{{assignment_directory}}/ticket.md\` before continuing. The callback helper remains \`{{callback_helper_path}}\`.`,
   "callback-reminder": CALLBACK_REMINDER_DEFAULT,
 };
 
@@ -343,28 +396,35 @@ const TAGS: Record<string, TagDefinition> = {
   incoming_summary: { name: "incoming_summary", description: "Summary recorded by the preceding node run.", example: "Review found a rollback gap." },
   incoming_handoff: { name: "incoming_handoff", description: "Explicit context the preceding actor handed to this node.", example: "Document rollback and add the missing test." },
   incoming_node: { name: "incoming_node", description: "Workflow node that transitioned into the active node.", example: "independent-review" },
+  incoming_output: { name: "incoming_output", description: "Configured tail of the preceding script or merged branch outputs.", example: "Deployment completed successfully." },
+  incoming_output_log: { name: "incoming_output_log", description: "Absolute tracker URL for the complete preceding script output artifact, when persisted.", example: "http://tracker:4310/api/tickets/AGENT-0042/runs/dummy-run/output" },
+  assignment_directory: { name: "assignment_directory", description: "Absolute supervisor-local directory containing the active durable node-run bundle.", example: "/srv/agentic-assignments/worker-a/tickets/AGENT-0042/runs/0001-implementation-dummy-run" },
+  start_here_path: { name: "start_here_path", description: "Absolute path to START_HERE.md for the active node run.", example: "/srv/agentic-assignments/worker-a/tickets/AGENT-0042/runs/0001-implementation-dummy-run/START_HERE.md" },
+  callback_helper_path: { name: "callback_helper_path", description: "Absolute path to the generated lease-aware callback helper.", example: "/srv/agentic-assignments/worker-a/tickets/AGENT-0042/runs/0001-implementation-dummy-run/callback" },
+  update_path: { name: "update_path", description: "Absolute path to a newly persisted guidance or question-answer update.", example: "/srv/agentic-assignments/worker-a/tickets/AGENT-0042/runs/0001-implementation-dummy-run/updates/00000042-guidance.md" },
 };
 
-const COMMON_PHASE_TAGS = ["ticket_id", "phase", "ticket_path", "ticket_markdown", "project_root", "callback_base", "node_id", "node_name", "allowed_outcomes", "incoming_outcome", "incoming_summary", "incoming_handoff", "incoming_node"];
+const COMMON_PHASE_TAGS = ["ticket_id", "phase", "ticket_path", "ticket_markdown", "project_root", "callback_base", "node_id", "node_name", "allowed_outcomes", "incoming_outcome", "incoming_summary", "incoming_handoff", "incoming_node", "incoming_output", "incoming_output_log"];
 const DEFINITIONS: Record<PromptName, PromptDefinition> = {
   assignment: {
-    name: "assignment", title: "Assignment envelope", purpose: "The complete message that starts or resumes one phase of ticket work.",
-    trigger: "After a phase is claimed or recovered and the supervisor has attached the ticket's Herdr conversation. Wraps the matching phase prompt.",
+    name: "assignment", title: "Assignment bootstrap", purpose: "The small message that points an agent to its durable node-run bundle.",
+    trigger: "After a node is claimed or recovered and the supervisor has written the complete assignment bundle.",
     stages: ["Specification", "Implementation", "Review"],
-    allowed_tags: [...COMMON_PHASE_TAGS, "phase_instructions"], required_tags: ["ticket_id", "phase", "ticket_path", "ticket_markdown", "phase_instructions", "callback_base"],
+    allowed_tags: [...COMMON_PHASE_TAGS, "phase_instructions", "assignment_directory", "start_here_path", "callback_helper_path"],
+    required_tags: ["ticket_id", "start_here_path", "callback_helper_path"],
   },
   specification: {
-    name: "specification", title: "Specification instructions", purpose: "Phase-specific instructions injected into the assignment envelope.",
+    name: "specification", title: "Specification instructions", purpose: "Phase-specific instructions written into the durable node.md assignment file.",
     trigger: "Initial specification and every specification-feedback iteration.", stages: ["Specification", "Specification feedback"],
     allowed_tags: COMMON_PHASE_TAGS, required_tags: [],
   },
   implementation: {
-    name: "implementation", title: "Implementation instructions", purpose: "Phase-specific instructions injected into the assignment envelope.",
+    name: "implementation", title: "Implementation instructions", purpose: "Phase-specific instructions written into the durable node.md assignment file.",
     trigger: "Initial implementation, review repairs, reopened tickets, and GitHub PR follow-up repairs.", stages: ["Implementation", "Review repair", "Reopen", "GitHub follow-up"],
     allowed_tags: COMMON_PHASE_TAGS, required_tags: [],
   },
   review: {
-    name: "review", title: "Review instructions", purpose: "Independent-review instructions injected into the assignment envelope.",
+    name: "review", title: "Review instructions", purpose: "Independent-review instructions written into the durable node.md assignment file.",
     trigger: "Initial Codex review and every re-review after implementation repairs.", stages: ["Review", "Re-review"],
     allowed_tags: COMMON_PHASE_TAGS, required_tags: [],
   },
@@ -396,12 +456,14 @@ const DEFINITIONS: Record<PromptName, PromptDefinition> = {
   guidance: {
     name: "guidance", title: "Live guidance", purpose: "A follow-up message injected into an already-running ticket conversation.",
     trigger: "Operator guidance, answered agent questions, and live ticket edits that request a reread.", stages: ["Running", "Question answered", "Live edit"],
-    allowed_tags: ["ticket_id", "message"], required_tags: ["message"],
+    allowed_tags: ["ticket_id", "message", "assignment_directory", "start_here_path", "callback_helper_path", "update_path"],
+    required_tags: ["message", "update_path", "start_here_path", "callback_helper_path"],
   },
   "callback-reminder": {
     name: "callback-reminder", title: "Callback reminder", purpose: "A one-time reminder that semantic completion requires a callback.",
     trigger: "Herdr reports idle or done before complete, ask, or fail; suppressed while a question awaits an answer.", stages: ["Idle without callback", "Done without callback"],
-    allowed_tags: ["ticket_id", "phase", "callback_base", "node_id", "node_name", "allowed_outcomes"], required_tags: [],
+    allowed_tags: ["ticket_id", "phase", "callback_base", "node_id", "node_name", "allowed_outcomes", "assignment_directory", "start_here_path", "callback_helper_path"],
+    required_tags: ["start_here_path", "callback_helper_path"],
   },
 };
 
@@ -413,7 +475,7 @@ function placeholders(content: string): string[] { return [...content.matchAll(/
 function genericDefinition(name: string): PromptDefinition {
   const title = name.replaceAll("-", " ").replace(/\b\w/g, (letter) => letter.toUpperCase());
   return {
-    name, title, purpose: "Reusable workflow-node instructions injected into the assignment envelope.",
+    name, title, purpose: "Reusable workflow-node instructions written into the durable node.md assignment file.",
     trigger: "Any agent node in a published workflow that references this prompt.", stages: ["Workflow agent node"],
     allowed_tags: COMMON_PHASE_TAGS, required_tags: [],
   };
@@ -467,11 +529,12 @@ export class PromptLibrary {
       }
       await mkdir(join(this.directory, ".versions"), { recursive: true });
       const olderDefaults: Partial<Record<PromptName, string[]>> = {
-        assignment: [LEGACY_ASSIGNMENT_DEFAULT, BATCH_QUESTION_ASSIGNMENT_DEFAULT, PRE_PROJECT_ROOT_ASSIGNMENT_DEFAULT, PRE_V3_ASSIGNMENT_DEFAULT, PRE_TYPED_OUTCOME_ASSIGNMENT_DEFAULT, PRE_PROMPT_ENGINEERING_ASSIGNMENT_DEFAULT, PRE_MERGE_PROMPT_ASSIGNMENT_DEFAULT],
+        assignment: [LEGACY_ASSIGNMENT_DEFAULT, BATCH_QUESTION_ASSIGNMENT_DEFAULT, PRE_PROJECT_ROOT_ASSIGNMENT_DEFAULT, PRE_V3_ASSIGNMENT_DEFAULT, PRE_TYPED_OUTCOME_ASSIGNMENT_DEFAULT, PRE_PROMPT_ENGINEERING_ASSIGNMENT_DEFAULT, PRE_WORKFLOW_DATA_ASSIGNMENT_DEFAULT, PRE_WORKFLOW_DATA_CURRENT_ASSIGNMENT_DEFAULT, PRE_MERGE_PROMPT_ASSIGNMENT_DEFAULT, PRE_DURABLE_BUNDLE_ASSIGNMENT_DEFAULT],
         specification: [PRE_BRANCH_SPECIFICATION_DEFAULT, PRE_PROMPT_ENGINEERING_SPECIFICATION_DEFAULT],
         implementation: [PRE_BRANCH_IMPLEMENTATION_DEFAULT, PRE_PROMPT_ENGINEERING_IMPLEMENTATION_DEFAULT],
         review: [PRE_PROMPT_ENGINEERING_REVIEW_DEFAULT],
-        "callback-reminder": [PRE_CALLBACK_SCHEMA_REMINDER_DEFAULT, PRE_V3_CALLBACK_REMINDER_DEFAULT, PRE_TYPED_OUTCOME_CALLBACK_REMINDER_DEFAULT, PRE_PROMPT_ENGINEERING_CALLBACK_REMINDER_DEFAULT],
+        guidance: [PRE_DURABLE_BUNDLE_GUIDANCE_DEFAULT],
+        "callback-reminder": [PRE_CALLBACK_SCHEMA_REMINDER_DEFAULT, PRE_V3_CALLBACK_REMINDER_DEFAULT, PRE_TYPED_OUTCOME_CALLBACK_REMINDER_DEFAULT, PRE_PROMPT_ENGINEERING_CALLBACK_REMINDER_DEFAULT, PRE_DURABLE_BUNDLE_CALLBACK_REMINDER_DEFAULT],
       };
       for (const [name, older] of Object.entries(olderDefaults) as [PromptName, string[]][]) {
         const path = join(this.directory, `${name}.md`);
@@ -588,11 +651,12 @@ export class PromptLibrary {
       if (definition.name === "specification" || definition.name === "implementation" || definition.name === "review") values.phase = definition.name;
       const phaseInstructions = renderPrompt(definition.name, content, values);
       const assignment = await this.get("assignment");
-      return renderPrompt("assignment", assignment.content, { ...values, phase_instructions: phaseInstructions });
+      return `${renderPrompt("assignment", assignment.content, { ...values, phase_instructions: phaseInstructions })}\n\n---\n\n# Durable node.md preview\n\n${phaseInstructions}`;
     }
     if (definition.name === "assignment") {
       const phasePrompt = await this.get(phase);
-      return renderPrompt("assignment", content, { ...values, phase_instructions: renderPrompt(phase, phasePrompt.content, values) });
+      const phaseInstructions = renderPrompt(phase, phasePrompt.content, values);
+      return `${renderPrompt("assignment", content, { ...values, phase_instructions: phaseInstructions })}\n\n---\n\n# Durable node.md preview\n\n${phaseInstructions}`;
     }
     return renderPrompt(definition.name, content, values);
   }

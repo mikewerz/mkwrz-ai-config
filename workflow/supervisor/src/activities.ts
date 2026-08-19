@@ -19,7 +19,11 @@ export interface ActivityResult {
   success: boolean;
   summary: string;
   output: string;
+  stdout?: string;
+  stderr?: string;
   exit_code: number | null;
+  script_path: string | null;
+  working_directory: string | null;
 }
 
 interface RepositoryActivityContext {
@@ -38,12 +42,37 @@ interface ActivityContext {
   project_root: string;
   selected_repository: string;
   primary_repository: string;
+  activity: { script_path: string | null; working_directory: string };
   repositories: RepositoryActivityContext[];
   workflow: {
     id: string | null; revision: string | null; node_id: string; node_name: string;
     node_run_id: string | null; attempt: number | null;
-    incoming: { source_node: string; outcome: string; summary: string | null; handoff: string | null; actor: string | null } | null;
+    incoming: { source_node: string; outcome: string; summary: string | null; handoff: string | null; output: string | null; output_log_path: string | null; actor: string | null } | null;
   };
+}
+
+type PathReference = NonNullable<NonNullable<ClaimedTicket["workflow_node"]>["script_file"]>;
+
+function selectedPath(reference: PathReference, inputs: Record<string, boolean | string>, label: string): string {
+  if (Boolean(reference.path) === Boolean(reference.path_input)) throw new Error(`${label} must define exactly one path or path_input`);
+  const value = reference.path ?? (reference.path_input ? inputs[reference.path_input] : undefined);
+  if (typeof value !== "string" || !value.trim()) throw new Error(`${label} did not resolve to a non-empty ticket path`);
+  return value.trim();
+}
+
+async function resolvedContainedPath(
+  reference: PathReference,
+  inputs: Record<string, boolean | string>,
+  bases: Record<PathReference["relative_to"], string>,
+  label: string,
+): Promise<string> {
+  const base = bases[reference.relative_to];
+  if (!base) throw new Error(`${label} uses unsupported base ${String(reference.relative_to)}`);
+  const requested = resolve(base, selectedPath(reference, inputs, label));
+  if (!inside(base, requested)) throw new Error(`${label} escapes ${reference.relative_to}`);
+  const resolved = await realpath(requested);
+  if (!inside(base, resolved)) throw new Error(`${label} resolves outside ${reference.relative_to}`);
+  return resolved;
 }
 
 function inside(parent: string, candidate: string): boolean {
@@ -85,7 +114,7 @@ async function repositoryContext(projectRoot: string, ticket: ClaimedTicket, rep
 
 export async function runRepositoryActivity(projectRoot: string, ticket: ClaimedTicket, signal?: AbortSignal): Promise<ActivityResult> {
   const node = ticket.workflow_node;
-  if (!node || node.type !== "script" || !node.repository || Boolean(node.action) === Boolean(node.inline)) {
+  if (!node || node.type !== "script" || !node.repository || Boolean(node.script_file ?? node.action) === Boolean(node.inline)) {
     throw new Error("Claim does not contain a deterministic activity node");
   }
   const repositoryId = node.repository === "primary"
@@ -102,12 +131,27 @@ export async function runRepositoryActivity(projectRoot: string, ticket: Claimed
   const repositories = await Promise.all(ticket.frontmatter.repositories.map((item) => repositoryContext(realProjectRoot, ticket, item)));
   const selectedRepository = repositories.find((item) => item.id === repositoryId)!;
   const primaryRepository = repositories.find((item) => item.id === primaryRepositoryId)!;
+  const inputs = ticket.frontmatter.workflow?.inputs ?? {};
+  const bases = {
+    selected_repository: realRepository,
+    primary_repository: primaryRepository.path,
+    project_root: realProjectRoot,
+  };
+  const workingDirectoryReference = node.working_directory ?? { relative_to: "selected_repository" as const, path: "." };
+  const workingDirectory = await resolvedContainedPath(workingDirectoryReference, inputs, bases, `Workflow node ${node.id} working directory`);
+  const scriptFileReference = node.script_file ?? (node.action
+    ? { relative_to: "selected_repository" as const, path: `.agents/actions/${node.action}.sh` }
+    : null);
+  const scriptPath = scriptFileReference
+    ? await resolvedContainedPath(scriptFileReference, inputs, bases, `Workflow node ${node.id} script path`)
+    : null;
   const incoming = ticket.frontmatter.workflow?.incoming;
   const context: ActivityContext = {
     ticket: { id: ticket.frontmatter.id, title: ticket.frontmatter.title, path: ticket.path, phase: ticket.frontmatter.phase },
     project_root: realProjectRoot,
     selected_repository: repositoryId,
     primary_repository: primaryRepositoryId,
+    activity: { script_path: scriptPath, working_directory: workingDirectory },
     repositories,
     workflow: {
       id: ticket.frontmatter.workflow?.id ?? null,
@@ -119,6 +163,7 @@ export async function runRepositoryActivity(projectRoot: string, ticket: Claimed
       incoming: incoming ? {
         source_node: incoming.source_node, outcome: incoming.outcome, summary: incoming.summary,
         handoff: incoming.handoff, actor: incoming.actor ?? null,
+        output: incoming.output ?? null, output_log_path: incoming.output_log_path ?? null,
       } : null,
     },
   };
@@ -133,6 +178,8 @@ export async function runRepositoryActivity(projectRoot: string, ticket: Claimed
     AGENTIC_PRIMARY_REPOSITORY_ID: primaryRepositoryId,
     AGENTIC_PRIMARY_REPOSITORY_PATH: primaryRepository.path,
     AGENTIC_PROJECT_ROOT: realProjectRoot,
+    AGENTIC_SCRIPT_PATH: scriptPath ?? "",
+    AGENTIC_WORKING_DIRECTORY: workingDirectory,
     AGENTIC_CURRENT_BRANCH: selectedRepository.current_branch ?? "",
     AGENTIC_DEFAULT_BRANCH: selectedRepository.default_branch ?? "",
     AGENTIC_HEAD_SHA: selectedRepository.head_sha ?? "",
@@ -149,6 +196,8 @@ export async function runRepositoryActivity(projectRoot: string, ticket: Claimed
     AGENTIC_INCOMING_OUTCOME: incoming?.outcome ?? "",
     AGENTIC_INCOMING_SUMMARY: incoming?.summary ?? "",
     AGENTIC_INCOMING_HANDOFF: incoming?.handoff ?? "",
+    AGENTIC_INCOMING_OUTPUT: incoming?.output ?? "",
+    AGENTIC_INCOMING_OUTPUT_LOG: incoming?.output_log_path ?? "",
     AGENTIC_TICKET_PATH: ticket.path,
     AGENTIC_WORKFLOW_NODE_TYPE: node.type,
   };
@@ -161,15 +210,11 @@ export async function runRepositoryActivity(projectRoot: string, ticket: Claimed
     else if (node.inline.language === "javascript") [executable, arguments_] = [process.execPath, ["--input-type=module", "--eval", node.inline.code]];
     else throw new Error(`Workflow node ${node.id} uses unsupported inline language ${String((node.inline as { language?: unknown }).language)}`);
   } else {
-    const actionRoot = resolve(repository, ".agents", "actions");
-    const requested = resolve(actionRoot, `${node.action}.sh`);
-    if (!inside(actionRoot, requested)) throw new Error(`Action ${node.action} escapes .agents/actions`);
-    const [realActionRoot, realAction] = await Promise.all([realpath(actionRoot), realpath(requested)]);
-    if (!inside(realRepository, realActionRoot) || !inside(realActionRoot, realAction)) throw new Error(`Action ${node.action} resolves outside ${repositoryId}/.agents/actions`);
-    const details = await stat(realAction);
-    if (!details.isFile()) throw new Error(`Action ${node.action} is not a regular file`);
-    await access(realAction, constants.X_OK);
-    [executable, arguments_] = [realAction, [
+    if (!scriptPath) throw new Error(`Workflow node ${node.id} has no resolved script path`);
+    const details = await stat(scriptPath);
+    if (!details.isFile()) throw new Error(`Script ${scriptPath} is not a regular file`);
+    await access(scriptPath, constants.X_OK);
+    [executable, arguments_] = [scriptPath, [
       "--context-json", contextJson,
       "--ticket-id", ticket.frontmatter.id,
       "--project-root", realProjectRoot,
@@ -180,20 +225,30 @@ export async function runRepositoryActivity(projectRoot: string, ticket: Claimed
       "--current-branch", selectedRepository.current_branch ?? "",
       "--default-branch", selectedRepository.default_branch ?? "",
       "--head-sha", selectedRepository.head_sha ?? "",
+      "--script-path", scriptPath,
+      "--working-directory", workingDirectory,
     ]];
   }
   try {
-    const result = await execute(executable, arguments_, { cwd: realRepository, env: environment, timeout: 30 * 60_000, maxBuffer: 1_000_000, signal });
-    const output = `${result.stdout ?? ""}${result.stderr ? `\n${result.stderr}` : ""}`.trim().slice(-1_000_000);
-    return { success: true, summary: `${node.name} succeeded.`, output, exit_code: 0 };
+    const result = await execute(executable, arguments_, { cwd: workingDirectory, env: environment, timeout: 30 * 60_000, maxBuffer: 1_000_000, signal });
+    const stdout = String(result.stdout ?? "").slice(-1_000_000);
+    const stderr = String(result.stderr ?? "").slice(-1_000_000);
+    const output = `${stdout}${stderr ? `\n${stderr}` : ""}`.trim().slice(-1_000_000);
+    return { success: true, summary: `${node.name} succeeded.`, output, stdout, stderr, exit_code: 0, script_path: scriptPath, working_directory: workingDirectory };
   } catch (error) {
     const failure = error as Error & { code?: number | string; stdout?: string; stderr?: string };
-    const output = `${failure.stdout ?? ""}${failure.stderr ? `\n${failure.stderr}` : ""}`.trim().slice(-1_000_000);
+    const stdout = String(failure.stdout ?? "").slice(-1_000_000);
+    const stderr = String(failure.stderr ?? "").slice(-1_000_000);
+    const output = `${stdout}${stderr ? `\n${stderr}` : ""}`.trim().slice(-1_000_000);
     return {
       success: false,
       summary: `${node.name} failed${typeof failure.code === "number" ? ` with exit code ${failure.code}` : ""}: ${failure.message}`,
       output,
+      stdout,
+      stderr,
       exit_code: typeof failure.code === "number" ? failure.code : null,
+      script_path: scriptPath,
+      working_directory: workingDirectory,
     };
   }
 }

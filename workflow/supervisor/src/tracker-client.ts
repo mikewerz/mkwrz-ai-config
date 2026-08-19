@@ -1,4 +1,4 @@
-import type { ActivityCapability, AgentObservation, ClaimedTicket, Guidance, InterruptRequest, Provider, SupervisorPresence, TrackerConfig, TrackerPrompt } from "./types.js";
+import type { ActivityCapability, AgentObservation, ClaimedTicket, Guidance, HarnessTelemetrySnapshot, InterruptRequest, Provider, SupervisorPresence, TrackerConfig, TrackerPrompt } from "./types.js";
 
 export class TrackerError extends Error {
   constructor(public readonly status: number, message: string) { super(message); }
@@ -38,7 +38,7 @@ export class TrackerClient {
     return response.json() as Promise<ClaimedTicket>;
   }
 
-  activityResult(lease: string, result: { success: boolean; summary: string; output: string; exit_code: number | null }): Promise<unknown> {
+  activityResult(lease: string, result: { success: boolean; summary: string; output: string; stdout?: string; stderr?: string; exit_code: number | null; script_path: string | null; working_directory: string | null }): Promise<unknown> {
     return this.request<unknown>(`/api/work/${lease}/activity-result`, { method: "POST", body: JSON.stringify(result) });
   }
 
@@ -85,7 +85,7 @@ export class TrackerClient {
     return result.tickets;
   }
 
-  heartbeat(lease: string, observation: AgentObservation & { guidanceCursor: number }) {
+  heartbeat(lease: string, observation: AgentObservation & { guidanceCursor: number; telemetry?: HarnessTelemetrySnapshot | null; telemetryBaseline?: HarnessTelemetrySnapshot | null }) {
     return this.request<{ active: boolean }>(`/api/work/${lease}/heartbeat`, {
       method: "POST", body: JSON.stringify({
         observed_state: observation.state, pane_id: observation.paneId,
@@ -98,13 +98,25 @@ export class TrackerClient {
           revision: observation.revision, session_source: observation.sessionSource,
           session_kind: observation.sessionKind, tokens: observation.tokens,
         },
+        ...(observation.telemetry ? { telemetry: observation.telemetry } : {}),
+        ...(observation.telemetryBaseline ? { telemetry_baseline: observation.telemetryBaseline } : {}),
       }),
+    });
+  }
+
+  telemetry(lease: string, snapshot: HarnessTelemetrySnapshot, baseline?: HarnessTelemetrySnapshot | null): Promise<unknown> {
+    return this.request<unknown>(`/api/work/${lease}/telemetry`, {
+      method: "POST", body: JSON.stringify({ telemetry: snapshot, ...(baseline ? { telemetry_baseline: baseline } : {}) }),
     });
   }
 
   async guidance(lease: string, after: number): Promise<Guidance[]> {
     const result = await this.request<{ guidance: Guidance[] }>(`/api/work/${lease}/guidance?after=${after}`);
     return result.guidance;
+  }
+
+  assignment(lease: string): Promise<ClaimedTicket> {
+    return this.request<ClaimedTicket>(`/api/work/${lease}/assignment`);
   }
 
   async control(lease: string): Promise<{ interrupt: InterruptRequest | null; waitingForAnswer: boolean }> {

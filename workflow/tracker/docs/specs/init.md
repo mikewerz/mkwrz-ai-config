@@ -282,7 +282,7 @@ The operator primarily authors:
 - `work_provider`, `review_provider`, `priority`, and `labels`; and
 - `repositories`.
 
-`work_provider` and `review_provider` are exactly `claude` or `codex`. Claude work requires Codex review, and Codex work requires Claude review. Missing routing fields on a legacy ticket default to its existing work assignment when one exists, otherwise Claude work and the corresponding reviewer. `priority` is an integer; higher values claim first. `labels` are scheduling-neutral free-form strings in V1.
+`work_provider` and `review_provider` are exactly `claude` or `codex`. Claude work requires Codex review, and Codex work requires Claude review. Missing routing fields on a legacy ticket default to its existing work assignment when one exists, otherwise Claude work and the corresponding reviewer. `priority` is an integer; higher values claim first. An operator may change it in any valid ticket state without interrupting work or guiding the agent because it is scheduling metadata. `labels` are scheduling-neutral free-form strings in V1.
 
 Every ticket must reference at least one repository and exactly one entry must have `primary: true`. Repository IDs are human-meaningful identifiers supplied to the agent. The tracker does not resolve, clone, validate, or prepare those repositories.
 
@@ -476,6 +476,7 @@ Valid normal combinations are:
 - A newly discovered ticket with `spec_required: true` starts at `specification/pending`.
 - A newly discovered ticket with `spec_required: false` starts at `implementation/pending`.
 - The operator explicitly marks a valid pending ticket ready.
+- An unclaimed ready ticket may be returned to `pending` as an editable draft without changing its current workflow node, visit count, attempts, conversations, supervisor affinity, or prior history. Marking it ready again resumes eligibility at that same node.
 
 ### Specification
 
@@ -734,13 +735,15 @@ All responses identify the ticket by stable `id` and include its current `revisi
 | `GET` | `/api/tickets/{id}` | Return parsed frontmatter, Markdown, validation, and current runtime observation. |
 | `PUT` | `/api/tickets/{id}` | Save UI edits using `keep_phase` or an explicit `rewind_phase`. |
 | `POST` | `/api/tickets/{id}/ready` | Move a pending valid ticket to ready. |
+| `POST` | `/api/tickets/{id}/draft` | Return an unclaimed ready ticket to pending draft state at the same workflow node. |
+| `POST` | `/api/tickets/{id}/priority` | Change integer scheduling priority at an expected ticket revision in any valid state. |
 | `POST` | `/api/tickets/{id}/approve-specification` | Approve a waiting specification. |
 | `POST` | `/api/tickets/{id}/request-specification-changes` | Append feedback and resume specification. |
 | `POST` | `/api/tickets/{id}/guidance` | Append human guidance for the active or next agent. |
 | `POST` | `/api/tickets/{id}/comment` | Append a human comment without changing workflow state. |
 | `POST` | `/api/tickets/{id}/questions/{questionId}/answer` | Durably answer an agent question and guide its retained conversation. |
 | `POST` | `/api/tickets/{id}/jira/export` | Create and associate a Jira Cloud issue from a local ticket. |
-| `POST` | `/api/tickets/{id}/jira/resync` | Refresh a pending Jira-backed ticket. |
+| `POST` | `/api/tickets/{id}/jira/resync` | Refresh an initial pending Jira-backed ticket before workflow progress. |
 | `POST` | `/api/tickets/{id}/check-pull-requests` | Immediately observe relevant GitHub PRs for a waiting specification or completed ticket and resume the applicable phase when actionable feedback exists. |
 | `POST` | `/api/tickets/{id}/archive` | Archive a completed ticket. |
 | `POST` | `/api/tickets/{id}/unarchive` | Return an archived ticket to the completed queue. |
@@ -758,6 +761,7 @@ All responses identify the ticket by stable `id` and include its current `revisi
 | `POST` | `/api/work/claim` | Atomically claim matching work for one provider slot. |
 | `GET` | `/api/work/active` | Recover active leases owned by a restarting supervisor slot. |
 | `POST` | `/api/work/{lease}/heartbeat` | Extend the lease and report Herdr/session observations. |
+| `POST` | `/api/work/{lease}/telemetry` | Best-effort final harness telemetry for the lease-matched durable node run; never advances workflow. |
 | `GET` | `/api/work/{lease}/guidance` | Long-poll guidance after a supplied sequence cursor. |
 | `GET` | `/api/work/{lease}/control` | Return a pending supervisor control request, if any. |
 | `POST` | `/api/work/{lease}/interrupt-ack` | Confirm Herdr interruption and atomically activate the requested phase. |
@@ -768,7 +772,7 @@ All responses identify the ticket by stable `id` and include its current `revisi
 
 `claim` accepts `supervisor_id`, process `instance_id`, `provider`, `available_providers`, and optional `wait_seconds`. The presence heartbeat supplies hostname, IP addresses, project root, Herdr session, available providers, instance start time, and a process instance ID. Presence is an in-memory operational projection: supervisors repopulate it after tracker restart, while ticket affinity remains durable in Markdown. A second live process may not use the same supervisor ID. Graceful shutdown unregisters its exact process instance; an unclean exit remains reserved until the presence TTL expires.
 
-Work `heartbeat` accepts observed Herdr state, pane/session references, compact Herdr metadata, and the last delivered guidance sequence. The tracker timestamps observations and state transitions itself. Guidance is therefore at least once: the supervisor deduplicates by guidance ID and advances its cursor only after it has submitted the prompt to Herdr.
+Work `heartbeat` accepts observed Herdr state, pane/session references, compact Herdr metadata, optional versioned harness telemetry plus its node baseline, and the last delivered guidance sequence. The tracker derives node-scoped token and cost deltas and timestamps observations and state transitions itself. Each durable node run also accrues active, human-wait, and quota-paused time. An exhausted rate-limit window with a future reset keeps the lease alive, counts the interval as quota-paused, and automatically resumes active accounting at the reset boundary; this covers Claude and Codex five-hour limits without treating the pause as productive runtime. Ticket totals are derived across node visits so loops are included without duplicating mutable rollup state. Guidance is therefore at least once: the supervisor deduplicates by guidance ID and advances its cursor only after it has submitted the prompt to Herdr.
 
 ### UI invalidation stream
 
@@ -779,7 +783,7 @@ Work `heartbeat` accepts observed Herdr state, pane/session references, compact 
 The Vite/React application is built and served by the Express service. V1 includes:
 
 - a browser-persisted Light, Dark, and Retro Hacker theme selector, with no behavioral differences between themes;
-- a queue grouped by phase/status with explicit work/review providers, priority, and validation state;
+- a queue ordered strictly by descending priority by default, with an optional workflow grouping view, explicit work/review providers, and validation state;
 - structured creation and pending-ticket editing, with raw Markdown shown only for invalid-ticket recovery;
 - a rendered read-only work description after the ticket becomes live;
 - a workflow visualization showing completed, current, upcoming, and skipped phases;
@@ -790,7 +794,7 @@ The Vite/React application is built and served by the Express service. V1 includ
 - optional Jira Cloud settings and GitHub observation controls, with integration health that never exposes credentials;
 - ready-ticket claim blockers naming any running same-host ticket and overlapping repositories, while preserving eligibility on other hosts;
 - ticket detail with repositories, multiple PR links per repository, current lease, assigned sessions, Jira association, pending questions, and interaction timeline;
-- ready, specification approval/change request, retry, rewind, reopen, fail, and cancel actions;
+- live priority editing plus ready, return-to-draft, specification approval/change request, retry, rewind, reopen, fail, and cancel actions;
 - comments, explicit question answers, and live guidance;
 - completed-ticket PR check and archive controls, plus an archived-ticket filter;
 - observed Herdr status, state age, heartbeat age, lease countdown, workspace/tab/pane identity, cwd, terminal title, display tokens, and an operator-facing attach hint; and
@@ -864,7 +868,7 @@ V1 explicitly excludes:
 - A host-local conflict leaves the waiting ticket `ready`, projects an actionable blocker, and disappears when the conflicting ticket completes, is cancelled, or is explicitly released.
 - Approval waits, blocked work, lease recovery, review, and repair retain the same supervisor and project root.
 - An explicit inactive release clears machine-local conversations before another supervisor can claim the ticket.
-- Priority and FIFO ordering are deterministic.
+- Priority ordering is deterministic, operator-adjustable in every valid state, and immediately affects later claims; equal priorities use the existing deterministic tie-breakers.
 - Stale lease callbacks cannot mutate a ticket.
 - Two unexplained lease losses requeue work; the third blocks for operator attention.
 - Herdr `idle` or `done` cannot advance a phase without `complete`.
