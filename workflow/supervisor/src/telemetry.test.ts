@@ -45,6 +45,7 @@ describe("TelemetryCollector", () => {
         reasoning_output_tokens: 0,
         total_tokens: 0,
       },
+      cost: { total_usd: 0, kind: "unavailable" },
       context: { used_tokens: 0, window_tokens: 258_400, used_percent: 0 },
       rate_limits: [{ id: "codex:primary", used_percent: 31, window_minutes: 10_080 }],
     });

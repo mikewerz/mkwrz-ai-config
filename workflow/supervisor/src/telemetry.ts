@@ -308,7 +308,10 @@ export function zeroTelemetryBaseline(snapshot: HarnessTelemetrySnapshot): Harne
   return {
     ...snapshot, observed_at: snapshot.observed_at,
     usage: zeroUsage(),
-    cost: snapshot.cost.total_usd === null ? snapshot.cost : { total_usd: 0, kind: snapshot.cost.kind },
+    // A fresh session starts this node at zero even when its model and pricing
+    // are not observable until the first response. The latest snapshot still
+    // has to supply a reported cost or match configured pricing.
+    cost: { total_usd: 0, kind: snapshot.cost.kind },
     context: { ...snapshot.context, used_tokens: 0, used_percent: snapshot.context.window_tokens ? 0 : null },
     rate_limits: structuredClone(snapshot.rate_limits),
   };
