@@ -1,7 +1,6 @@
 export function ticketMarkdown(overrides: Record<string, unknown> = {}): string {
   const base: Record<string, unknown> = {
-    id: "APT-0001", title: "First ticket", spec_required: true, review_required: true,
-    work_provider: "claude", review_provider: "codex", priority: 10, labels: [], repositories: [{ id: "demo", primary: true }],
+    id: "APT-0001", title: "First ticket", priority: 10, labels: [], repositories: [{ id: "demo", primary: true }],
   };
   const data = { ...base, ...overrides };
   const lines = ["---"];

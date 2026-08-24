@@ -2,10 +2,11 @@ import { createHash, randomUUID } from "node:crypto";
 import { mkdir, open, readFile, readdir, rename, rm, stat } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
 import { parse, stringify } from "yaml";
-import { HttpError, PROVIDERS, type ActivityCapability, type JsonValue, type NodeTimingState, type Phase, type Provider, type ResolvedAgentProfile, type TicketFrontmatter, type WorkflowNodeRun, type WorkflowTransitionContext } from "./domain.js";
+import { HttpError, type ActivityCapability, type JsonValue, type NodeTimingState, type Phase, type Provider, type ResolvedAgentProfile, type TicketFrontmatter, type WorkflowNodeRun, type WorkflowTransitionContext } from "./domain.js";
+import { artifactVersion } from "./artifact-versions.js";
 
-export type WorkflowNodeType = "agent" | "script" | "human_gate" | "read" | "write" | "workflow" | "fan_out" | "fan_in" | "terminal";
-export type ProviderSelector = Provider | "work" | "review";
+export type WorkflowNodeType = "agent" | "script" | "checkpoint" | "restore_checkpoint" | "human_gate" | "wait" | "read" | "write" | "workflow" | "fan_out" | "fan_in" | "terminal";
+export type WorkflowConversationPolicy = "resume" | "fresh_each_visit" | "reset_after_visits";
 
 export interface WorkflowInputOption { value: string; label: string }
 export interface WorkflowInput {
@@ -44,6 +45,29 @@ export interface WorkflowScriptOutput {
   persist_stdout: boolean;
   prompt_tail_lines: number;
 }
+export interface WorkflowWaitSchedule {
+  initial_seconds: number;
+  multiplier: number;
+  maximum_seconds: number;
+  jitter_percent: number;
+  deadline_seconds: number;
+}
+export interface WorkflowArtifactDeclaration {
+  name: string;
+  path: string;
+  content_type: string;
+  required: boolean;
+  interpretation?: {
+    kind: "quality_report";
+    schema: "agentic-quality/v1";
+    required_attributes: string[];
+  };
+}
+export interface WorkflowCheckpointSource {
+  mode: "latest" | "id" | "metadata";
+  checkpoint_id?: string;
+  metadata_key?: string;
+}
 export type WorkflowInlineLanguage = "shell" | "python" | "javascript";
 export interface WorkflowInlineActivity {
   language: WorkflowInlineLanguage;
@@ -72,16 +96,20 @@ export interface WorkflowNode {
   phase: Phase;
   stage: string;
   prompt?: string;
-  provider?: ProviderSelector;
   agent_profile?: string;
   conversation_key?: string;
+  conversation_policy?: WorkflowConversationPolicy;
+  maximum_visits_per_session?: number;
   repository?: string;
   script_file?: WorkflowPathReference;
   working_directory?: WorkflowPathReference;
-  /** Legacy shorthand normalized to script_file + working_directory. */
-  action?: string;
   inline?: WorkflowInlineActivity;
   script_output?: WorkflowScriptOutput;
+  artifacts?: WorkflowArtifactDeclaration[];
+  checkpoint_label?: string;
+  checkpoint_source?: WorkflowCheckpointSource;
+  wait_schedule?: WorkflowWaitSchedule;
+  timeout_to?: string;
   metadata_key?: string;
   metadata_value?: JsonValue;
   next?: string;
@@ -119,18 +147,46 @@ export interface WorkflowDocument {
   definition: WorkflowDefinition;
   content: string;
   revision: string;
+  version?: number;
   valid: boolean;
   errors: string[];
   referenced_prompts: string[];
 }
 
+export type WorkflowReleaseStatus = "active" | "trial" | "retired";
+export interface WorkflowRelease {
+  workflow_id: string;
+  revision: string;
+  version: number;
+  label: string;
+  status: WorkflowReleaseStatus;
+  published_at: string;
+  parent_revision: string | null;
+  is_default: boolean;
+  definition: WorkflowDefinition;
+}
+export interface WorkflowReleaseCatalog {
+  version: 1;
+  revision: number;
+  updated_at: string;
+  default_workflow_id: string;
+  workflows: Record<string, {
+    default_revision: string;
+    releases: Record<string, Omit<WorkflowRelease, "workflow_id" | "revision" | "is_default" | "definition">>;
+  }>;
+}
+
 export function workflowRoutes(node: WorkflowNode): WorkflowOutcome[] {
   if (node.type === "agent") return node.outcomes;
   if (node.type === "human_gate") return node.choices;
-  if (node.type === "script") return node.exit_codes;
+  if (node.type === "script" || node.type === "checkpoint" || node.type === "restore_checkpoint") return node.exit_codes;
   if (node.type === "read") return node.metadata_cases ?? [];
   if (node.type === "workflow") return node.status_codes ?? [];
   if (node.type === "fan_out") return node.branches ?? [];
+  if (node.type === "wait") return [
+    ...(node.next ? [{ id: "elapsed", label: "Wait elapsed", description: "The durable wait interval elapsed.", target: node.next, metric_class: "neutral" as const }] : []),
+    ...(node.timeout_to ? [{ id: "timed_out", label: "Wait timed out", description: "The external wait deadline expired.", target: node.timeout_to, metric_class: "failure" as const }] : []),
+  ];
   if (node.type === "write" || node.type === "fan_in") return node.next ? [{ id: "completed", label: "Continue", description: "Continue to the next node.", target: node.next }] : [];
   return [];
 }
@@ -150,7 +206,7 @@ export function workflowRoute(node: WorkflowNode, outcome: string): WorkflowOutc
 }
 
 export function activityRoute(node: WorkflowNode, exitCode: number | null): WorkflowExitRoute | undefined {
-  if (node.type !== "script") return undefined;
+  if (!["script", "checkpoint", "restore_checkpoint"].includes(node.type)) return undefined;
   if (exitCode !== null) {
     const exact = node.exit_codes.find((route) => route.codes?.includes(exitCode));
     if (exact) return exact;
@@ -206,7 +262,7 @@ export const STANDARD_WORKFLOW: WorkflowDefinition = {
   nodes: [
     {
       id: "specification", name: "Specification", type: "agent", phase: "specification", stage: "specification",
-      prompt: "specification", provider: "work", conversation_key: "work", max_visits: 10,
+      prompt: "specification", agent_profile: "claude", conversation_key: "work", max_visits: 10,
       pull_request_requirement: { scope: "primary", phase: "specification" },
       outcomes: [{ id: "completed", label: "Specification completed", description: "The specification is ready for human review.", target: "specification-approval" }], choices: [], exit_codes: [],
     },
@@ -220,13 +276,13 @@ export const STANDARD_WORKFLOW: WorkflowDefinition = {
     },
     {
       id: "implementation", name: "Implementation", type: "agent", phase: "implementation", stage: "implementation",
-      prompt: "implementation", provider: "work", conversation_key: "work", max_visits: 20,
+      prompt: "implementation", agent_profile: "claude", conversation_key: "work", max_visits: 20,
       pull_request_requirement: { scope: "any", phase: "implementation" },
       outcomes: [{ id: "completed", label: "Implementation completed", description: "Implementation and verification are complete.", target: "review" }], choices: [], exit_codes: [],
     },
     {
       id: "review", name: "Independent review", type: "agent", phase: "review", stage: "review",
-      prompt: "review", provider: "review", conversation_key: "review", max_visits: 20,
+      prompt: "review", agent_profile: "codex", conversation_key: "review", max_visits: 20,
       outcomes: [
         { id: "approved", label: "Approve implementation", description: "The implementation passes independent review.", target: "done" },
         { id: "changes_requested", label: "Request changes", description: "Return findings to the implementation agent.", target: "implementation" },
@@ -255,7 +311,7 @@ export const DEV_ONLY_WORKFLOW: WorkflowDefinition = {
   nodes: [
     {
       id: "specification", name: "Specify ticket", type: "agent", phase: "specification", stage: "specification",
-      prompt: "specification", provider: "work", conversation_key: "work", max_visits: 20,
+      prompt: "specification", agent_profile: "claude", conversation_key: "work", max_visits: 20,
       pull_request_requirement: { scope: "primary", phase: "specification" },
       outcomes: [{ id: "completed", label: "Specification ready", description: "The specification PR is ready for human approval.", target: "specification-approval" }], choices: [], exit_codes: [],
     },
@@ -269,13 +325,13 @@ export const DEV_ONLY_WORKFLOW: WorkflowDefinition = {
     },
     {
       id: "implementation", name: "Implement change", type: "agent", phase: "implementation", stage: "development",
-      prompt: "implementation", provider: "work", conversation_key: "work", max_visits: 30,
+      prompt: "implementation", agent_profile: "claude", conversation_key: "work", max_visits: 30,
       pull_request_requirement: { scope: "any", phase: "implementation" },
       outcomes: [{ id: "completed", label: "Implementation ready", description: "Implementation and repository verification are complete.", target: "initial-review" }], choices: [], exit_codes: [],
     },
     {
       id: "initial-review", name: "Independent code review", type: "agent", phase: "review", stage: "review",
-      prompt: "review", provider: "review", conversation_key: "review", max_visits: 30,
+      prompt: "review", agent_profile: "codex", conversation_key: "review", max_visits: 30,
       outcomes: [
         { id: "approved", label: "Approve implementation", description: "No blocking review findings remain.", target: "pr-approval" },
         { id: "changes_requested", label: "Request implementation changes", description: "Return blocking findings to the implementation agent.", target: "implementation" },
@@ -291,7 +347,7 @@ export const DEV_ONLY_WORKFLOW: WorkflowDefinition = {
     },
     {
       id: "merge", name: "Merge approved pull requests", type: "agent", phase: "implementation", stage: "merge",
-      prompt: "merge", provider: "work", conversation_key: "work", max_visits: 10,
+      prompt: "merge", agent_profile: "claude", conversation_key: "work", max_visits: 10,
       outcomes: [{ id: "completed", label: "Pull requests merged", description: "All approved ticket pull requests are merged and verified.", target: "completion-callback" }], choices: [], exit_codes: [],
     },
     {
@@ -330,7 +386,7 @@ export const END_TO_END_WORKFLOW: WorkflowDefinition = {
   nodes: [
     {
       id: "specification", name: "Specify ticket", type: "agent", phase: "specification", stage: "specification",
-      prompt: "specification", provider: "work", conversation_key: "work", max_visits: 20,
+      prompt: "specification", agent_profile: "claude", conversation_key: "work", max_visits: 20,
       pull_request_requirement: { scope: "primary", phase: "specification" },
       outcomes: [{ id: "completed", label: "Specification ready", description: "The specification PR is ready for human approval.", target: "specification-approval" }], choices: [], exit_codes: [],
     },
@@ -344,18 +400,18 @@ export const END_TO_END_WORKFLOW: WorkflowDefinition = {
     },
     {
       id: "postman-baseline", name: "Design and baseline Postman collection", type: "agent", phase: "implementation", stage: "baseline",
-      prompt: "postman-baseline", provider: "work", conversation_key: "work", max_visits: 10,
+      prompt: "postman-baseline", agent_profile: "claude", conversation_key: "work", max_visits: 10,
       outcomes: [{ id: "completed", label: "Baseline captured", description: "The collection is committed and its current non-production baseline is recorded.", target: "implementation" }], choices: [], exit_codes: [],
     },
     {
       id: "implementation", name: "Implement change", type: "agent", phase: "implementation", stage: "development",
-      prompt: "implementation", provider: "work", conversation_key: "work", max_visits: 40,
+      prompt: "implementation", agent_profile: "claude", conversation_key: "work", max_visits: 40,
       pull_request_requirement: { scope: "any", phase: "implementation" },
       outcomes: [{ id: "completed", label: "Implementation ready", description: "Implementation and repository verification are complete.", target: "initial-review" }], choices: [], exit_codes: [],
     },
     {
       id: "initial-review", name: "Independent code review", type: "agent", phase: "review", stage: "review",
-      prompt: "review", provider: "review", conversation_key: "review", max_visits: 40,
+      prompt: "review", agent_profile: "codex", conversation_key: "review", max_visits: 40,
       outcomes: [
         { id: "approved", label: "Approve implementation", description: "No blocking review findings remain.", target: "nonprod-validation" },
         { id: "changes_requested", label: "Request implementation changes", description: "Return blocking findings to implementation.", target: "implementation" },
@@ -363,7 +419,7 @@ export const END_TO_END_WORKFLOW: WorkflowDefinition = {
     },
     {
       id: "nonprod-validation", name: "Deploy and validate non-production", type: "agent", phase: "implementation", stage: "nonprod",
-      prompt: "nonprod-validation", provider: "work", conversation_key: "work", max_visits: 20,
+      prompt: "nonprod-validation", agent_profile: "claude", conversation_key: "work", max_visits: 20,
       outcomes: [
         { id: "validated", label: "Non-production validated", description: "The deployment is healthy and regression validation passes.", target: "nonprod-rollback" },
         { id: "validation_failed", label: "Validation failed", description: "The deployment ran but validation failed; roll back before repair.", target: "nonprod-rollback" },
@@ -373,7 +429,7 @@ export const END_TO_END_WORKFLOW: WorkflowDefinition = {
     },
     {
       id: "nonprod-rollback", name: "Roll back non-production", type: "agent", phase: "implementation", stage: "nonprod",
-      prompt: "nonprod-rollback", provider: "work", conversation_key: "work", max_visits: 20,
+      prompt: "nonprod-rollback", agent_profile: "claude", conversation_key: "work", max_visits: 20,
       outcomes: [{ id: "completed", label: "Rollback verified", description: "Non-production has returned to its intended baseline.", target: "human-validation" }], choices: [], exit_codes: [],
     },
     {
@@ -386,18 +442,12 @@ export const END_TO_END_WORKFLOW: WorkflowDefinition = {
     },
     {
       id: "release-ticket", name: "Create release ticket", type: "agent", phase: "implementation", stage: "release",
-      prompt: "release-ticket", provider: "work", conversation_key: "work", max_visits: 10,
+      prompt: "release-ticket", agent_profile: "claude", conversation_key: "work", max_visits: 10,
       outcomes: [{ id: "completed", label: "Release ticket created", description: "The release record exists with the required delivery context.", target: "done" }], choices: [], exit_codes: [],
     },
     { id: "done", name: "Done", type: "terminal", phase: "done", stage: "done", terminal_status: "completed", github_watch: { pull_request_phase: "all", feedback_target: "implementation" }, outcomes: [], choices: [], exit_codes: [] },
   ],
 };
-
-const PRE_METRICS_DEFAULTS = new Map<string, WorkflowDefinition>([
-  [STANDARD_WORKFLOW.id, structuredClone(STANDARD_WORKFLOW)],
-  [DEV_ONLY_WORKFLOW.id, structuredClone(DEV_ONLY_WORKFLOW)],
-  [END_TO_END_WORKFLOW.id, structuredClone(END_TO_END_WORKFLOW)],
-]);
 
 const FAILURE_METRIC_OUTCOMES = new Set(["changes_requested", "failure", "failed", "validation_failed", "deployment_failed"]);
 for (const definition of [STANDARD_WORKFLOW, DEV_ONLY_WORKFLOW, END_TO_END_WORKFLOW]) {
@@ -407,46 +457,6 @@ for (const definition of [STANDARD_WORKFLOW, DEV_ONLY_WORKFLOW, END_TO_END_WORKF
 }
 
 export const DEFAULT_WORKFLOWS = [STANDARD_WORKFLOW, DEV_ONLY_WORKFLOW, END_TO_END_WORKFLOW] as const;
-
-const PRE_CORRECTNESS_STANDARD_WORKFLOW = structuredClone(STANDARD_WORKFLOW);
-delete PRE_CORRECTNESS_STANDARD_WORKFLOW.nodes.find((node) => node.id === "specification")?.pull_request_requirement;
-delete PRE_CORRECTNESS_STANDARD_WORKFLOW.nodes.find((node) => node.id === "implementation")?.pull_request_requirement;
-delete PRE_CORRECTNESS_STANDARD_WORKFLOW.nodes.find((node) => node.id === "done")?.github_watch;
-
-const PRE_CORRECTNESS_DEV_ONLY_WORKFLOW = structuredClone(DEV_ONLY_WORKFLOW);
-delete PRE_CORRECTNESS_DEV_ONLY_WORKFLOW.nodes.find((node) => node.id === "specification")?.pull_request_requirement;
-delete PRE_CORRECTNESS_DEV_ONLY_WORKFLOW.nodes.find((node) => node.id === "implementation")?.pull_request_requirement;
-delete PRE_CORRECTNESS_DEV_ONLY_WORKFLOW.nodes.find((node) => node.id === "done")?.github_watch;
-
-const PRE_CORRECTNESS_END_TO_END_WORKFLOW = structuredClone(END_TO_END_WORKFLOW);
-delete PRE_CORRECTNESS_END_TO_END_WORKFLOW.nodes.find((node) => node.id === "specification")?.pull_request_requirement;
-delete PRE_CORRECTNESS_END_TO_END_WORKFLOW.nodes.find((node) => node.id === "implementation")?.pull_request_requirement;
-delete PRE_CORRECTNESS_END_TO_END_WORKFLOW.nodes.find((node) => node.id === "done")?.github_watch;
-PRE_CORRECTNESS_END_TO_END_WORKFLOW.nodes.find((node) => node.id === "nonprod-validation")!.outcomes = [
-  { id: "completed", label: "Non-production validated", description: "The deployment is healthy and regression validation passes.", target: "nonprod-rollback" },
-];
-
-const PREVIOUS_DEFAULTS = new Map<string, WorkflowDefinition>([
-  [STANDARD_WORKFLOW.id, PRE_CORRECTNESS_STANDARD_WORKFLOW],
-  [DEV_ONLY_WORKFLOW.id, PRE_CORRECTNESS_DEV_ONLY_WORKFLOW],
-  [END_TO_END_WORKFLOW.id, PRE_CORRECTNESS_END_TO_END_WORKFLOW],
-]);
-
-const PRE_GATE_OBSERVATION_STANDARD_WORKFLOW = structuredClone(PRE_CORRECTNESS_STANDARD_WORKFLOW);
-delete PRE_GATE_OBSERVATION_STANDARD_WORKFLOW.nodes.find((node) => node.id === "specification-approval")?.github_watch;
-
-const LEGACY_STANDARD_WORKFLOW = {
-  version: 1, id: "standard-delivery", name: "Standard delivery",
-  description: "Optional specification, implementation, independent review, and repair loops.",
-  start: "specification", max_transitions: 50,
-  nodes: [
-    { id: "specification", name: "Specification", type: "agent", phase: "specification", prompt: "specification", provider: "work", conversation_key: "work", condition: "spec_required", max_visits: 10, on: { completed: "specification-approval", skipped: "implementation" } },
-    { id: "specification-approval", name: "Approve specification", type: "human_gate", phase: "specification", condition: "spec_required", max_visits: 10, on: { approved: "implementation", changes_requested: "specification", skipped: "implementation" } },
-    { id: "implementation", name: "Implementation", type: "agent", phase: "implementation", prompt: "implementation", provider: "work", conversation_key: "work", max_visits: 20, on: { completed: "review" } },
-    { id: "review", name: "Independent review", type: "agent", phase: "review", prompt: "review", provider: "review", conversation_key: "review", condition: "review_required", max_visits: 20, on: { approved: "done", changes_requested: "implementation", skipped: "done" } },
-    { id: "done", name: "Done", type: "terminal", phase: "done", terminal_status: "completed", on: {} },
-  ],
-};
 
 function record(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
@@ -473,8 +483,6 @@ function normalizeOutcome(item: unknown, fallbackId = ""): WorkflowOutcome {
 
 function normalizeDefinition(value: unknown): WorkflowDefinition {
   if (!record(value)) throw new HttpError(422, "Workflow must be a YAML object");
-  const legacyNodes = Array.isArray(value.nodes) ? value.nodes.filter(record) : [];
-  const phases = [...new Set(legacyNodes.map((node) => typeof node.phase === "string" ? node.phase : "implementation"))] as Phase[];
   const stages: WorkflowStage[] = Array.isArray(value.stages) ? value.stages.map((item) => {
     const stage = record(item) ? item : {};
     return {
@@ -485,7 +493,7 @@ function normalizeDefinition(value: unknown): WorkflowDefinition {
       default_enabled: stage.default_enabled !== false,
       ...(typeof stage.bypass_to === "string" ? { bypass_to: stage.bypass_to } : {}),
     };
-  }) : phases.map((phase) => ({ id: phase, name: labelFor(phase), phase, skippable: false, default_enabled: true }));
+  }) : [];
   const inputs: WorkflowInput[] = Array.isArray(value.inputs) ? value.inputs.map((item) => {
     const input = record(item) ? item : {};
     const type = input.type === "select" || input.type === "text" ? input.type : "boolean";
@@ -502,17 +510,14 @@ function normalizeDefinition(value: unknown): WorkflowDefinition {
   }) : [];
   const nodes = Array.isArray(value.nodes) ? value.nodes.map((item) => {
     const node = record(item) ? item : {};
-    const type = node.type === "verification" ? "script" : typeof node.type === "string" ? node.type as WorkflowNodeType : "agent";
+    const type = typeof node.type === "string" ? node.type as WorkflowNodeType : "agent";
     const phase = typeof node.phase === "string" ? node.phase as Phase : "implementation";
-    const legacyOn = record(node.on) ? Object.fromEntries(Object.entries(node.on).map(([key, target]) => [key, String(target)])) : {};
     const whenValue = record(node.when) ? node.when : null;
-    const legacyCondition = typeof node.condition === "string" ? node.condition : null;
-    const legacyRoutes = Object.entries(legacyOn).filter(([id]) => id !== "skipped").map(([id, target]) => ({ id, label: labelFor(id), description: `${labelFor(id)} outcome.`, target }));
-    const outcomes = Array.isArray(node.outcomes) ? node.outcomes.map((outcome) => normalizeOutcome(outcome)) : type === "agent" ? legacyRoutes : [];
+    const outcomes = Array.isArray(node.outcomes) ? node.outcomes.map((outcome) => normalizeOutcome(outcome)) : [];
     const choices = Array.isArray(node.choices) ? node.choices.map((choice) => {
       const normalized = normalizeOutcome(choice);
       return { ...normalized, ...(record(choice) && choice.comment_required === true ? { comment_required: true } : {}) };
-    }) : type === "human_gate" ? legacyRoutes : [];
+    }) : [];
     const exitCodes = Array.isArray(node.exit_codes) ? node.exit_codes.map((route) => {
       const normalized = normalizeOutcome(route);
       return {
@@ -520,10 +525,7 @@ function normalizeDefinition(value: unknown): WorkflowDefinition {
         ...(record(route) && Array.isArray(route.codes) ? { codes: route.codes.map(Number) } : {}),
         ...(record(route) && route.default === true ? { default: true } : {}),
       };
-    }) : type === "script" ? [
-      { id: "success", label: "Success", description: "The action exited with code 0.", target: legacyOn.success ?? "", codes: [0] },
-      { id: "failure", label: "Failure", description: "The action exited non-zero or could not run.", target: legacyOn.failure ?? "", default: true },
-    ] : [];
+    }) : [];
     const metadataCases = Array.isArray(node.metadata_cases) ? node.metadata_cases.map((route) => {
       const normalized = normalizeOutcome(route);
       return {
@@ -548,16 +550,15 @@ function normalizeDefinition(value: unknown): WorkflowDefinition {
       phase,
       stage: typeof node.stage === "string" ? node.stage : phase,
       ...(typeof node.prompt === "string" ? { prompt: node.prompt } : {}),
-      ...(typeof node.provider === "string" ? { provider: node.provider as ProviderSelector } : {}),
       ...(typeof node.agent_profile === "string" ? { agent_profile: node.agent_profile } : {}),
       ...(typeof node.conversation_key === "string" ? { conversation_key: node.conversation_key } : {}),
+      ...(typeof node.conversation_policy === "string" ? { conversation_policy: node.conversation_policy as WorkflowConversationPolicy } : {}),
+      ...(Number.isInteger(node.maximum_visits_per_session) ? { maximum_visits_per_session: Number(node.maximum_visits_per_session) } : {}),
       ...(typeof node.repository === "string" ? { repository: node.repository } : {}),
       ...(record(node.script_file) ? { script_file: {
         relative_to: (typeof node.script_file.relative_to === "string" ? node.script_file.relative_to : "selected_repository") as WorkflowPathBase,
         ...(typeof node.script_file.path === "string" ? { path: node.script_file.path } : {}),
         ...(typeof node.script_file.path_input === "string" ? { path_input: node.script_file.path_input } : {}),
-      } } : typeof node.action === "string" ? { script_file: {
-        relative_to: "selected_repository" as const, path: `.agents/actions/${node.action}.sh`,
       } } : {}),
       ...(record(node.working_directory) ? { working_directory: {
         relative_to: (typeof node.working_directory.relative_to === "string" ? node.working_directory.relative_to : "selected_repository") as WorkflowPathBase,
@@ -571,6 +572,32 @@ function normalizeDefinition(value: unknown): WorkflowDefinition {
         persist_stdout: node.script_output.persist_stdout === true,
         prompt_tail_lines: Number.isInteger(node.script_output.prompt_tail_lines) ? Number(node.script_output.prompt_tail_lines) : 0,
       } } : {}),
+      ...(Array.isArray(node.artifacts) ? { artifacts: node.artifacts.filter(record).map((artifact) => ({
+        name: typeof artifact.name === "string" ? artifact.name : "",
+        path: typeof artifact.path === "string" ? artifact.path : "",
+        content_type: typeof artifact.content_type === "string" ? artifact.content_type : "application/octet-stream",
+        required: artifact.required === true,
+        ...(record(artifact.interpretation) && artifact.interpretation.kind === "quality_report" ? { interpretation: {
+          kind: "quality_report" as const,
+          schema: "agentic-quality/v1" as const,
+          required_attributes: Array.isArray(artifact.interpretation.required_attributes)
+            ? artifact.interpretation.required_attributes.filter((item): item is string => typeof item === "string") : [],
+        } } : {}),
+      })) } : {}),
+      ...(typeof node.checkpoint_label === "string" ? { checkpoint_label: node.checkpoint_label } : {}),
+      ...(record(node.checkpoint_source) && typeof node.checkpoint_source.mode === "string" ? { checkpoint_source: {
+        mode: node.checkpoint_source.mode as WorkflowCheckpointSource["mode"],
+        ...(typeof node.checkpoint_source.checkpoint_id === "string" ? { checkpoint_id: node.checkpoint_source.checkpoint_id } : {}),
+        ...(typeof node.checkpoint_source.metadata_key === "string" ? { metadata_key: node.checkpoint_source.metadata_key } : {}),
+      } } : {}),
+      ...(record(node.wait_schedule) ? { wait_schedule: {
+        initial_seconds: Number(node.wait_schedule.initial_seconds),
+        multiplier: Number(node.wait_schedule.multiplier),
+        maximum_seconds: Number(node.wait_schedule.maximum_seconds),
+        jitter_percent: Number(node.wait_schedule.jitter_percent),
+        deadline_seconds: Number(node.wait_schedule.deadline_seconds),
+      } } : {}),
+      ...(typeof node.timeout_to === "string" ? { timeout_to: node.timeout_to } : {}),
       ...(typeof node.metadata_key === "string" ? { metadata_key: node.metadata_key } : {}),
       ...("metadata_value" in node ? { metadata_value: node.metadata_value as JsonValue } : {}),
       ...(typeof node.next === "string" ? { next: node.next } : {}),
@@ -589,8 +616,8 @@ function normalizeDefinition(value: unknown): WorkflowDefinition {
         : {}),
       ...(whenValue && typeof whenValue.input === "string" && (typeof whenValue.equals === "string" || typeof whenValue.equals === "boolean")
         ? { when: { input: whenValue.input, equals: whenValue.equals } }
-        : legacyCondition ? { when: { input: legacyCondition, equals: true } } : {}),
-      ...(typeof node.otherwise === "string" ? { otherwise: node.otherwise } : typeof legacyOn.skipped === "string" ? { otherwise: legacyOn.skipped } : {}),
+        : {}),
+      ...(typeof node.otherwise === "string" ? { otherwise: node.otherwise } : {}),
       ...(Number.isInteger(node.max_visits) ? { max_visits: Number(node.max_visits) } : {}),
       ...(typeof node.terminal_status === "string" ? { terminal_status: node.terminal_status as NonNullable<WorkflowNode["terminal_status"]> } : {}),
       ...(Number.isInteger(node.status_code) ? { status_code: Number(node.status_code) } : {}),
@@ -624,7 +651,7 @@ export function validateWorkflow(definition: WorkflowDefinition, promptIds?: Set
   const ids = definition.nodes.map((node) => node.id);
   if (new Set(ids).size !== ids.length) errors.push("node ids must be unique");
   if (!ids.includes(definition.start)) errors.push("start must reference a node");
-  const validTypes: WorkflowNodeType[] = ["agent", "script", "human_gate", "read", "write", "workflow", "fan_out", "fan_in", "terminal"];
+  const validTypes: WorkflowNodeType[] = ["agent", "script", "checkpoint", "restore_checkpoint", "human_gate", "wait", "read", "write", "workflow", "fan_out", "fan_in", "terminal"];
   const validPhases: Phase[] = ["specification", "implementation", "review", "done"];
   const stageIds = definition.stages.map((stage) => stage.id);
   const inputIds = definition.inputs.map((input) => input.id);
@@ -660,7 +687,7 @@ export function validateWorkflow(definition: WorkflowDefinition, promptIds?: Set
     if (node.type !== "terminal" && node.phase === "done") errors.push(`node ${node.id}: only terminal nodes may project to done`);
     if (!stageIds.includes(node.stage)) errors.push(`node ${node.id}: stage ${node.stage} does not exist`);
     if (definition.stages.find((stage) => stage.id === node.stage)?.phase !== node.phase) errors.push(`node ${node.id}: phase projection must match stage ${node.stage}`);
-    if (node.when && !inputIds.includes(node.when.input) && node.when.input !== "spec_required" && node.when.input !== "review_required") errors.push(`node ${node.id}: condition input ${node.when.input} does not exist`);
+    if (node.when && !inputIds.includes(node.when.input)) errors.push(`node ${node.id}: condition input ${node.when.input} does not exist`);
     if (node.when && !node.otherwise) errors.push(`node ${node.id}: conditioned nodes require an otherwise target`);
     if (node.when && node.otherwise === node.id) errors.push(`node ${node.id}: otherwise target must leave the conditioned node`);
     if (node.when) {
@@ -682,14 +709,17 @@ export function validateWorkflow(definition: WorkflowDefinition, promptIds?: Set
     if (node.type === "agent") {
       if (!node.prompt || !SAFE_ID.test(node.prompt)) errors.push(`node ${node.id}: agent prompt is required`);
       if (node.prompt && promptIds && !promptIds.has(node.prompt)) errors.push(`node ${node.id}: prompt ${node.prompt} does not exist or is invalid`);
-      if (!node.agent_profile && (!node.provider || ![...PROVIDERS, "work", "review"].includes(node.provider))) errors.push(`node ${node.id}: agent_profile or a legacy provider selector is required`);
-      if (node.agent_profile && !SAFE_ID.test(node.agent_profile)) errors.push(`node ${node.id}: agent_profile must be a lowercase artifact id`);
-      if (node.agent_profile && agentProfileIds && !agentProfileIds.has(node.agent_profile)) errors.push(`node ${node.id}: agent profile ${node.agent_profile} does not exist`);
+      if (!node.agent_profile || !SAFE_ID.test(node.agent_profile)) errors.push(`node ${node.id}: agent_profile is required and must be a lowercase artifact id`);
+      if (node.agent_profile && agentProfileIds && !agentProfileIds.has(node.agent_profile) && node.agent_profile !== "default") errors.push(`node ${node.id}: agent profile ${node.agent_profile} does not exist`);
       if (!node.conversation_key || !SAFE_ID.test(node.conversation_key)) errors.push(`node ${node.id}: conversation_key is required`);
+      const conversationPolicy = node.conversation_policy ?? "resume";
+      if (!["resume", "fresh_each_visit", "reset_after_visits"].includes(conversationPolicy)) errors.push(`node ${node.id}: conversation_policy is invalid`);
+      if (conversationPolicy === "reset_after_visits" && (!Number.isInteger(node.maximum_visits_per_session) || (node.maximum_visits_per_session ?? 0) < 1 || (node.maximum_visits_per_session ?? 0) > 100)) errors.push(`node ${node.id}: reset_after_visits requires maximum_visits_per_session between 1 and 100`);
+      if (conversationPolicy !== "reset_after_visits" && node.maximum_visits_per_session !== undefined) errors.push(`node ${node.id}: maximum_visits_per_session is only valid with reset_after_visits`);
       if (node.conversation_key) {
-        const selector = node.agent_profile ? `profile:${node.agent_profile}` : node.provider;
+        const selector = node.agent_profile ? `profile:${node.agent_profile}` : undefined;
         const priorProvider = conversationProviders.get(node.conversation_key);
-        if (selector && priorProvider && priorProvider !== selector) errors.push(`node ${node.id}: conversation ${node.conversation_key} is already assigned to provider selector ${priorProvider}`);
+        if (selector && priorProvider && priorProvider !== selector) errors.push(`node ${node.id}: conversation ${node.conversation_key} is already assigned to agent profile ${priorProvider.replace("profile:", "")}`);
         else if (selector) conversationProviders.set(node.conversation_key, selector);
       }
       if (!node.outcomes.length) errors.push(`node ${node.id}: agent needs an outcome`);
@@ -721,6 +751,46 @@ export function validateWorkflow(definition: WorkflowDefinition, promptIds?: Set
       if (explicitCodes.some((code) => !Number.isInteger(code) || code < 0 || code > 255)) errors.push(`node ${node.id}: exit codes must be integers from 0 to 255`);
       if (new Set(explicitCodes).size !== explicitCodes.length) errors.push(`node ${node.id}: exit codes cannot be routed more than once`);
       if (node.script_output && (!Number.isInteger(node.script_output.prompt_tail_lines) || node.script_output.prompt_tail_lines < 0 || node.script_output.prompt_tail_lines > 500)) errors.push(`node ${node.id}: prompt_tail_lines must be between 0 and 500`);
+      if ((node.artifacts?.length ?? 0) > 50) errors.push(`node ${node.id}: scripts may declare at most 50 artifacts`);
+      for (const artifact of node.artifacts ?? []) {
+        if (!SAFE_ID.test(artifact.name)) errors.push(`node ${node.id}: artifact ${artifact.name || "<missing>"} needs a lowercase artifact name`);
+        if (!portableRelativePath(artifact.path, false)) errors.push(`node ${node.id}: artifact ${artifact.name} path must be a contained relative path`);
+        if (!artifact.content_type.includes("/")) errors.push(`node ${node.id}: artifact ${artifact.name} content_type must be a MIME type`);
+        if (artifact.interpretation) {
+          if (artifact.interpretation.schema !== "agentic-quality/v1") errors.push(`node ${node.id}: artifact ${artifact.name} uses an unsupported quality schema`);
+          if (!["application/yaml", "application/x-yaml", "text/yaml"].includes(artifact.content_type)) errors.push(`node ${node.id}: quality artifact ${artifact.name} must use a YAML content type`);
+          if (artifact.interpretation.required_attributes.length > 100) errors.push(`node ${node.id}: quality artifact ${artifact.name} may require at most 100 attributes`);
+          for (const key of artifact.interpretation.required_attributes) if (!/^[a-z][a-z0-9._-]{0,127}$/.test(key)) errors.push(`node ${node.id}: quality artifact ${artifact.name} has invalid required attribute ${key}`);
+          if (new Set(artifact.interpretation.required_attributes).size !== artifact.interpretation.required_attributes.length) errors.push(`node ${node.id}: quality artifact ${artifact.name} required attributes must be unique`);
+        }
+      }
+      if (new Set((node.artifacts ?? []).map((artifact) => artifact.name)).size !== (node.artifacts?.length ?? 0)) errors.push(`node ${node.id}: artifact names must be unique`);
+    }
+    if (node.type === "checkpoint" || node.type === "restore_checkpoint") {
+      if (!node.exit_codes.some((route) => route.codes?.includes(0))) errors.push(`node ${node.id}: checkpoint activities require an exit-code 0 route`);
+      if (node.exit_codes.filter((route) => route.default).length !== 1) errors.push(`node ${node.id}: checkpoint activities require exactly one default route`);
+      if (node.exit_codes.some((route) => route.default && route.codes?.length)) errors.push(`node ${node.id}: default route cannot list exit codes`);
+    }
+    if (node.type === "wait") {
+      const schedule = node.wait_schedule;
+      if (!schedule) errors.push(`node ${node.id}: wait_schedule is required`);
+      if (!node.next || !ids.includes(node.next)) errors.push(`node ${node.id}: wait nodes require a valid next target`);
+      if (!node.timeout_to || !ids.includes(node.timeout_to)) errors.push(`node ${node.id}: wait nodes require a valid timeout target`);
+      if (node.next === node.id || node.timeout_to === node.id) errors.push(`node ${node.id}: wait routes must leave the wait node`);
+      if (schedule) {
+        if (!Number.isFinite(schedule.initial_seconds) || schedule.initial_seconds < 1 || schedule.initial_seconds > 86_400) errors.push(`node ${node.id}: initial_seconds must be between 1 and 86400`);
+        if (!Number.isFinite(schedule.multiplier) || schedule.multiplier < 1 || schedule.multiplier > 10) errors.push(`node ${node.id}: multiplier must be between 1 and 10`);
+        if (!Number.isFinite(schedule.maximum_seconds) || schedule.maximum_seconds < schedule.initial_seconds || schedule.maximum_seconds > 604_800) errors.push(`node ${node.id}: maximum_seconds must be at least initial_seconds and at most 604800`);
+        if (!Number.isFinite(schedule.jitter_percent) || schedule.jitter_percent < 0 || schedule.jitter_percent > 50) errors.push(`node ${node.id}: jitter_percent must be between 0 and 50`);
+        if (!Number.isFinite(schedule.deadline_seconds) || schedule.deadline_seconds < schedule.initial_seconds || schedule.deadline_seconds > 2_592_000) errors.push(`node ${node.id}: deadline_seconds must be at least initial_seconds and at most 2592000`);
+      }
+    }
+    if (node.type === "checkpoint" && node.checkpoint_label !== undefined && !node.checkpoint_label.trim()) errors.push(`node ${node.id}: checkpoint_label must be non-empty when provided`);
+    if (node.type === "restore_checkpoint") {
+      const source = node.checkpoint_source;
+      if (!source || !["latest", "id", "metadata"].includes(source.mode)) errors.push(`node ${node.id}: restore nodes require a checkpoint source`);
+      if (source?.mode === "id" && !source.checkpoint_id?.trim()) errors.push(`node ${node.id}: id checkpoint source requires checkpoint_id`);
+      if (source?.mode === "metadata" && (!source.metadata_key || !/^[A-Za-z][A-Za-z0-9_.-]{0,127}$/.test(source.metadata_key))) errors.push(`node ${node.id}: metadata checkpoint source requires a valid metadata_key`);
     }
     if (node.type === "read") {
       if (!node.metadata_key || !/^[A-Za-z][A-Za-z0-9_.-]{0,127}$/.test(node.metadata_key)) errors.push(`node ${node.id}: metadata_key is required`);
@@ -815,10 +885,14 @@ async function atomicWrite(path: string, content: string): Promise<void> {
 
 export class WorkflowLibrary {
   readonly directory: string;
+  readonly catalogPath: string;
   private queue: Promise<unknown> = Promise.resolve();
   private started: Promise<void> | null = null;
 
-  constructor(root: string) { this.directory = join(resolve(root), "workflows"); }
+  constructor(root: string) {
+    this.directory = join(resolve(root), "workflows");
+    this.catalogPath = join(this.directory, ".releases.yaml");
+  }
 
   private serial<T>(work: () => Promise<T>): Promise<T> {
     const next = this.queue.then(work, work); this.queue = next.then(() => undefined, () => undefined); return next;
@@ -830,28 +904,36 @@ export class WorkflowLibrary {
       await mkdir(join(this.directory, ".versions"), { recursive: true });
       for (const definition of DEFAULT_WORKFLOWS) {
         const path = join(this.directory, `${definition.id}.yaml`);
-        try { await stat(path); }
+        let current: string;
+        try { current = await readFile(path, "utf8"); }
         catch (error) {
           if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-          await atomicWrite(path, normalizedContent(definition));
-        }
-        let current = await readFile(path, "utf8");
-        await this.archive(definition.id, digest(current), current);
-        if (current === normalizedContent(PREVIOUS_DEFAULTS.get(definition.id)!) || current === normalizedContent(PRE_METRICS_DEFAULTS.get(definition.id)!)) {
           current = normalizedContent(definition);
           await atomicWrite(path, current);
-          await this.archive(definition.id, digest(current), current);
         }
+        const currentDocument = this.document(current);
+        if (currentDocument.valid) {
+          const profileUpgrade = structuredClone(currentDocument.definition);
+          for (const node of profileUpgrade.nodes) if (node.type === "agent") {
+            if (node.agent_profile === "default") node.agent_profile = "claude";
+            else if (node.agent_profile === "review") node.agent_profile = "codex";
+          }
+          const shipped = normalizedContent(definition);
+          const shippedDefinition = this.document(shipped).definition;
+          if (JSON.stringify(profileUpgrade) === JSON.stringify(shippedDefinition) && current !== shipped) {
+            await this.archive(definition.id, digest(current), current);
+            current = shipped;
+            await atomicWrite(path, current);
+          }
+        }
+        if (!this.document(current).valid) {
+          await this.archive(definition.id, digest(current), current);
+          current = normalizedContent(definition);
+          await atomicWrite(path, current);
+        }
+        await this.archive(definition.id, digest(current), current);
       }
-      const path = join(this.directory, `${STANDARD_WORKFLOW.id}.yaml`);
-      let current = await readFile(path, "utf8");
-      await this.archive(STANDARD_WORKFLOW.id, digest(current), current);
-      const legacy = stringify(LEGACY_STANDARD_WORKFLOW, { lineWidth: 0 }).trimEnd() + "\n";
-      if (current === legacy || current === normalizedContent(PRE_GATE_OBSERVATION_STANDARD_WORKFLOW)) {
-        current = normalizedContent(STANDARD_WORKFLOW);
-        await atomicWrite(path, current);
-      }
-      await this.archive(STANDARD_WORKFLOW.id, digest(current), current);
+      await this.reconcileCatalog();
     });
     return this.started;
   }
@@ -863,6 +945,99 @@ export class WorkflowLibrary {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
       await atomicWrite(path, content);
     }
+  }
+
+  private emptyCatalog(): WorkflowReleaseCatalog {
+    return { version: 1, revision: 1, updated_at: new Date().toISOString(), default_workflow_id: "standard-delivery", workflows: {} };
+  }
+
+  private async readCatalog(): Promise<WorkflowReleaseCatalog> {
+    try {
+      const raw = parse(await readFile(this.catalogPath, "utf8")) as Partial<WorkflowReleaseCatalog>;
+      if (raw.version !== 1 || !Number.isInteger(raw.revision) || typeof raw.updated_at !== "string"
+        || typeof raw.default_workflow_id !== "string" || !raw.workflows || typeof raw.workflows !== "object") {
+        throw new HttpError(422, "Workflow release catalog is invalid");
+      }
+      return raw as WorkflowReleaseCatalog;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return this.emptyCatalog();
+      if (error instanceof HttpError) throw error;
+      throw new HttpError(422, "Workflow release catalog YAML is invalid", [(error as Error).message]);
+    }
+  }
+
+  private async writeCatalog(catalog: WorkflowReleaseCatalog): Promise<void> {
+    await atomicWrite(this.catalogPath, stringify(catalog, { lineWidth: 0, nullStr: "null" }));
+  }
+
+  private activateDefault(workflow: WorkflowReleaseCatalog["workflows"][string], revision: string): boolean {
+    let changed = workflow.default_revision !== revision;
+    workflow.default_revision = revision;
+    for (const [candidateRevision, release] of Object.entries(workflow.releases)) {
+      const status = candidateRevision === revision ? "active" : release.status === "active" ? "retired" : release.status;
+      if (release.status !== status) {
+        release.status = status;
+        changed = true;
+      }
+    }
+    return changed;
+  }
+
+  private async registerRelease(document: WorkflowDocument, options: { makeDefault: boolean; label?: string; status?: WorkflowReleaseStatus; parentRevision?: string | null }, catalog?: WorkflowReleaseCatalog): Promise<WorkflowReleaseCatalog> {
+    const next = catalog ?? await this.readCatalog();
+    const workflow = next.workflows[document.definition.id] ?? { default_revision: "", releases: {} };
+    const existing = workflow.releases[document.revision];
+    let changed = false;
+    if (!existing) {
+      workflow.releases[document.revision] = {
+        version: document.version ?? await artifactVersion(this.directory, document.definition.id, document.revision),
+        label: options.label?.trim() || `v${document.version ?? 1}`,
+        status: options.status ?? (options.makeDefault ? "active" : "trial"),
+        published_at: new Date().toISOString(),
+        parent_revision: options.parentRevision ?? null,
+      };
+      changed = true;
+    }
+    if (options.makeDefault) {
+      if (this.activateDefault(workflow, document.revision)) changed = true;
+    }
+    changed ||= !next.workflows[document.definition.id];
+    next.workflows[document.definition.id] = workflow;
+    if (changed) { next.revision += 1; next.updated_at = new Date().toISOString(); }
+    if (!catalog && changed) await this.writeCatalog(next);
+    return next;
+  }
+
+  private async reconcileCatalog(): Promise<void> {
+    let catalog = await this.readCatalog();
+    const files = (await readdir(this.directory, { withFileTypes: true }))
+      .filter((entry) => entry.isFile() && entry.name.endsWith(".yaml") && !entry.name.startsWith("."));
+    for (const file of files) {
+      const document = await this.withVersion(this.document(await readFile(join(this.directory, file.name), "utf8")));
+      const existingWorkflow = Boolean(catalog.workflows[document.definition.id]);
+      const versionsDirectory = join(this.directory, ".versions", document.definition.id);
+      let revisions: string[] = [];
+      try { revisions = (await readdir(versionsDirectory)).filter((name) => /^[a-f0-9]{64}\.yaml$/.test(name)).map((name) => name.slice(0, -5)); }
+      catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+      for (const revision of revisions) {
+        const historical = await this.withVersion(this.document(await readFile(join(versionsDirectory, `${revision}.yaml`), "utf8")));
+        catalog = await this.registerRelease(historical, { makeDefault: false, status: "retired" }, catalog);
+      }
+      catalog = await this.registerRelease(document, { makeDefault: !existingWorkflow, status: existingWorkflow ? "trial" : "active" }, catalog);
+    }
+    let normalized = false;
+    for (const workflow of Object.values(catalog.workflows)) {
+      if (workflow.default_revision && workflow.releases[workflow.default_revision] && this.activateDefault(workflow, workflow.default_revision)) normalized = true;
+    }
+    if (normalized) {
+      catalog.revision += 1;
+      catalog.updated_at = new Date().toISOString();
+    }
+    if (!catalog.workflows[catalog.default_workflow_id]) {
+      catalog.default_workflow_id = catalog.workflows["standard-delivery"] ? "standard-delivery" : Object.keys(catalog.workflows).sort()[0] ?? "standard-delivery";
+      catalog.revision += 1; catalog.updated_at = new Date().toISOString();
+    }
+    await this.writeCatalog(catalog);
   }
 
   private document(content: string, promptIds?: Set<string>, workflowIds?: Set<string>, agentProfileIds?: Set<string>): WorkflowDocument {
@@ -879,23 +1054,41 @@ export class WorkflowLibrary {
     };
   }
 
+  private async withVersion(document: WorkflowDocument): Promise<WorkflowDocument> {
+    await this.archive(document.definition.id, document.revision, document.content);
+    return { ...document, version: await artifactVersion(this.directory, document.definition.id, document.revision) };
+  }
+
   async list(): Promise<WorkflowDocument[]> {
     await this.start();
     const files = (await readdir(this.directory, { withFileTypes: true }))
-      .filter((entry) => entry.isFile() && entry.name.endsWith(".yaml"))
+      .filter((entry) => entry.isFile() && entry.name.endsWith(".yaml") && !entry.name.startsWith("."))
       .map((entry) => entry.name).sort();
-    return Promise.all(files.map(async (file) => this.document(await readFile(join(this.directory, file), "utf8"))));
+    return Promise.all(files.map(async (file) => this.withVersion(this.document(await readFile(join(this.directory, file), "utf8")))));
   }
 
-  async get(id: string, revision?: string): Promise<WorkflowDocument> {
+  async catalog(): Promise<{ catalog: WorkflowReleaseCatalog; releases: WorkflowRelease[] }> {
     await this.start();
+    return this.serial(async () => {
+      const catalog = await this.readCatalog();
+      const releases: WorkflowRelease[] = [];
+      for (const [workflowId, workflow] of Object.entries(catalog.workflows)) for (const [revision, release] of Object.entries(workflow.releases)) {
+        try {
+          const document = await this.getWithoutStart(workflowId, revision);
+          releases.push({ workflow_id: workflowId, revision, ...release, is_default: workflow.default_revision === revision, definition: document.definition });
+        } catch { /* preserve a repairable catalog even if an archived file is missing */ }
+      }
+      releases.sort((left, right) => left.workflow_id.localeCompare(right.workflow_id) || right.version - left.version);
+      return { catalog, releases };
+    });
+  }
+
+  private async getWithoutStart(id: string, revision?: string): Promise<WorkflowDocument> {
     if (!SAFE_ID.test(id)) throw new HttpError(404, `Workflow ${id} not found`);
     if (revision && !/^[a-f0-9]{64}$/.test(revision)) throw new HttpError(422, "Workflow revision must be a SHA-256 digest");
-    const path = revision
-      ? join(this.directory, ".versions", id, `${revision}.yaml`)
-      : join(this.directory, `${id}.yaml`);
+    const path = revision ? join(this.directory, ".versions", id, `${revision}.yaml`) : join(this.directory, `${id}.yaml`);
     try {
-      const document = this.document(await readFile(path, "utf8"));
+      const document = await this.withVersion(this.document(await readFile(path, "utf8")));
       if (document.definition.id !== id) throw new HttpError(422, `Workflow file id does not match ${id}`);
       return document;
     } catch (error) {
@@ -904,7 +1097,38 @@ export class WorkflowLibrary {
     }
   }
 
-  async save(content: string, expectedRevision?: string, promptIds?: Set<string>, workflowIds?: Set<string>, agentProfileIds?: Set<string>): Promise<WorkflowDocument> {
+  async get(id: string, revision?: string): Promise<WorkflowDocument> {
+    await this.start();
+    return this.getWithoutStart(id, revision);
+  }
+
+  async assignment(id?: string, revision?: string): Promise<{ document: WorkflowDocument; selection: "default" | "manual_trial" }> {
+    await this.start();
+    const catalog = await this.readCatalog();
+    const workflowId = id || catalog.default_workflow_id;
+    const workflow = catalog.workflows[workflowId];
+    if (!workflow) throw new HttpError(404, `Workflow ${workflowId} not found`);
+    const selectedRevision = revision || workflow.default_revision;
+    const release = workflow.releases[selectedRevision];
+    if (!release) throw new HttpError(404, `Workflow ${workflowId}@${selectedRevision} is not published`);
+    if (release.status === "retired") throw new HttpError(409, `Workflow ${workflowId}@${selectedRevision} is retired`);
+    return { document: await this.getWithoutStart(workflowId, selectedRevision), selection: revision && revision !== workflow.default_revision ? "manual_trial" : "default" };
+  }
+
+  async promote(id: string, revision: string): Promise<{ catalog: WorkflowReleaseCatalog; release: WorkflowRelease }> {
+    await this.start();
+    return this.serial(async () => {
+      const catalog = await this.readCatalog();
+      const workflow = catalog.workflows[id]; const release = workflow?.releases[revision];
+      if (!workflow || !release) throw new HttpError(404, `Workflow ${id}@${revision} is not published`);
+      this.activateDefault(workflow, revision);
+      catalog.revision += 1; catalog.updated_at = new Date().toISOString(); await this.writeCatalog(catalog);
+      const document = await this.getWithoutStart(id, revision);
+      return { catalog, release: { workflow_id: id, revision, ...release, is_default: true, definition: document.definition } };
+    });
+  }
+
+  async save(content: string, expectedRevision?: string, promptIds?: Set<string>, workflowIds?: Set<string>, agentProfileIds?: Set<string>, releaseOptions: { makeDefault?: boolean; label?: string } = {}): Promise<WorkflowDocument> {
     await this.start();
     return this.serial(async () => {
       const document = this.document(content, promptIds, workflowIds, agentProfileIds);
@@ -916,13 +1140,35 @@ export class WorkflowLibrary {
       try { current = await readFile(path, "utf8"); }
       catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
       if (current !== null && expectedRevision === undefined) throw new HttpError(409, `Workflow ${document.definition.id} already exists`);
-      if (current !== null && digest(current) !== expectedRevision) throw new HttpError(409, "Workflow revision changed", this.document(current));
+      if (current !== null && digest(current) !== expectedRevision) throw new HttpError(409, "Workflow revision changed", await this.withVersion(this.document(current)));
       if (current === null && expectedRevision !== undefined) throw new HttpError(404, `Workflow ${document.definition.id} not found`);
       if (current !== null) await this.archive(document.definition.id, digest(current), current);
       await atomicWrite(path, normalized);
       await this.archive(document.definition.id, next.revision, normalized);
-      return next;
+      const versioned = await this.withVersion(next);
+      await this.registerRelease(versioned, {
+        makeDefault: current === null || releaseOptions.makeDefault === true,
+        ...(releaseOptions.label !== undefined ? { label: releaseOptions.label } : {}),
+        parentRevision: current === null ? null : digest(current),
+      });
+      return versioned;
     });
+  }
+
+  async restore(id: string, expectedRevision: string): Promise<WorkflowDocument> {
+    const definition = DEFAULT_WORKFLOWS.find((candidate) => candidate.id === id);
+    if (!definition) throw new HttpError(409, `Workflow ${id} has no built-in default`);
+    return this.save(normalizedContent(definition), expectedRevision, undefined, undefined, undefined, { makeDefault: true, label: "Restored built-in default" });
+  }
+
+  async restoreAll(): Promise<WorkflowDocument[]> {
+    const output: WorkflowDocument[] = [];
+    for (const definition of DEFAULT_WORKFLOWS) {
+      const current = await this.get(definition.id);
+      const content = normalizedContent(definition);
+      output.push(current.content === content ? current : await this.save(content, current.revision, undefined, undefined, undefined, { makeDefault: true, label: "Restored built-in default" }));
+    }
+    return output;
   }
 }
 
@@ -934,16 +1180,14 @@ export function workflowNode(definition: WorkflowDefinition, id: string): Workfl
 
 export function resolveNodeProvider(ticket: TicketFrontmatter, node: WorkflowNode, workflowId?: string): Provider | null {
   if (node.type !== "agent") return null;
-  const profile = resolvedAgentProfile(ticket, node, workflowId);
-  if (profile) return profile.provider;
-  if (node.provider === "work") return ticket.work_provider;
-  if (node.provider === "review") return ticket.review_provider;
-  return PROVIDERS.includes(node.provider as Provider) ? node.provider as Provider : null;
+  return resolvedAgentProfile(ticket, node, workflowId)?.provider ?? null;
 }
 
 export function requiredActivityCapability(node: WorkflowNode): ActivityCapability | null {
+  if (node.type === "checkpoint") return "git_checkpoint";
+  if (node.type === "restore_checkpoint") return "git_restore";
   if (node.type !== "script") return null;
-  if (node.script_file || node.action) return "repository_action";
+  if (node.script_file) return "repository_action";
   if (node.inline?.language === "shell") return "inline_shell";
   if (node.inline?.language === "javascript") return "inline_javascript";
   if (node.inline?.language === "python") return "inline_python";
@@ -957,15 +1201,12 @@ export function nodeAttemptCounter(ticket: TicketFrontmatter, nodeId?: string): 
     ticket.workflow.node_attempts[key] ??= { total: 0, consecutive_lease_losses: 0 };
     return ticket.workflow.node_attempts[key]!;
   }
-  if (ticket.phase === "done") throw new HttpError(409, "Terminal tickets cannot start work attempts");
-  return ticket.attempts[ticket.phase];
+  throw new HttpError(409, "Workflow execution is missing its node attempt counter");
 }
 
 function conditionMet(ticket: TicketFrontmatter, condition: WorkflowCondition | undefined): boolean {
   if (!condition) return true;
-  const value = condition.input === "spec_required" ? ticket.spec_required
-    : condition.input === "review_required" ? ticket.review_required
-      : ticket.workflow?.inputs[condition.input];
+  const value = ticket.workflow?.inputs[condition.input];
   return value === condition.equals;
 }
 
@@ -977,6 +1218,7 @@ export function workflowNodeEnabled(ticket: TicketFrontmatter, definition: Workf
 
 function projectionStatus(node: WorkflowNode): TicketFrontmatter["status"] {
   if (node.type === "human_gate") return "waiting_approval";
+  if (node.type === "wait") return "waiting_external";
   if (node.type === "terminal") return node.terminal_status ?? "failed";
   return "ready";
 }
@@ -988,6 +1230,7 @@ export function initializeWorkflow(
   selections: {
     inputs?: Record<string, boolean | string>; stage_enabled?: Record<string, boolean>;
     workflow_revisions?: Record<string, string>; resolved_agent_profiles?: Record<string, ResolvedAgentProfile>;
+    assignment_selection?: "default" | "manual_trial" | "experiment"; experiment_id?: string | null;
   } = {},
 ): void {
   if (!document.valid) throw new HttpError(422, "Cannot assign an invalid workflow", document.errors);
@@ -1013,9 +1256,8 @@ export function initializeWorkflow(
     }
   }
   const stageEnabled = Object.fromEntries(document.definition.stages.map((stage) => {
-    const legacy = stage.id === "specification" ? ticket.spec_required : stage.id === "review" ? ticket.review_required : undefined;
     const requested = selections.stage_enabled?.[stage.id];
-    return [stage.id, stage.skippable ? requested ?? legacy ?? stage.default_enabled : true];
+    return [stage.id, stage.skippable ? requested ?? stage.default_enabled : true];
   }));
   ticket.workflow = {
     id: document.definition.id, revision: document.revision, current_node: document.definition.start, transition_count: 0,
@@ -1023,10 +1265,16 @@ export function initializeWorkflow(
     node_visits: {}, node_attempts: {}, node_runs: [], prompt_revisions: promptRevisions, inputs, stage_enabled: stageEnabled, incoming: null,
     active_workflow_id: document.definition.id, active_workflow_revision: document.revision,
     workflow_revisions: { [document.definition.id]: document.revision, ...(selections.workflow_revisions ?? {}) },
-    workflow_stack: [], fan_out_stack: [], resolved_agent_profiles: selections.resolved_agent_profiles ?? {},
+    workflow_stack: [], fan_out_stack: [], wait_states: {}, resolved_agent_profiles: selections.resolved_agent_profiles ?? {},
   };
-  if ("specification" in stageEnabled) ticket.spec_required = stageEnabled.specification ?? ticket.spec_required;
-  if ("review" in stageEnabled) ticket.review_required = stageEnabled.review ?? ticket.review_required;
+  ticket.workflow_assignment ??= {
+    workflow_id: document.definition.id,
+    revision: document.revision,
+    version: document.version ?? 1,
+    selection: selections.assignment_selection ?? "default",
+    assigned_at: now,
+    experiment_id: selections.experiment_id ?? null,
+  };
   ticket.conversations ??= {};
   enterCurrentNode(ticket, document.definition, false);
   if (initialStatus === "pending") ticket.status = "pending";
@@ -1054,7 +1302,7 @@ export function enterCurrentNode(ticket: TicketFrontmatter, definition: Workflow
         lease_id: null,
         started_at: now, completed_at: now, outcome: "bypassed", summary,
         handoff: null, output: null, input_revision: ticket.revision, telemetry: null,
-        timing: emptyNodeTiming(node.type === "human_gate" ? "human_wait" : "active", null),
+        timing: emptyNodeTiming(node.type === "human_gate" ? "human_wait" : node.type === "wait" ? "external_wait" : "active", null),
       });
       return transitionTo(ticket, definition, target, { outcome: "bypassed", summary, actor: "workflow", source_node: node.id, count_visit: countVisit });
     }
@@ -1086,6 +1334,18 @@ export function transitionTo(ticket: TicketFrontmatter, definition: WorkflowDefi
   const now = new Date().toISOString();
   const identity = activeWorkflowIdentity(ticket);
   const sourceVisit = ticket.workflow.node_visits[runtimeNodeKey(ticket, source)] ?? 0;
+  const operatorMove = (details.actor ?? "workflow") === "operator" || details.outcome.startsWith("operator_");
+  const runningSource = operatorMove ? [...ticket.workflow.node_runs].reverse().find((run) => run.node_id === source
+    && run.workflow_revision === identity.revision
+    && (run.workflow_id ?? ticket.workflow!.id) === identity.id
+    && run.visit === sourceVisit && run.status === "running") : undefined;
+  if (runningSource) {
+    accountNodeRunTiming(runningSource, now);
+    runningSource.status = "interrupted";
+    runningSource.completed_at = now;
+    runningSource.outcome = details.outcome;
+    runningSource.summary = details.summary ?? "Execution interrupted by an operator transition.";
+  }
   const matchingRun = [...ticket.workflow.node_runs].reverse().find((run) => run.node_id === source
     && run.workflow_revision === identity.revision
     && (run.workflow_id ?? ticket.workflow!.id) === identity.id
@@ -1097,7 +1357,7 @@ export function transitionTo(ticket: TicketFrontmatter, definition: WorkflowDefi
       supervisor_id: null, provider: null, started_at: now, completed_at: now, outcome: details.outcome,
       summary: details.summary ?? `Transitioned through ${details.outcome}.`, handoff: details.handoff ?? null,
       output: null, input_revision: ticket.revision, lease_id: null, telemetry: null,
-      timing: emptyNodeTiming(sourceNode.type === "human_gate" ? "human_wait" : "active", null),
+      timing: emptyNodeTiming(sourceNode.type === "human_gate" ? "human_wait" : sourceNode.type === "wait" ? "external_wait" : "active", null),
     });
   }
   ticket.workflow.incoming = {
@@ -1106,6 +1366,11 @@ export function transitionTo(ticket: TicketFrontmatter, definition: WorkflowDefi
     output: details.output ?? null, output_log_path: details.output_log_path ?? null,
     actor: details.actor ?? "workflow", created_at: now,
   };
+  for (const [key, state] of Object.entries(ticket.workflow.wait_states ?? {})) {
+    const waitNode = definition.nodes.find((candidate) => candidate.id === state.node_id && candidate.type === "wait");
+    if (operatorMove && waitNode?.id === source) { delete ticket.workflow.wait_states?.[key]; continue; }
+    if (waitNode?.next === source && target !== waitNode.id) delete ticket.workflow.wait_states?.[key];
+  }
   ticket.workflow.current_node = target;
   ticket.workflow.current_node_entered_at = now;
   ticket.workflow.completed_at = null;
@@ -1122,7 +1387,7 @@ export function advanceWorkflow(ticket: TicketFrontmatter, definition: WorkflowD
 }
 
 export function beginNodeRun(ticket: TicketFrontmatter, node: WorkflowNode, workflowRevision: string, attempt: number, now: string, supervisorId: string, provider: Provider | null, leaseId: string | null = null): WorkflowNodeRun {
-  const timingState: NodeTimingState = node.type === "human_gate" ? "human_wait" : "active";
+  const timingState: NodeTimingState = node.type === "human_gate" ? "human_wait" : node.type === "wait" ? "external_wait" : "active";
   const run: WorkflowNodeRun = {
     id: randomUUID(), ...(ticket.workflow ? { workflow_id: activeWorkflowIdentity(ticket).id } : {}), workflow_revision: workflowRevision, node_id: node.id, node_type: node.type,
     visit: ticket.workflow?.node_visits[ticket.workflow ? runtimeNodeKey(ticket, node.id) : node.id] ?? 1, attempt, status: "running", supervisor_id: supervisorId, provider,
@@ -1150,7 +1415,7 @@ export function finishNodeRun(ticket: TicketFrontmatter, runId: string, outcome:
 
 export function emptyNodeTiming(state: NodeTimingState, startedAt: string | null): WorkflowNodeRun["timing"] {
   return {
-    active_ms: 0, quota_paused_ms: 0, human_wait_ms: 0,
+    active_ms: 0, quota_paused_ms: 0, human_wait_ms: 0, external_wait_ms: 0,
     state, last_accounted_at: startedAt, pause_limit_id: null, pause_until: null,
   };
 }
@@ -1172,6 +1437,7 @@ export function accountNodeRunTiming(
       elapsed -= paused;
       if (elapsed > 0) run.timing.active_ms += elapsed;
     } else if (run.timing.state === "human_wait") run.timing.human_wait_ms += elapsed;
+    else if (run.timing.state === "external_wait") run.timing.external_wait_ms += elapsed;
     else run.timing.active_ms += elapsed;
   }
   if (next) {

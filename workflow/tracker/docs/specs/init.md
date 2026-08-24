@@ -2,7 +2,7 @@
 
 ## Status
 
-Approved V1 product and architecture specification. Preserved as the lightweight baseline; the additive software-factory architecture is specified in [V3](./v3.md).
+Historical V1 product and architecture specification, preserved as the lightweight baseline. The current workflow-first contract is specified in [V3](./v3.md); ticket-level specification/review flags and provider selectors described below are not part of new V3 tickets.
 
 ## Goal
 
@@ -33,7 +33,7 @@ The system does not decompose implementation into graph nodes, prescribe how an 
                               |
                               v
                  +-------------------------+
-                 |    workflow/tracker     |
+                 | workflow/tracker        |
                  | tickets, state, leases, |
                  | approval, guidance      |
                  +------------+------------+
@@ -41,7 +41,7 @@ The system does not decompose implementation into graph nodes, prescribe how an 
                          claim/callback
                               |
                  +------------v---------------+
-                 |   workflow/supervisor      |
+                 | workflow/supervisor        |
                  | small deterministic loop   |
                  +------------+---------------+
                               |
@@ -50,9 +50,9 @@ The system does not decompose implementation into graph nodes, prescribe how an 
                          +----v----+
                          |  Herdr  |
                          +----+----+
-                         +----+----+
-                         |         |
-                       Claude    Codex
+                        +-----+-----+
+                        |           |
+                     Claude       Codex
 ```
 
 Herdr supplies persistent terminal sessions, lifecycle observation, prompts to agents that are already working, and native Codex and Claude session references. Its `working`, `blocked`, `idle`, and `done` states help the operator and supervisor understand liveness, but do not identify whether the assigned semantic task succeeded. See [Herdr agent automation](https://herdr.dev/docs/agent-automation/), [Herdr socket API](https://herdr.dev/docs/socket-api/), and [Herdr session restore](https://herdr.dev/docs/session-state/).
@@ -128,8 +128,8 @@ providers:
     - claude
     - codex
 repositories:
-  - id: agentic-project-tracker
-    url: git@github.com:example/agentic-project-tracker.git
+  - id: tracker
+    url: git@github.com:example/tracker.git
   - id: application-api
     url: https://github.com/example/application-api.git
 jira:
@@ -145,7 +145,7 @@ github:
 
 Repository `id` values are unique safe directory names matching `[A-Za-z0-9][A-Za-z0-9._-]*`; `.` and `..` are forbidden. URLs are nonempty Git clone sources and must also be unique. The tracker rejects invalid YAML, duplicate entries, unsafe IDs, and stale UI revisions without replacing the last valid file.
 
-`providers.enabled` controls the work-agent choices offered when creating a ticket. It contains one or more unique values from `claude` and `codex`; missing legacy configuration defaults to both. This is an operator preference rather than a live capability projection: supervisor availability does not automatically add or remove choices. Existing tickets retain and display their recorded provider even when it is no longer enabled for new work.
+`providers.enabled` controls the work-agent choices offered when creating a ticket. It contains one or more unique values from `claude` and `codex`; missing configuration defaults to both. This is an operator preference rather than a live capability projection: supervisor availability does not automatically add or remove choices. Existing tickets retain and display their recorded provider even when it is no longer enabled for new work.
 
 Each supervisor periodically fetches the current catalog and reconciles every entry to `PROJECT_ROOT/<id>`. If that path already exists, it is left untouched. If it is absent, the supervisor runs `git clone -- <url> <absolute-target>`. It does not pull, reset, change branches, inspect remotes, or replace existing directories.
 
@@ -282,7 +282,7 @@ The operator primarily authors:
 - `work_provider`, `review_provider`, `priority`, and `labels`; and
 - `repositories`.
 
-`work_provider` and `review_provider` are exactly `claude` or `codex`. Claude work requires Codex review, and Codex work requires Claude review. Missing routing fields on a legacy ticket default to its existing work assignment when one exists, otherwise Claude work and the corresponding reviewer. `priority` is an integer; higher values claim first. An operator may change it in any valid ticket state without interrupting work or guiding the agent because it is scheduling metadata. `labels` are scheduling-neutral free-form strings in V1.
+`work_provider` and `review_provider` are exactly `claude` or `codex`. Claude work requires Codex review, and Codex work requires Claude review. Missing routing fields on a legacy ticket default to its existing work assignment when one exists, otherwise Claude work and Codex review. `priority` is an integer; higher values claim first. An operator may change it in any valid ticket state without interrupting work or guiding the agent because it is scheduling metadata. `labels` are scheduling-neutral free-form strings in V1.
 
 Every ticket must reference at least one repository and exactly one entry must have `primary: true`. Repository IDs are human-meaningful identifiers supplied to the agent. The tracker does not resolve, clone, validate, or prepare those repositories.
 
@@ -574,7 +574,7 @@ Every mutation from an agent or supervisor includes the current lease ID. A stal
 
 For a terminal callback, the tracker records the lease ID, request digest, and resulting response in the ticket's interaction event before clearing `execution`. An exact retry replays that result; reuse of the same lease with a different callback payload returns `409 Conflict`.
 
-Herdr lifecycle changes may update `observed_herdr_state` and the UI, but `idle` or `done` never completes a phase. Initial assignment delivery uses Herdr's stalled-prompt detection with a timeout longer than its five-second activity window. An `agent_prompt_stalled` result retries the same complete assignment once; a normal timeout after activity means the agent is still working. The supervisor does not enter its monitoring/reminder loop until assignment activity has been confirmed. If both submissions stall, it reports an infrastructure error and later lease recovery retries the complete assignment rather than substituting a callback reminder.
+Herdr lifecycle changes may update `observed_herdr_state` and the UI, but `idle` or `done` never completes a phase. After an actual agent launch, the supervisor waits for Herdr's `interactive_ready=true` and `launch_pending=false` predicate to remain stable before sending work; older Herdr versions without either field receive a conservative bounded startup delay. Initial assignment delivery then uses Herdr's stalled-prompt detection with a timeout longer than its five-second activity window. Because `agent_prompt_stalled` can mean either delayed lifecycle observation or text left unsent in a full-screen agent's composer, the supervisor never pastes the complete assignment twice on one lease. It polls activity and unwrapped pane text for the assignment's unique absolute `START_HERE.md` path during a bounded recovery window. Activity confirms delivery; a matching staged prompt is submitted with a single `Enter`, but never while launch remains pending or interactive readiness is false. If neither appears, the supervisor reports an infrastructure delivery error and later lease recovery retries the node rather than substituting a callback reminder. A normal timeout after activity means the agent is still working. The supervisor does not enter its monitoring/reminder loop until assignment delivery has been confirmed.
 
 After confirmed assignment activity, if the agent settles without sending `complete`, `ask`, or `fail`, the supervisor may remind it once per lease of the callback contract; later lifecycle changes do not re-arm that reminder. It must not infer success from terminal output. An operator may manually resume the same leased conversation through guidance after a provider cooldown.
 
@@ -870,9 +870,10 @@ V1 explicitly excludes:
 - An explicit inactive release clears machine-local conversations before another supervisor can claim the ticket.
 - Priority ordering is deterministic, operator-adjustable in every valid state, and immediately affects later claims; equal priorities use the existing deterministic tie-breakers.
 - Stale lease callbacks cannot mutate a ticket.
-- Two unexplained lease losses requeue work; the third blocks for operator attention.
+- Agent claims begin in `starting`; the supervisor renews their lease throughout repository inspection, bundle creation, pane startup/restoration, interactive-readiness settling, and prompt delivery. Only confirmed prompt acceptance or observed activity after interactive readiness changes the claim to `delivered`/running.
+- A startup or prompt-delivery failure is an operational `delivery_failed` run, takes no workflow edge, and retains the ticket conversation for the next attempt. The first two consecutive operational delivery/lease losses requeue the same node; the third blocks for operator attention. A successful node settlement resets the consecutive-loss count.
 - Herdr `idle` or `done` cannot advance a phase without `complete`.
-- A stalled initial Herdr prompt retries the identical full assignment, never sends the callback reminder in its place, and must show confirmed activity before reminder monitoring begins.
+- A stalled initial Herdr prompt is never pasted twice on the same lease. The supervisor must recover through content-anchored pane observation, submit a visibly staged prompt with only `Enter`, or fail delivery without taking a workflow edge. It never sends the callback reminder in place of the assignment, and reminder monitoring begins only after confirmed delivery. Herdr commands have a hard supervisor deadline, while independent lease renewal prevents slow provider startup from masquerading as an abandoned ticket.
 
 ### Workflow
 
@@ -923,7 +924,7 @@ V1 explicitly excludes:
 
 ### End-to-end scenarios
 
-1. A Claude-selected ticket is specified and implemented by one Claude ticket conversation, independently reviewed by its Codex ticket conversation, and completes with an evolving draft PR recorded in Markdown.
+1. A Claude-selected ticket is specified and implemented by one Claude ticket conversation, independently reviewed by its selected Codex ticket conversation, and completes with an evolving draft PR recorded in Markdown.
 2. A Codex-selected ticket is specified and implemented by one Codex work conversation. It receives human specification feedback without losing context, is independently reviewed in a separate Claude review conversation, returns once for repair, and completes with draft PRs for every changed repository.
 3. During implementation, an operator edits the ticket description in the UI and chooses to continue. The active Claude or Codex conversation receives durable reread guidance without the tracker restarting the work or prescribing how to respond.
 4. During implementation, an operator edits the description and restarts from specification. The old agent is interrupted and fenced before the same work conversation becomes claimable for specification.
@@ -940,7 +941,7 @@ The eventual implementations must include unit and integration coverage for:
 - guidance cursors and idempotent callbacks;
 - prompt default seeding, reserved-directory exclusion, tag validation, optimistic edits, full-envelope preview, and supervisor refresh;
 - live-description continue edits, active interrupt acknowledgement, callback fencing, and restart failure behavior;
-- Herdr command/session adaptation through fakes rather than real paid agent turns, including confirmed, still-working timeout, stalled, retry, and unexpected-error prompt delivery paths;
+- Herdr command/session adaptation through fakes rather than real paid agent turns, including confirmed, still-working timeout, stalled-composer recovery without duplicate paste, unseen-prompt lease retry, and unexpected-error delivery paths;
 - proof that observed lifecycle state never triggers semantic completion; and
 - the primary React queue, editor decision, approval, guidance, and recovery flows.
 

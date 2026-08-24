@@ -104,15 +104,16 @@ async function eachJsonLine(path: string, visit: (entry: JsonRecord) => void): P
 function usageFromCodex(value: unknown): TokenUsage | null {
   const item = record(value);
   if (!item) return null;
-  const input = finite(item.input_tokens) ?? 0;
+  const rawInput = finite(item.input_tokens) ?? 0;
   const cached = finite(item.cached_input_tokens) ?? 0;
+  const input = Math.max(0, rawInput - cached);
   const cacheWrite = finite(item.cache_write_input_tokens) ?? 0;
   const output = finite(item.output_tokens) ?? 0;
   const reasoning = finite(item.reasoning_output_tokens) ?? 0;
   return {
     input_tokens: input, cached_input_tokens: cached, cache_write_input_tokens: cacheWrite,
     output_tokens: output, reasoning_output_tokens: reasoning,
-    total_tokens: finite(item.total_tokens) ?? input + cached + cacheWrite + output + reasoning,
+    total_tokens: finite(item.total_tokens) ?? input + cached + cacheWrite + output,
   };
 }
 
@@ -306,9 +307,9 @@ export class TelemetryCollector {
 export function zeroTelemetryBaseline(snapshot: HarnessTelemetrySnapshot): HarnessTelemetrySnapshot {
   return {
     ...snapshot, observed_at: snapshot.observed_at,
-    usage: snapshot.usage ? zeroUsage() : null,
+    usage: zeroUsage(),
     cost: snapshot.cost.total_usd === null ? snapshot.cost : { total_usd: 0, kind: snapshot.cost.kind },
     context: { ...snapshot.context, used_tokens: 0, used_percent: snapshot.context.window_tokens ? 0 : null },
-    rate_limits: [],
+    rate_limits: structuredClone(snapshot.rate_limits),
   };
 }

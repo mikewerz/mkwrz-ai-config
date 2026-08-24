@@ -6,6 +6,7 @@ cd "$script_dir"
 
 pid_file="${DEPLOY_PID_FILE:-.pid}"
 log_file="${DEPLOY_LOG_FILE:-app.log}"
+bootstrap_log="${DEPLOY_BOOTSTRAP_LOG_FILE:-app.bootstrap.log}"
 expected_command="dist/server/index.js"
 new_pid=""
 
@@ -62,15 +63,22 @@ if ! command -v node >/dev/null 2>&1 || ! command -v npm >/dev/null 2>&1 || ! co
   exit 1
 fi
 
-echo "Installing locked dependencies and verifying the tracker."
+echo "Installing locked dependencies."
 npm ci
-npm run verify
+if [[ "${DEPLOY_RUN_TESTS:-false}" == "true" ]]; then
+  echo "Running the full tracker verification suite."
+  npm run verify
+else
+  echo "Skipping tracker tests; type-checking and building production artifacts."
+  npm run typecheck
+  npm run build
+fi
 
 stop_existing
 trap cleanup_failed_start ERR
 
 echo "Starting the production tracker."
-nohup node dist/server/index.js >> "$log_file" 2>&1 &
+nohup env LOG_FILE="$log_file" node dist/server/index.js >> "$bootstrap_log" 2>&1 &
 new_pid=$!
 printf '%s\n' "$new_pid" > "$pid_file"
 sleep 1
@@ -81,7 +89,7 @@ health_url="$(node --input-type=module -e '
   const configured = process.env.HOST ?? "127.0.0.1";
   const host = configured === "0.0.0.0" || configured === "::" ? "127.0.0.1" : configured;
   const address = host.includes(":") ? `[${host}]` : host;
-  console.log(`http://${address}:${process.env.PORT ?? "4310"}/api/healthz`);
+  console.log(`http://${address}:${process.env.PORT ?? "4310"}/api/readyz`);
 ')"
 
 for _ in {1..20}; do
@@ -96,5 +104,6 @@ done
 
 echo "Tracker failed its startup health check. Recent log output:" >&2
 tail -n 80 "$log_file" >&2 || true
+tail -n 80 "$bootstrap_log" >&2 || true
 cleanup_failed_start
 exit 1

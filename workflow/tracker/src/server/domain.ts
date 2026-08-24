@@ -1,9 +1,9 @@
 export const PHASES = ["specification", "implementation", "review", "done"] as const;
 export const STATUSES = [
-  "pending", "ready", "running", "blocked", "waiting_approval", "completed", "failed", "cancelled",
+  "pending", "ready", "running", "blocked", "waiting_approval", "waiting_external", "completed", "failed", "cancelled",
 ] as const;
 export const PROVIDERS = ["claude", "codex"] as const;
-export const ACTIVITY_CAPABILITIES = ["repository_action", "inline_shell", "inline_javascript", "inline_python"] as const;
+export const ACTIVITY_CAPABILITIES = ["repository_action", "inline_shell", "inline_javascript", "inline_python", "git_checkpoint", "git_restore"] as const;
 export const PRODUCTION_RESULTS = ["unassessed", "succeeded", "failed", "rolled_back", "not_deployed"] as const;
 
 export type Phase = (typeof PHASES)[number];
@@ -11,7 +11,6 @@ export type TicketStatus = (typeof STATUSES)[number];
 export type Provider = (typeof PROVIDERS)[number];
 export type ActivityCapability = (typeof ACTIVITY_CAPABILITIES)[number];
 export type ProductionResult = (typeof PRODUCTION_RESULTS)[number];
-export type ReviewProvider = Provider;
 export type JsonPrimitive = string | number | boolean | null;
 export type JsonValue = JsonPrimitive | JsonValue[] | { [key: string]: JsonValue };
 
@@ -27,10 +26,58 @@ export interface RepositoryRef {
   primary: boolean;
 }
 
+export interface TicketAttachment {
+  id: string;
+  filename: string;
+  content_type: string;
+  size_bytes: number;
+  sha256: string;
+  created_at: string;
+}
+
+export type ArtifactKind = "attachment" | "script_output" | "script_artifact" | "quality_report" | "checkpoint_bundle" | "checkpoint_manifest" | "execution_manifest";
+export interface ArtifactRecord {
+  id: string;
+  kind: ArtifactKind;
+  ticket_id: string;
+  node_run_id: string | null;
+  filename: string;
+  content_type: string;
+  size_bytes: number;
+  sha256: string;
+  created_at: string;
+  metadata: Record<string, JsonValue>;
+}
+
+export interface TicketArtifactRef extends ArtifactRecord {}
+export interface CheckpointRepositoryRef {
+  repository: string;
+  head_sha: string;
+  snapshot_sha: string;
+  branch: string | null;
+  remote_url: string | null;
+  dirty: boolean;
+  bundle_artifact_id: string;
+}
+export interface TicketCheckpoint {
+  id: string;
+  label: string;
+  kind: "workflow" | "manual" | "pre_restore";
+  node_id: string;
+  node_run_id: string | null;
+  created_at: string;
+  repositories: CheckpointRepositoryRef[];
+  manifest_artifact_id: string;
+}
+
 export interface AgentRef {
   provider: Provider | null;
   herdr_pane_id: string | null;
   session_ref: string | null;
+  generation: number;
+  visits_in_generation: number;
+  last_visit_key: string | null;
+  reset_reason: string | null;
 }
 
 export interface AttemptCounter {
@@ -131,7 +178,7 @@ export interface HarnessTelemetrySnapshot {
   model: { id: string | null; provider: string | null; observed_ids: string[] };
   reasoning: { effort: string | null; enabled: boolean | null; source: string | null };
   usage: TokenUsage | null;
-  cost: { total_usd: number | null; kind: "reported" | "estimated" | "unavailable" };
+  cost: { total_usd: number | null; kind: "reported" | "estimated" | "unavailable"; source?: string | null; pricing_id?: string | null; effective_at?: string | null };
   context: { used_tokens: number | null; window_tokens: number | null; used_percent: number | null };
   rate_limits: Array<{ id: string; name: string | null; used_percent: number; window_minutes: number | null; resets_at: string | null }>;
   attributes: Record<string, string | number | boolean | null>;
@@ -143,12 +190,13 @@ export interface HarnessTelemetryRecord {
   delta: { usage: TokenUsage | null; cost_usd: number | null };
 }
 
-export type NodeTimingState = "active" | "quota_paused" | "human_wait";
+export type NodeTimingState = "active" | "quota_paused" | "human_wait" | "external_wait";
 
 export interface NodeRunTiming {
   active_ms: number;
   quota_paused_ms: number;
   human_wait_ms: number;
+  external_wait_ms: number;
   state: NodeTimingState;
   last_accounted_at: string | null;
   pause_limit_id: string | null;
@@ -164,6 +212,8 @@ export interface Execution {
   claimed_at: string;
   last_heartbeat_at: string;
   lease_expires_at: string;
+  delivery_status: "starting" | "delivered";
+  delivery_confirmed_at: string | null;
   observed_herdr_state: string | null;
   herdr_observation: HerdrObservation | null;
   telemetry: HarnessTelemetryRecord | null;
@@ -171,7 +221,7 @@ export interface Execution {
   interrupt_request: InterruptRequest | null;
   node_run_id?: string | undefined;
   node_id?: string | undefined;
-  node_type?: "agent" | "script" | undefined;
+  node_type?: "agent" | "script" | "checkpoint" | "restore_checkpoint" | undefined;
   conversation_key?: string | undefined;
 }
 
@@ -180,7 +230,7 @@ export interface WorkflowNodeRun {
   workflow_id?: string;
   workflow_revision: string;
   node_id: string;
-  node_type: "agent" | "script" | "verification" | "human_gate" | "read" | "write" | "workflow" | "fan_out" | "fan_in" | "terminal";
+  node_type: "agent" | "script" | "checkpoint" | "restore_checkpoint" | "human_gate" | "wait" | "read" | "write" | "workflow" | "fan_out" | "fan_in" | "terminal";
   visit: number;
   attempt: number;
   status: "running" | "completed" | "failed" | "interrupted";
@@ -198,6 +248,11 @@ export interface WorkflowNodeRun {
   output_bytes?: number | null;
   script_path?: string | null;
   working_directory?: string | null;
+  conversation_generation?: number | null;
+  manifest_artifact_id?: string | null;
+  wait?: { wake_at: string; deadline_at: string; delay_seconds: number } | null;
+  metadata_writes?: Record<string, JsonValue>;
+  external_references?: Array<{ type: string; id: string; url: string | null }>;
   input_revision: number;
   telemetry: HarnessTelemetryRecord | null;
   timing: NodeRunTiming;
@@ -231,6 +286,24 @@ export interface WorkflowFanOutFrame {
   source: WorkflowTransitionContext | null;
 }
 
+export interface WorkflowWaitState {
+  workflow_id: string;
+  workflow_revision: string;
+  node_id: string;
+  started_at: string;
+  wake_at: string;
+  deadline_at: string;
+  attempt: number;
+  node_run_id: string;
+}
+
+export interface WorkflowRunLedgerRef {
+  version: 1;
+  ticket_revision: number;
+  run_count: number;
+  sha256: string;
+}
+
 export interface WorkflowRuntime {
   id: string;
   revision: string;
@@ -242,6 +315,7 @@ export interface WorkflowRuntime {
   node_visits: Record<string, number>;
   node_attempts: Record<string, AttemptCounter>;
   node_runs: WorkflowNodeRun[];
+  run_ledger?: WorkflowRunLedgerRef;
   prompt_revisions: Record<string, string>;
   inputs: Record<string, boolean | string>;
   stage_enabled: Record<string, boolean>;
@@ -251,7 +325,17 @@ export interface WorkflowRuntime {
   workflow_revisions?: Record<string, string>;
   workflow_stack?: WorkflowCallFrame[];
   fan_out_stack?: WorkflowFanOutFrame[];
+  wait_states?: Record<string, WorkflowWaitState>;
   resolved_agent_profiles?: Record<string, ResolvedAgentProfile>;
+}
+
+export interface WorkflowAssignment {
+  workflow_id: string;
+  revision: string;
+  version: number;
+  selection: "default" | "manual_trial" | "experiment";
+  assigned_at: string;
+  experiment_id: string | null;
 }
 
 export interface CallbackReceipt {
@@ -265,18 +349,15 @@ export interface TicketFrontmatter {
   title: string;
   phase: Phase;
   status: TicketStatus;
-  spec_required: boolean;
-  review_required: boolean;
-  work_provider: Provider;
-  review_provider: ReviewProvider;
   priority: number;
   labels: string[];
   repositories: RepositoryRef[];
+  attachments: TicketAttachment[];
+  artifacts: TicketArtifactRef[];
+  checkpoints: TicketCheckpoint[];
   assigned_supervisor: string | null;
   assigned_supervisor_host: string | null;
-  agents: Record<"specification" | "implementation" | "review", AgentRef>;
   execution: Execution | null;
-  attempts: Record<"specification" | "implementation" | "review", AttemptCounter>;
   pull_requests: PullRequestRef[];
   questions: TicketQuestion[];
   metadata?: Record<string, JsonValue>;
@@ -284,6 +365,7 @@ export interface TicketFrontmatter {
   production_result: ProductionResult;
   production_assessed_at: string | null;
   production_assessment_note: string | null;
+  estimated_human_days: number | null;
   archived_at: string | null;
   revision: number;
   event_sequence: number;
@@ -291,6 +373,7 @@ export interface TicketFrontmatter {
   updated_at: string;
   last_callback?: CallbackReceipt | null | undefined;
   workflow?: WorkflowRuntime | null | undefined;
+  workflow_assignment?: WorkflowAssignment | null | undefined;
   conversations?: Record<string, AgentRef> | undefined;
 }
 
@@ -314,13 +397,11 @@ export interface TicketSummary {
   title: string;
   phase: Phase;
   status: TicketStatus;
-  work_provider: Provider;
-  review_provider: ReviewProvider;
-  review_required: boolean;
   priority: number;
   provider: Provider | null;
   revision: number;
   created_at: string;
+  updated_at: string;
   valid: boolean;
   errors: string[];
   path: string;
@@ -331,6 +412,10 @@ export interface TicketSummary {
   workflow_node_id: string | null;
   workflow_node_name: string | null;
   workflow_stage_name: string | null;
+  labels: string[];
+  repositories: string[];
+  assigned_supervisor: string | null;
+  estimated_human_days: number | null;
 }
 
 export interface RepositoryClaimBlocker {
@@ -342,28 +427,26 @@ export interface RepositoryClaimBlocker {
 }
 
 export class HttpError extends Error {
-  constructor(public readonly status: number, message: string, public readonly details?: unknown) {
+  readonly code: string;
+  constructor(public readonly status: number, message: string, public readonly details?: unknown, code?: string) {
     super(message);
+    this.code = code ?? errorCode(status, message);
   }
 }
 
-export function requiredProvider(ticket: TicketFrontmatter): Provider | null {
-  if (ticket.phase === "review") return ticket.review_provider;
-  if (ticket.phase === "specification" || ticket.phase === "implementation") return ticket.work_provider;
-  return null;
-}
-
-export function defaultReviewProvider(workProvider: Provider): ReviewProvider {
-  return workProvider === "codex" ? "claude" : "codex";
-}
-
-export function canProviderClaim(ticket: TicketFrontmatter, provider: Provider): boolean {
-  return requiredProvider(ticket) === provider;
-}
-
-export function canSupervisorOwn(ticket: TicketFrontmatter, availableProviders: Provider[]): boolean {
-  if (!availableProviders.includes(ticket.work_provider)) return false;
-  return !ticket.review_required || availableProviders.includes(ticket.review_provider);
+function errorCode(status: number, message: string): string {
+  const normalized = message.toLowerCase();
+  if (normalized.includes("lease") && (normalized.includes("stale") || normalized.includes("unknown") || normalized.includes("no longer retained"))) return "LEASE_STALE";
+  if (normalized.includes("lease") && normalized.includes("interrupt")) return "LEASE_INTERRUPTING";
+  if (normalized.includes("lease")) return "LEASE_CONFLICT";
+  if (normalized.includes("quality report") || normalized.includes("quality") && normalized.includes("schema")) return "QUALITY_REPORT_INVALID";
+  if (normalized.includes("artifact") && normalized.includes("integrity")) return "ARTIFACT_INTEGRITY_FAILED";
+  if (normalized.includes("artifact") && normalized.includes("ownership")) return "ARTIFACT_OWNERSHIP_MISMATCH";
+  if (normalized.includes("artifact") && normalized.includes("not found")) return "ARTIFACT_NOT_FOUND";
+  if (normalized.includes("artifact") && normalized.includes("byte limit")) return "ARTIFACT_TOO_LARGE";
+  if (normalized.includes("artifact") && (normalized.includes("quota") || normalized.includes("references"))) return "ARTIFACT_QUOTA_EXCEEDED";
+  if (normalized.includes("artifact") || normalized.includes("attachment")) return "ARTIFACT_INVALID";
+  return status === 404 ? "NOT_FOUND" : status === 409 ? "CONFLICT" : status === 413 ? "PAYLOAD_TOO_LARGE" : status === 422 ? "VALIDATION_FAILED" : "INTERNAL_ERROR";
 }
 
 export function supervisorReservationActive(ticket: TicketFrontmatter): boolean {
@@ -371,5 +454,5 @@ export function supervisorReservationActive(ticket: TicketFrontmatter): boolean 
 }
 
 export function isProgressed(ticket: TicketFrontmatter): boolean {
-  return !(ticket.status === "pending" && ticket.phase === (ticket.spec_required ? "specification" : "implementation"));
+  return ticket.status !== "pending";
 }

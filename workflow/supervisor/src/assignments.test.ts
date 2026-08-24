@@ -1,9 +1,10 @@
 import { execFile } from "node:child_process";
+import { createHash } from "node:crypto";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { AssignmentBundleWriter } from "./assignments.js";
 import { PromptStore } from "./prompts.js";
 import type { ClaimedTicket } from "./types.js";
@@ -24,14 +25,8 @@ function claimedTicket(): ClaimedTicket {
     markdown: "# Goal\n\nRepair the deployment.\n",
     frontmatter: {
       id: "AGENT-42", title: "Repair deployment", phase: "implementation", status: "running",
-      work_provider: "claude", review_provider: "codex",
       repositories: [{ id: "api service", primary: true }],
       pull_requests: [{ repository: "api service", url: "https://github.com/example/api/pull/42", phase: "implementation" }],
-      agents: {
-        specification: { provider: "claude", herdr_pane_id: null, session_ref: null },
-        implementation: { provider: "claude", herdr_pane_id: null, session_ref: null },
-        review: { provider: "codex", herdr_pane_id: null, session_ref: null },
-      },
       workflow: {
         id: "delivery", revision: "r1", current_node: "repair",
         incoming: {
@@ -47,7 +42,7 @@ function claimedTicket(): ClaimedTicket {
     },
     workflow_node: {
       id: "repair", name: "Repair implementation", type: "agent", phase: "implementation",
-      prompt: "implementation", provider: "work", conversation_key: "work",
+      prompt: "implementation", agent_profile: "default", conversation_key: "work",
       outcomes: [{ id: "repaired", label: "Repair completed", description: "Return to review.", target: "review" }],
       choices: [], exit_codes: [],
     },
@@ -67,7 +62,27 @@ function prompts(): PromptStore {
 
 describe("durable assignment bundles", () => {
   afterEach(async () => {
+    vi.unstubAllGlobals();
     await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
+  });
+
+  it("downloads verified ticket attachments into the durable node-run bundle", async () => {
+    const root = await temporaryRoot();
+    const content = Buffer.from("attached screenshot");
+    const ticket = claimedTicket();
+    ticket.frontmatter.attachments = [{
+      id: "attachment-1", filename: "example.png", content_type: "image/png", size_bytes: content.byteLength,
+      sha256: createHash("sha256").update(content).digest("hex"), created_at: "2026-08-20T00:00:00.000Z",
+    }];
+    const fetcher = vi.fn().mockResolvedValue(new Response(content, { status: 200, headers: { "Content-Type": "image/png" } }));
+    vi.stubGlobal("fetch", fetcher);
+    const bundle = await new AssignmentBundleWriter(root, "worker").prepare(ticket, "http://tracker.test", "/srv/projects", prompts());
+    const localPath = join(bundle.attachmentsDirectory, "attachment-1", "example.png");
+
+    expect(await readFile(localPath)).toEqual(content);
+    expect(await readFile(bundle.startHerePath, "utf8")).toContain(localPath);
+    expect(await readFile(join(bundle.runDirectory, "attachments.md"), "utf8")).toContain("example.png");
+    expect(fetcher).toHaveBeenCalledWith(new URL("http://tracker.test/api/tickets/AGENT-42/attachments/attachment-1/content"));
   });
 
   it("writes one unsanitized node-run directory with complete recovery context", async () => {

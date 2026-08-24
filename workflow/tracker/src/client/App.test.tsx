@@ -4,18 +4,21 @@ import "@testing-library/jest-dom/vitest";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import React from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { stringify } from "yaml";
 import { App } from "./App.js";
 
 const summary = {
   id: "APT-42", title: "UI ticket", phase: "implementation", status: "running",
-  work_provider: "claude", review_provider: "codex", review_required: true,
-  priority: 50, provider: "claude", revision: 7, created_at: "2026-08-14T11:00:00Z", valid: true, errors: [], path: "APT-42.md", claim_blockers: [], archived_at: null, workflow_id: "standard-delivery",
+  priority: 50, provider: "claude", revision: 7, created_at: "2026-08-14T11:00:00Z", updated_at: "2026-08-14T12:01:30Z", valid: true, errors: [], path: "APT-42.md", claim_blockers: [], archived_at: null,
+  labels: ["dashboard"], repositories: ["demo"], assigned_supervisor: "coordinator-vm", estimated_human_days: null,
+  workflow_id: "standard-delivery", workflow_node_id: "implementation", workflow_node_name: "Implementation", workflow_stage_name: "Implementation",
 };
 
 const execution = {
   provider: "claude", phase: "implementation", attempt: 2, supervisor_id: "coordinator-vm",
   claimed_at: "2026-08-14T12:00:00Z", last_heartbeat_at: "2026-08-14T12:01:30Z",
   lease_expires_at: "2026-08-14T12:03:30Z", lease_id: "lease-1", observed_herdr_state: "working", guidance: [],
+  delivery_status: "delivered", delivery_confirmed_at: "2026-08-14T12:00:05Z",
   interrupt_request: null,
   herdr_observation: {
     state: "working", observed_at: "2026-08-14T12:01:30Z", state_changed_at: "2026-08-14T12:00:05Z",
@@ -32,18 +35,13 @@ const detail = {
   valid: true, errors: [],
   frontmatter: {
     id: "APT-42", title: "UI ticket", phase: "implementation", status: "running", revision: 7,
-    spec_required: true, review_required: true, work_provider: "claude", review_provider: "codex", priority: 50, labels: ["dashboard"],
-    repositories: [{ id: "demo", primary: true }], pull_requests: [{ repository: "demo", url: "https://github.com/example/demo/pull/42" }],
+    priority: 50, labels: ["dashboard"],
+    repositories: [{ id: "demo", primary: true }], attachments: [], pull_requests: [{ repository: "demo", url: "https://github.com/example/demo/pull/42" }],
     questions: [], jira: null, archived_at: null,
     created_at: "2026-08-14T11:00:00Z", updated_at: "2026-08-14T12:01:30Z", execution,
     assigned_supervisor: "coordinator-vm",
     assigned_supervisor_host: "worker-vm",
-    attempts: { specification: { total: 1, consecutive_lease_losses: 0 }, implementation: { total: 2, consecutive_lease_losses: 0 }, review: { total: 0, consecutive_lease_losses: 0 } },
-    agents: {
-      specification: { provider: "claude", herdr_pane_id: "w1:p1", session_ref: "session-1" },
-      implementation: { provider: "claude", herdr_pane_id: "w1:p1", session_ref: "session-1" },
-      review: { provider: "codex", herdr_pane_id: null, session_ref: null },
-    },
+    conversations: { work: { provider: "claude", herdr_pane_id: "w1:p1", session_ref: "session-1" } },
   },
 };
 
@@ -54,7 +52,7 @@ const promptFixtures = [
     allowed_tags: ["ticket_id", "phase", "ticket_path", "ticket_markdown", "project_root", "phase_instructions", "callback_base"],
     required_tags: ["ticket_id", "phase", "ticket_path", "ticket_markdown", "phase_instructions", "callback_base"],
     content: "Work {{ticket_id}} in {{phase}} from {{project_root}}.\n\n{{ticket_markdown}}\n\n{{phase_instructions}}\n\nCallback: {{callback_base}} at {{ticket_path}}",
-    revision: "assignment-r1", valid: true, errors: [],
+    revision: "assignment-r1", version: 1, valid: true, errors: [],
     tags: [
       { name: "ticket_id", description: "Stable ticket identifier.", example: "AGENT-0042" },
       { name: "phase", description: "Durable work phase.", example: "implementation" },
@@ -68,7 +66,7 @@ const promptFixtures = [
   ...["specification", "implementation", "review", "guidance", "callback-reminder"].map((name) => ({
     name, title: `${name[0]!.toUpperCase()}${name.slice(1)} instructions`, purpose: `${name} message`,
     trigger: `${name} transition trigger`, stages: [name === "guidance" ? "Live edit" : name],
-    allowed_tags: [], required_tags: [], content: `${name} instructions`, revision: `${name}-r1`, tags: [], valid: true, errors: [],
+    allowed_tags: [], required_tags: [], content: `${name} instructions`, revision: `${name}-r1`, version: 1, tags: [], valid: true, errors: [],
   })),
 ];
 
@@ -83,10 +81,10 @@ const workflowDefinition = {
     { id: "done", name: "Done", phase: "done", skippable: false, default_enabled: true },
   ],
   nodes: [
-    { id: "specification", name: "Specification", type: "agent", phase: "specification", stage: "specification", prompt: "specification", provider: "work", conversation_key: "work", max_visits: 20, outcomes: [{ id: "completed", label: "Specification completed", description: "Ready for approval.", target: "specification-approval" }], choices: [], exit_codes: [] },
-    { id: "specification-approval", name: "Approve specification", type: "human_gate", phase: "specification", stage: "specification", max_visits: 20, outcomes: [], choices: [{ id: "approved", label: "Approve", description: "Continue.", target: "implementation" }, { id: "changes_requested", label: "Request changes", description: "Revise.", target: "specification", comment_required: true }], exit_codes: [] },
-    { id: "implementation", name: "Implementation", type: "agent", phase: "implementation", stage: "implementation", prompt: "implementation", provider: "work", conversation_key: "work", max_visits: 20, outcomes: [{ id: "completed", label: "Implementation completed", description: "Ready for review.", target: "review" }], choices: [], exit_codes: [] },
-    { id: "review", name: "Independent review", type: "agent", phase: "review", stage: "review", prompt: "review", provider: "review", conversation_key: "review", max_visits: 20, outcomes: [{ id: "approved", label: "Approve", description: "Finish.", target: "done" }, { id: "changes_requested", label: "Request changes", description: "Repair.", target: "implementation" }], choices: [], exit_codes: [] },
+    { id: "specification", name: "Specification", type: "agent", phase: "specification", stage: "specification", prompt: "specification", agent_profile: "default", conversation_key: "work", max_visits: 20, outcomes: [{ id: "completed", label: "Specification completed", description: "Ready for approval.", target: "specification-approval" }], choices: [], exit_codes: [] },
+    { id: "specification-approval", name: "Approve specification", type: "human_gate", phase: "specification", stage: "specification", max_visits: 20, github_watch: { pull_request_phase: "specification", feedback_outcome: "changes_requested" }, outcomes: [], choices: [{ id: "approved", label: "Approve", description: "Continue.", target: "implementation" }, { id: "changes_requested", label: "Request changes", description: "Revise.", target: "specification", comment_required: true }], exit_codes: [] },
+    { id: "implementation", name: "Implementation", type: "agent", phase: "implementation", stage: "implementation", prompt: "implementation", agent_profile: "default", conversation_key: "work", max_visits: 20, outcomes: [{ id: "completed", label: "Implementation completed", description: "Ready for review.", target: "review" }], choices: [], exit_codes: [] },
+    { id: "review", name: "Independent review", type: "agent", phase: "review", stage: "review", prompt: "review", agent_profile: "review", conversation_key: "review", max_visits: 20, outcomes: [{ id: "approved", label: "Approve", description: "Finish.", target: "done" }, { id: "changes_requested", label: "Request changes", description: "Repair.", target: "implementation" }], choices: [], exit_codes: [] },
     { id: "done", name: "Done", type: "terminal", phase: "done", stage: "done", terminal_status: "completed", outcomes: [], choices: [], exit_codes: [] },
   ],
 };
@@ -94,7 +92,7 @@ const workflowDefinition = {
 const workflowFixture = {
   definition: workflowDefinition,
   content: JSON.stringify(workflowDefinition, null, 2),
-  revision: "workflow-r1", valid: true, errors: [], referenced_prompts: ["specification", "implementation", "review"],
+  revision: "workflow-r1", version: 1, valid: true, errors: [], referenced_prompts: ["specification", "implementation", "review"],
 };
 
 const metricsFixture = {
@@ -103,21 +101,25 @@ const metricsFixture = {
   totals: {
     tickets: 1, completed: 1, archived: 0, total_tokens: 1_100, known_cost_usd: 0.02,
     active_ms: 90_000, quota_paused_ms: 30_000, human_wait_ms: 60_000,
+    estimated_human_days: 2, estimated_human_cost_usd: 2_000, human_day_rate_usd: 1_000,
+    comparison_tickets: 1, comparison_human_cost_usd: 2_000, comparison_factory_cost_usd: 0.02,
+    comparison_savings_usd: 1_999.98, comparison_savings_rate: 0.99999,
     production: { unassessed: 0, succeeded: 1, failed: 0, rolled_back: 0, not_deployed: 0 },
     production_assessed: 1, production_success_rate: 1,
   },
   coverage: { agent_runs: 1, token_runs: 1, cost_runs: 1, estimated_cost_runs: 0, complete_token_tickets: 1, complete_cost_tickets: 1 },
-  summaries: Object.fromEntries(["ticket_duration_ms", "active_time_ms", "human_wait_ms", "quota_pause_ms", "tokens_per_ticket", "cost_per_ticket_usd"].map((key) => [key, { count: 1, min: 1, q1: 1, median: 1, q3: 1, max: 1, mean: 1, p90: 1, p95: 1 }])),
+  summaries: Object.fromEntries(["ticket_duration_ms", "active_time_ms", "human_wait_ms", "quota_pause_ms", "tokens_per_ticket", "cost_per_ticket_usd", "estimated_human_days", "estimated_human_cost_usd"].map((key) => [key, { count: 1, min: 1, q1: 1, median: 1, q3: 1, max: 1, mean: 1, p90: 1, p95: 1 }])),
   workflows: [{
     workflow_id: "standard-delivery", workflow_revision: "workflow-r1", ticket_count: 1,
     nodes: [{
       workflow_id: "standard-delivery", workflow_revision: "workflow-r1", node_id: "implementation", node_name: "Implementation", node_type: "agent",
-      ticket_count: 1, runs: 1, completed: 1, running: 0, interrupted: 0, bypassed: 0, lease_lost: 0,
+      ticket_count: 1, runs: 1, completed: 1, running: 0, interrupted: 0, bypassed: 0, lease_lost: 0, delivery_failed: 0,
       classifications: { success: 1, failure: 0, neutral: 0, unclassified: 0 }, success_rate: 1,
       wall_ms: { count: 1, min: 90_000, q1: 90_000, median: 90_000, q3: 90_000, max: 90_000, mean: 90_000, p90: 90_000, p95: 90_000 },
       active_ms: 90_000, quota_paused_ms: 30_000, human_wait_ms: 0, total_tokens: 1_100, known_cost_usd: 0.02,
       telemetry_coverage: { token_runs: 1, cost_runs: 1, total_runs: 1 },
       branches: [{ outcome: "completed", label: "Completed", target: "done", metric_class: "success", count: 1, rate: 1 }],
+      quality: [{ key: "coverage.line_percent", label: "Line coverage", type: "number", unit: "percent", direction: "higher_is_better", ticket_count: 1, reports: 1, statuses: { pass: 1, warn: 0, fail: 0, unknown: 0 }, pass_rate: 1, numeric: { count: 1, min: 84, q1: 84, median: 84, q3: 84, max: 84, mean: 84, p90: 84, p95: 84 }, values: [{ value: "84", count: 1 }] }],
     }],
   }],
   profiles: [{ alias: "default", provider: "claude", model: "opus", reasoning: "high", runs: 1, success: 1, failure: 0, success_rate: 1, total_tokens: 1_100, known_cost_usd: 0.02, token_runs: 1, cost_runs: 1, wall_ms: { count: 1, min: 90_000, q1: 90_000, median: 90_000, q3: 90_000, max: 90_000, mean: 90_000, p90: 90_000, p95: 90_000 } }],
@@ -143,16 +145,51 @@ describe("operator UI", () => {
   let current: any = structuredClone(detail);
   let claimBlockers: any[] = [];
   let trackerConfig: any;
+  let quotaReport: any;
   let prompts: any[];
   let workflows: any[];
+  let workflowReleases: any;
+  let intakeOverview: any;
   beforeEach(() => {
     installLocalStorage();
     document.documentElement.removeAttribute("data-theme");
     current = structuredClone(detail);
+    current.workflow_definition = structuredClone(workflowDefinition);
+    current.workflow_node = structuredClone(workflowDefinition.nodes.find((node) => node.id === "implementation"));
+    current.resolved_agent_profile = { alias: "default", provider: "claude", model: "claude-opus", reasoning: "high" };
+    current.frontmatter.workflow = {
+      id: "standard-delivery", revision: "workflow-r1", active_workflow_id: "standard-delivery", current_node: "implementation",
+      transition_count: 1, started_at: "2026-08-14T11:00:00Z", completed_at: null, current_node_entered_at: "2026-08-14T12:00:00Z",
+      node_visits: { implementation: 1 }, node_attempts: { implementation: { total: 2, consecutive_lease_losses: 0 } },
+      prompt_revisions: {}, workflow_revisions: { "standard-delivery": "workflow-r1" }, inputs: {},
+      stage_enabled: { specification: true, implementation: true, review: true, done: true }, incoming: null,
+      node_runs: [], workflow_stack: [], fan_out_stack: [],
+      resolved_agent_profiles: {
+        "standard-delivery/specification": { alias: "default", provider: "claude", model: "claude-opus", reasoning: "high" },
+        "standard-delivery/implementation": { alias: "default", provider: "claude", model: "claude-opus", reasoning: "high" },
+        "standard-delivery/review": { alias: "review", provider: "codex", model: "gpt-5.6-sol", reasoning: "high" },
+      },
+    };
     claimBlockers = [];
     prompts = structuredClone(promptFixtures);
     workflows = [structuredClone(workflowFixture)];
-    trackerConfig = { version: 1, revision: 2, updated_at: "2026-08-14T12:00:00Z", tickets: { id_prefix: "AGENT", next_number: 1 }, providers: { enabled: ["claude", "codex"] }, repositories: [{ id: "demo", url: "git@github.com:example/demo.git" }], jira: { enabled: false, site_url: "", project_key: "", issue_type: "Task" }, github: { observation_enabled: false, observation_interval_minutes: 30, ignored_logins: [] } };
+    workflowReleases = { catalog: { version: 1, revision: 1, updated_at: "2026-08-14T12:00:00Z", default_workflow_id: "standard-delivery", workflows: { "standard-delivery": { default_revision: "workflow-r1" } } }, releases: [{ workflow_id: "standard-delivery", revision: "workflow-r1", version: 1, label: "Initial release", status: "active", published_at: "2026-08-14T12:00:00Z", parent_revision: null, is_default: true, definition: structuredClone(workflowDefinition) }] };
+    trackerConfig = { version: 1, revision: 2, updated_at: "2026-08-14T12:00:00Z", tickets: { id_prefix: "AGENT", next_number: 1 }, providers: { enabled: ["claude", "codex"] }, agent_profiles: { default: "default", profiles: [{ id: "default", label: "Default", provider: "claude", model: "claude-opus", reasoning: "high" }, { id: "review", label: "Independent review", provider: "codex", model: "gpt-5.6-sol", reasoning: "high" }] }, repositories: [{ id: "demo", url: "git@github.com:example/demo.git" }], jira: { enabled: false, site_url: "", project_key: "", issue_type: "Task" }, github: { observation_enabled: false, observation_interval_minutes: 30, ignored_logins: [] }, pricing: { estimate_missing_costs: true, models: [{ id: "codex-gpt-5.6-sol", provider: "codex", model: "gpt-5.6-sol", input_per_million_usd: 5, cached_input_per_million_usd: 0.5, cache_write_input_per_million_usd: 6.25, output_per_million_usd: 30, source_url: "https://developers.openai.com/api/docs/models/gpt-5.6-sol", effective_at: "2026-08-19" }] }, metrics: { human_day_rate_usd: 1_000, quota_account_aliases: {} } };
+    quotaReport = { generated_at: "2026-08-20T12:00:00Z", accounts: [{
+      account_id: "coordinator-vm", supervisor_ids: ["coordinator-vm"], provider: "codex", limit_id: "codex:primary", status: "estimated",
+      used_percent: 31, window_minutes: 10_080, resets_at: "2026-08-27T04:25:50Z", observed_at: "2026-08-20T12:00:00Z", plan_types: ["prolite"],
+      estimated_weekly_tokens: 100_000_000, estimated_weekly_api_usd: 200, token_samples: 3, cost_samples: 3, direct_samples: 2, percentage_points_observed: 4, confidence: "medium",
+    }, {
+      account_id: "coordinator-vm", supervisor_ids: ["coordinator-vm"], provider: "claude", limit_id: "seven_day", status: "estimated",
+      used_percent: 45, window_minutes: 10_080, resets_at: "2026-08-27T04:25:50Z", observed_at: "2026-08-20T12:00:00Z", plan_types: [],
+      estimated_weekly_tokens: 80_000_000, estimated_weekly_api_usd: 150, token_samples: 2, cost_samples: 2, direct_samples: 2, percentage_points_observed: 3, confidence: "medium",
+    }] };
+    const campaignDefinition = { version: 1, id: "continuous-improvement", name: "Continuous improvement", description: "Improve the demo.", enabled: true, limits: { max_new_per_run: 100, max_new_per_day: 100, max_open: 50, max_working: 10, max_observed_unarchived: 100 }, success_policy: {} };
+    intakeOverview = {
+      generated_at: "2026-08-20T12:00:00Z", totals: { campaigns: 1, enabled_campaigns: 1, invalid_campaigns: 0, sources: 0, enabled_sources: 0, invalid_sources: 0, runs: 0, preview_runs: 0, running_runs: 0, failed_runs: 0, candidates: 0, admitted: 0, deferred: 0, rejected: 0 },
+      campaigns: [{ id: campaignDefinition.id, name: campaignDefinition.name, revision: "campaign-r1", enabled: true, sources: 0, runs: 0, successful_runs: 0, failed_runs: 0, candidates: 0, admitted: 0, deferred: 0, open_tickets: 0, working_tickets: 0, completed_tickets: 0, production_successes: 0 }],
+      sources: [], recent_runs: [], recent_candidates: [], source_documents: [], campaign_documents: [{ definition: campaignDefinition, content: stringify(campaignDefinition, { lineWidth: 0 }), revision: "campaign-r1", valid: true, errors: [] }],
+    };
     vi.stubGlobal("EventSource", FakeEventSource);
     vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const path = String(input);
@@ -164,6 +201,7 @@ describe("operator UI", () => {
         ticket_id: current.id, title: current.frontmatter.title, phase: current.frontmatter.phase, status: current.frontmatter.status,
         provider: "claude", attempt: 2, claimed_at: execution.claimed_at, last_heartbeat_at: execution.last_heartbeat_at,
         lease_expires_at: execution.lease_expires_at, consecutive_lease_losses: 0, pane_id: "w1:p1", session_ref: "session-1", herdr: execution.herdr_observation,
+        delivery_status: current.frontmatter.execution.delivery_status, delivery_confirmed_at: current.frontmatter.execution.delivery_confirmed_at,
         telemetry: current.frontmatter.execution.telemetry ?? null,
       }] : [] });
       if (path === "/api/supervisors" && !init?.method) return Response.json({ supervisors: [{
@@ -173,26 +211,50 @@ describe("operator UI", () => {
         last_seen_at: "2026-08-14T12:01:30Z", status: "online",
         assigned_ticket: { id: "APT-42", title: "UI ticket", phase: current.frontmatter.phase, status: current.frontmatter.status },
       }] });
+      if (path === "/api/operations" && !init?.method) return Response.json({
+        status: "ready", ready: true, checked_at: "2026-08-14T12:01:30Z", failures: [], warnings: [],
+        ticket_store: { root: "/srv/tickets", writable: true, ticket_count: 1, valid_tickets: 1, invalid_tickets: 0, index_generation: 3, index_rebuilt_at: "2026-08-14T12:01:00Z", watcher_enabled: true, disk: { total_bytes: 100_000, free_bytes: 50_000, available_bytes: 40_000 } },
+        libraries: { configuration_revision: 2, prompts: 6, invalid_prompts: [], workflows: 1, invalid_workflows: [] },
+        background_operations: {
+          github_observation: { in_progress: false, last_started_at: "2026-08-14T12:00:00Z", last_succeeded_at: "2026-08-14T12:00:01Z", last_failed_at: null, last_duration_ms: 1_000, last_error: null, details: { checked: 1 } },
+          artifact_maintenance: { in_progress: false, last_started_at: null, last_succeeded_at: null, last_failed_at: null, last_duration_ms: null, last_error: null, details: {} },
+        },
+      });
+      if (path.startsWith("/api/metrics/compare") && !init?.method) {
+        const summary = { count: 1, min: 1, q1: 1, median: 1, q3: 1, max: 1, mean: 1, p90: 1, p95: 1 };
+        const arm = (revision: string) => ({ workflow_id: "standard-delivery", workflow_revision: revision, cohort: { assigned: 1, completed: 1, failed: 0, cancelled: 0, blocked: 0, in_progress: 0, crossover: 0, efficiency_eligible: 1 }, completion_rate: 1, production_success_rate: 1, coverage: { cost_tickets: 1, token_tickets: 1, eligible_tickets: 1 }, totals: { known_cost_usd: 1, known_tokens: 100, active_ms: 1, human_wait_ms: 0, quota_paused_ms: 0 }, summaries: { ticket_duration_ms: summary, active_time_ms: summary, human_wait_ms: summary, quota_pause_ms: summary, cost_per_ticket_usd: summary, tokens_per_ticket: summary, node_visits: summary }, nodes: metricsFixture.workflows[0]!.nodes });
+        return Response.json({ generated_at: "2026-08-18T13:00:00Z", left: arm("workflow-r1"), right: arm("workflow-r2"), deltas: Object.fromEntries(["completion_rate", "production_success_rate", "median_cost_usd", "median_tokens", "median_duration_ms", "median_active_ms"].map((key) => [key, { absolute: 0, percent: 0 }])) });
+      }
       if (path.startsWith("/api/metrics") && !init?.method) return Response.json(metricsFixture);
-      if (path === "/api/config" && !init?.method) return Response.json({ config: trackerConfig });
+      if (path === "/api/intake" && !init?.method) return Response.json(intakeOverview);
+      if (path === "/api/config" && !init?.method) return Response.json({ config: trackerConfig, quota: quotaReport });
       if (path === "/api/prompts" && !init?.method) return Response.json({ prompts });
       if (path === "/api/prompts" && init?.method === "POST") {
         const payload = JSON.parse(String(init.body));
-        const prompt = { name: payload.name, title: payload.name.replaceAll("-", " "), purpose: "Reusable workflow-node instructions.", trigger: "Workflow agent node", stages: ["Workflow agent node"], allowed_tags: [], required_tags: [], tags: [], content: `${payload.content.trim()}\n`, revision: `${payload.name}-r1`, valid: true, errors: [], workflow_references: [] };
+        const prompt = { name: payload.name, title: payload.name.replaceAll("-", " "), purpose: "Reusable workflow-node instructions.", trigger: "Workflow agent node", stages: ["Workflow agent node"], allowed_tags: [], required_tags: [], tags: [], content: `${payload.content.trim()}\n`, revision: `${payload.name}-r1`, version: 1, valid: true, errors: [], workflow_references: [] };
         prompts.push(prompt); return Response.json({ prompt }, { status: 201 });
       }
       if (path === "/api/workflows" && !init?.method) return Response.json({ workflows });
+      if (path === "/api/workflow-releases" && !init?.method) return Response.json(workflowReleases);
       if (path === "/api/workflows" && init?.method === "POST") {
         const payload = JSON.parse(String(init.body));
         const definition = (await import("yaml")).parse(payload.content);
         const workflow = { definition, content: payload.content, revision: `${definition.id}-r1`, valid: true, errors: [], referenced_prompts: definition.nodes.filter((node: any) => node.prompt).map((node: any) => node.prompt) };
-        workflows.push(workflow); return Response.json({ workflow }, { status: 201 });
+        workflows.push(workflow); workflowReleases.releases.push({ workflow_id: definition.id, revision: workflow.revision, version: 1, label: payload.label || "v1", status: "active", published_at: new Date().toISOString(), parent_revision: null, is_default: true, definition }); return Response.json({ workflow }, { status: 201 });
       }
       if (path.startsWith("/api/workflows/") && init?.method === "PUT") {
         const payload = JSON.parse(String(init.body));
         const definition = (await import("yaml")).parse(payload.content);
         const workflow = { definition, content: payload.content, revision: `${definition.id}-r2`, valid: true, errors: [], referenced_prompts: definition.nodes.filter((node: any) => node.prompt).map((node: any) => node.prompt) };
-        workflows = workflows.map((item) => item.definition.id === definition.id ? workflow : item); return Response.json({ workflow });
+        workflows = workflows.map((item) => item.definition.id === definition.id ? workflow : item);
+        if (payload.make_default) workflowReleases.releases.forEach((release: any) => {
+          if (release.workflow_id === definition.id) {
+            release.is_default = false;
+            if (release.status === "active") release.status = "retired";
+          }
+        });
+        workflowReleases.releases.push({ workflow_id: definition.id, revision: workflow.revision, version: 2, label: payload.label || "v2", status: payload.make_default ? "active" : "trial", published_at: new Date().toISOString(), parent_revision: "workflow-r1", is_default: payload.make_default, definition });
+        return Response.json({ workflow });
       }
       if (path.startsWith("/api/prompts/") && path.endsWith("/preview") && init?.method === "POST") {
         const payload = JSON.parse(String(init.body));
@@ -209,11 +271,28 @@ describe("operator UI", () => {
       if (path === "/api/config" && init?.method === "PUT") {
         const payload = JSON.parse(String(init.body));
         trackerConfig = { ...trackerConfig, ...payload, revision: trackerConfig.revision + 1 };
-        return Response.json({ config: trackerConfig });
+        return Response.json({ config: trackerConfig, quota: quotaReport });
+      }
+      if (path.startsWith("/api/tickets/APT-42/attachments?") && init?.method === "POST") {
+        const file = init.body as File;
+        current.frontmatter.attachments.push({ id: "attachment-1", filename: new URL(path, "http://test").searchParams.get("filename"), content_type: init.headers && (init.headers as Record<string, string>)["X-Attachment-Content-Type"], size_bytes: file.size, sha256: "a".repeat(64), created_at: "2026-08-20T00:00:00Z" });
+        current.frontmatter.revision += 1;
+        return Response.json(current, { status: 201 });
+      }
+      if (path === "/api/tickets/APT-42/attachments/attachment-1" && init?.method === "DELETE") {
+        current.frontmatter.attachments = [];
+        current.frontmatter.revision += 1;
+        return Response.json(current);
       }
       if (path === "/api/tickets/APT-42" && !init?.method) return Response.json(current);
       if (path === "/api/tickets/APT-42" && init?.method === "PUT") {
         current = { ...current, markdown: String(JSON.parse(String(init.body)).markdown) };
+        return Response.json(current);
+      }
+      if (path === "/api/tickets/APT-42/workflow/migrate" && init?.method === "POST") {
+        const payload = JSON.parse(String(init.body));
+        current.frontmatter.workflow.current_node = payload.node_id;
+        current.workflow_node = structuredClone(workflowDefinition.nodes.find((node) => node.id === payload.node_id));
         return Response.json(current);
       }
       if (path === "/api/tickets/APT-42/priority" && init?.method === "POST") {
@@ -273,10 +352,36 @@ describe("operator UI", () => {
     expect(await screen.findByRole("button", { name: "Use Retro Hacker theme" })).toHaveAttribute("aria-pressed", "true");
   });
 
+  it("authors campaigns and sources through structured intake forms while retaining advanced YAML", async () => {
+    // Arrange and execute
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: "Intake" }));
+    expect(await screen.findByRole("heading", { name: "Campaigns & intake" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /Campaign/ }));
+
+    // Verify campaign form
+    expect(screen.getByLabelText("Campaign ID")).toHaveValue("new-campaign");
+    expect(screen.getByLabelText("Campaign name")).toHaveValue("New campaign");
+    expect(screen.getByLabelText("New per run")).toHaveValue(100);
+    fireEvent.click(screen.getByRole("button", { name: "Performance" }));
+    expect(screen.getByLabelText("Campaign ID")).toHaveValue("performance-improvement");
+    expect((screen.getByLabelText("Intake definition YAML") as HTMLTextAreaElement).value).toContain("performance-improvement");
+
+    // Execute and verify source form
+    fireEvent.click(screen.getByRole("button", { name: "Close" }));
+    fireEvent.click(screen.getByRole("button", { name: /Source/ }));
+    expect(screen.getByLabelText("Source campaign")).toHaveValue("continuous-improvement");
+    expect(screen.getByLabelText("Source workflow")).toHaveValue("standard-delivery");
+    expect(screen.getByLabelText("Source repository 1")).toHaveAttribute("list", "intake-repository-catalog");
+    fireEvent.click(screen.getByRole("button", { name: /New relic/i }));
+    expect(screen.getByLabelText("Source language")).toHaveValue("python");
+    expect(screen.getByRole("button", { name: "Save & test discovery" })).toBeEnabled();
+  });
+
   it("presents a live ticket as a workflow-focused issue instead of a raw editor", async () => {
     render(<App />);
     fireEvent.click(await screen.findByRole("button", { name: /UI ticket/i }));
-    expect(await screen.findByRole("heading", { name: "Path to completion" })).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: "Standard delivery" })).toBeInTheDocument();
     expect(screen.getByText("Running tests")).toBeInTheDocument();
     expect(screen.getByText("/srv/projects/demo")).toBeInTheDocument();
     expect(screen.getByText("herdr:claude · id")).toBeInTheDocument();
@@ -285,6 +390,113 @@ describe("operator UI", () => {
     expect(screen.getByRole("link", { name: /Open draft PR/i })).toHaveAttribute("href", "https://github.com/example/demo/pull/42");
     expect(screen.queryByLabelText("Raw ticket Markdown")).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Save ticket" })).not.toBeInTheDocument();
+  });
+
+  it("separates assignment delivery from neutral Herdr idle observations", async () => {
+    current.frontmatter.execution.delivery_status = "delivered";
+    current.frontmatter.execution.delivery_confirmed_at = "2026-08-14T12:00:05Z";
+    current.frontmatter.execution.observed_herdr_state = "idle";
+    current.frontmatter.execution.herdr_observation = {
+      ...current.frontmatter.execution.herdr_observation,
+      state: "idle",
+    };
+
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: /UI ticket/i }));
+
+    expect(await screen.findByText("Herdr observation")).toBeInTheDocument();
+    expect(screen.getAllByText("Idle").length).toBeGreaterThan(0);
+    expect(screen.queryByText("Agent settled without a ticket callback")).not.toBeInTheDocument();
+    expect(screen.queryByText("Preparing the agent and confirming assignment delivery.")).not.toBeInTheDocument();
+  });
+
+  it("shows an agent claim as starting until prompt delivery is confirmed", async () => {
+    current.frontmatter.execution.delivery_status = "starting";
+    current.frontmatter.execution.delivery_confirmed_at = null;
+
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: /UI ticket/i }));
+
+    expect(await screen.findByText("Preparing the agent and confirming assignment delivery.")).toBeInTheDocument();
+    expect(screen.getByText("Pending")).toBeInTheDocument();
+  });
+
+  it("browses complete ticket evidence, provenance, and run history from one view", async () => {
+    const timing = { active_ms: 1_000, quota_paused_ms: 0, human_wait_ms: 0, external_wait_ms: 0, state: "active", last_accounted_at: null, pause_limit_id: null, pause_until: null };
+    current.frontmatter.workflow.node_runs = Array.from({ length: 13 }, (_, index) => ({
+      id: `run-${index}`, workflow_revision: "workflow-r1", node_id: index === 0 ? "historic-run" : "implementation", node_type: index === 12 ? "script" : "agent",
+      visit: index + 1, attempt: 1, status: "completed", outcome: "completed", summary: `Run ${index} finished.`,
+      started_at: "2026-08-14T11:00:00Z", completed_at: "2026-08-14T11:01:00Z", lease_id: `lease-${index}`, telemetry: null, timing,
+      ...(index === 12 ? { supervisor_id: "worker-a", provider: "claude", input_revision: 7, conversation_generation: 2, output_path: ".runs/output.log", output_bytes: 2_048, manifest_artifact_id: "execution-manifest" } : {}),
+    }));
+    current.frontmatter.artifacts = [
+      { id: "execution-manifest", kind: "execution_manifest", ticket_id: "APT-42", node_run_id: "run-12", filename: "run-12.execution-manifest.json", content_type: "application/json", size_bytes: 900, sha256: "a".repeat(64), created_at: "2026-08-14T11:04:00Z", metadata: {} },
+      { id: "script-report", kind: "script_artifact", ticket_id: "APT-42", node_run_id: "run-12", filename: "verification.html", content_type: "text/html", size_bytes: 1_024, sha256: "b".repeat(64), created_at: "2026-08-14T11:03:00Z", metadata: {} },
+      { id: "checkpoint-manifest", kind: "checkpoint_manifest", ticket_id: "APT-42", node_run_id: "run-12", filename: "checkpoint-1.json", content_type: "application/json", size_bytes: 500, sha256: "c".repeat(64), created_at: "2026-08-14T11:02:00Z", metadata: {} },
+      { id: "checkpoint-bundle", kind: "checkpoint_bundle", ticket_id: "APT-42", node_run_id: "run-12", filename: "demo.bundle", content_type: "application/x-git-bundle", size_bytes: 4_096, sha256: "d".repeat(64), created_at: "2026-08-14T11:01:00Z", metadata: {} },
+    ];
+    current.frontmatter.checkpoints = [{ id: "checkpoint-1", label: "Before release", kind: "workflow", node_id: "implementation", node_run_id: "run-12", created_at: "2026-08-14T11:02:00Z", manifest_artifact_id: "checkpoint-manifest", repositories: [{ repository: "demo", head_sha: "1".repeat(40), snapshot_sha: "2".repeat(40), branch: "main", remote_url: "https://github.com/example/demo.git", dirty: true, bundle_artifact_id: "checkpoint-bundle" }] }];
+    current.frontmatter.attachments = [{ id: "attachment-1", filename: "requirements.txt", content_type: "text/plain", size_bytes: 42, sha256: "e".repeat(64), created_at: "2026-08-14T10:00:00Z" }];
+
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: /UI ticket/i }));
+    const evidence = (await screen.findByRole("heading", { name: "Evidence & artifacts" })).closest("section")!;
+
+    expect(within(evidence).getByText("verification.html")).toBeInTheDocument();
+    const manifestRow = within(evidence).getByText("run-12.execution-manifest.json").closest("article")!;
+    expect(within(manifestRow).getByRole("link", { name: "Download" })).toHaveAttribute("href", "/api/tickets/APT-42/artifacts/execution-manifest/content?download=true");
+    fireEvent.click(within(evidence).getByRole("tab", { name: /Run history/ }));
+    expect(evidence.querySelectorAll(".run-evidence")).toHaveLength(13);
+    expect(within(evidence).getByText("Historic Run")).toBeInTheDocument();
+    expect(within(evidence).getByText("worker-a · Claude")).toBeInTheDocument();
+    expect(within(evidence).getByText("workflow-r1 · ticket r7")).toBeInTheDocument();
+    fireEvent.click(within(evidence).getByRole("tab", { name: /Manifests/ }));
+    expect(within(evidence).getByText("run-12.execution-manifest.json")).toBeInTheDocument();
+    expect(within(evidence).getByText("checkpoint-1.json")).toBeInTheDocument();
+    fireEvent.click(within(evidence).getByRole("tab", { name: /Outputs/ }));
+    expect(within(evidence).getByRole("link", { name: /Implementation output/ })).toHaveAttribute("href", "/api/tickets/APT-42/runs/run-12/output");
+    fireEvent.click(within(evidence).getByRole("tab", { name: /Checkpoints/ }));
+    expect(within(evidence).getByText("Before release")).toBeInTheDocument();
+    expect(within(evidence).getByRole("link", { name: "Bundle" })).toHaveAttribute("href", "/api/tickets/APT-42/artifacts/checkpoint-bundle/content?download=true");
+    fireEvent.click(within(evidence).getByRole("tab", { name: /Attachments/ }));
+    expect(within(evidence).getByText("requirements.txt")).toBeInTheDocument();
+    expect(within(evidence).getByLabelText("Add ticket attachments")).toBeInTheDocument();
+  });
+
+  it("shows normalized quality evidence from immutable YAML artifacts", async () => {
+    current.frontmatter.workflow.node_runs = [{ id: "quality-run", workflow_revision: "workflow-r1", node_id: "implementation", node_type: "script", visit: 1, attempt: 1, status: "completed", outcome: "success", summary: "Verified", started_at: "2026-08-14T11:30:00Z", completed_at: "2026-08-14T11:31:00Z", lease_id: "quality-lease", telemetry: null, timing: { active_ms: 60_000, quota_paused_ms: 0, human_wait_ms: 0, external_wait_ms: 0, state: "active", last_accounted_at: null, pause_limit_id: null, pause_until: null } }];
+    current.frontmatter.artifacts = [{ id: "quality-artifact", kind: "quality_report", ticket_id: "APT-42", node_run_id: "quality-run", filename: "quality.yaml", content_type: "application/yaml", size_bytes: 100, sha256: "a".repeat(64), created_at: "2026-08-14T11:31:00Z", metadata: { quality_report: { schema: "agentic-quality/v1", name: "Verification", subject: { type: "repository", repository: "demo" }, attributes: [{ key: "coverage.line_percent", label: "Line coverage", value: 84.2, type: "number", unit: "percent", direction: "higher_is_better", target: 80, status: "pass", registered: true }] } } }];
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: /UI ticket/i }));
+    expect(await screen.findByRole("heading", { name: "Quality" })).toBeInTheDocument();
+    expect(screen.getByText("Line coverage")).toBeInTheDocument();
+    expect(screen.getByText("84.2 percent")).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "YAML ↗" })).toHaveAttribute("href", "/api/tickets/APT-42/artifacts/quality-artifact/content");
+  });
+
+  it("shows only the newest quality observation for the same node, subject, and attribute", async () => {
+    // Arrange
+    current.frontmatter.workflow.node_runs = [{ id: "quality-run", workflow_revision: "workflow-r1", node_id: "implementation", node_type: "script", visit: 1, attempt: 1, status: "completed", outcome: "success", summary: "Verified", started_at: "2026-08-14T11:30:00Z", completed_at: "2026-08-14T11:32:00Z", lease_id: "quality-lease", telemetry: null, timing: { active_ms: 120_000, quota_paused_ms: 0, human_wait_ms: 0, external_wait_ms: 0, state: "active", last_accounted_at: null, pause_limit_id: null, pause_until: null } }];
+    const report = (value: number, registered: boolean, repository = "demo") => ({ schema: "agentic-quality/v1", name: "Verification", subject: { type: "repository", repository }, attributes: [{ key: "coverage.line_percent", label: "Line coverage", value, type: "number", unit: "percent", direction: "higher_is_better", target: 80, status: value >= 80 ? "pass" : "fail", registered }] });
+    current.frontmatter.artifacts = [
+      { id: "quality-old", kind: "quality_report", ticket_id: "APT-42", node_run_id: "quality-run", filename: "old.yaml", content_type: "application/yaml", size_bytes: 100, sha256: "a".repeat(64), created_at: "2026-08-14T11:31:00Z", metadata: { quality_report: report(55, true) } },
+      { id: "quality-new", kind: "quality_report", ticket_id: "APT-42", node_run_id: "quality-run", filename: "new.yaml", content_type: "application/yaml", size_bytes: 100, sha256: "b".repeat(64), created_at: "2026-08-14T11:32:00Z", metadata: { quality_report: report(88, false) } },
+      { id: "quality-other", kind: "quality_report", ticket_id: "APT-42", node_run_id: "quality-run", filename: "other.yaml", content_type: "application/yaml", size_bytes: 100, sha256: "c".repeat(64), created_at: "2026-08-14T11:33:00Z", metadata: { quality_report: report(77, true, "shared") } },
+    ];
+
+    // Act
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: /UI ticket/i }));
+
+    // Assert
+    expect(await screen.findByText("88 percent")).toBeInTheDocument();
+    expect(screen.getByText("77 percent")).toBeInTheDocument();
+    expect(screen.queryByText("55 percent")).not.toBeInTheDocument();
+    expect(screen.getByText(/unregistered/)).toBeInTheDocument();
+    expect(screen.getAllByRole("link", { name: "YAML ↗" }).map((link) => link.getAttribute("href"))).toEqual(expect.arrayContaining([
+      "/api/tickets/APT-42/artifacts/quality-new/content",
+      "/api/tickets/APT-42/artifacts/quality-other/content",
+    ]));
   });
 
   it("shows exact harness model, reasoning, node usage, and ticket cost coverage", async () => {
@@ -312,21 +524,37 @@ describe("operator UI", () => {
     expect(screen.getAllByText("$0.02").length).toBeGreaterThan(0);
     expect(screen.getByText(/Cost coverage: 1\/1/)).toBeInTheDocument();
     expect(screen.getByText("Quota paused")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("tab", { name: /Run history/ }));
     expect(screen.getAllByText(/30s quota paused/).length).toBeGreaterThan(0);
   });
 
   it("orders the queue by priority and allows priority changes while a ticket is live", async () => {
     render(<App />);
-    expect(await screen.findByRole("heading", { name: /Priority order/i })).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: /Ticket queue/i })).toBeInTheDocument();
     fireEvent.click(await screen.findByRole("button", { name: /UI ticket/i }));
     const priority = await screen.findByLabelText("Ticket priority");
     expect(priority).toHaveValue(50);
     fireEvent.change(priority, { target: { value: "75" } });
-    fireEvent.click(screen.getByRole("button", { name: "Update" }));
+    fireEvent.click(within(priority.parentElement!).getByRole("button", { name: "Update" }));
     await waitFor(() => expect(fetch).toHaveBeenCalledWith("/api/tickets/APT-42/priority", expect.objectContaining({
       method: "POST", body: expect.stringContaining('"priority":75'),
     })));
     expect(await screen.findByLabelText("Ticket priority")).toHaveValue(75);
+  });
+
+  it("uploads ticket attachments from a live ticket and displays their metadata", async () => {
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: /UI ticket/i }));
+    fireEvent.click(await screen.findByRole("tab", { name: /Attachments/ }));
+    const input = await screen.findByLabelText("Add ticket attachments");
+    const file = new File(["image bytes"], "example.png", { type: "image/png" });
+    fireEvent.change(input, { target: { files: [file] } });
+
+    expect(await screen.findByText("example.png")).toBeInTheDocument();
+    expect(screen.getByText(/image\/png/)).toBeInTheDocument();
+    expect(fetch).toHaveBeenCalledWith(expect.stringContaining("/api/tickets/APT-42/attachments?"), expect.objectContaining({
+      method: "POST", body: file, headers: expect.objectContaining({ "X-Attachment-Content-Type": "image/png" }),
+    }));
   });
 
   it("returns an unclaimed ready ticket to the editable draft state", async () => {
@@ -342,7 +570,9 @@ describe("operator UI", () => {
 
   it("shows supervisor host, root, agents, and ticket reservation on the health page", async () => {
     render(<App />);
-    fireEvent.click(await screen.findByRole("button", { name: /Supervisor health/i }));
+    fireEvent.click(await screen.findByRole("button", { name: /Operations/i }));
+    expect(await screen.findByRole("heading", { name: "Tracker readiness" })).toBeInTheDocument();
+    expect(screen.getByText("1/1 valid · generation 3")).toBeInTheDocument();
     expect(await screen.findByRole("heading", { name: "coordinator-vm" })).toBeInTheDocument();
     expect(screen.getByText("192.0.2.70")).toBeInTheDocument();
     expect(screen.getByText("/srv/projects")).toBeInTheDocument();
@@ -351,6 +581,7 @@ describe("operator UI", () => {
   });
 
   it("shows revision-aware workflow reliability, distributions, and production outcomes on the metrics page", async () => {
+    workflowReleases.releases.push({ ...workflowReleases.releases[0], revision: "workflow-r2", version: 2, label: "Review trial", status: "trial", is_default: false });
     render(<App />);
     fireEvent.click(await screen.findByRole("button", { name: "Metrics" }));
     expect(await screen.findByRole("heading", { name: "Factory metrics" })).toBeInTheDocument();
@@ -358,7 +589,12 @@ describe("operator UI", () => {
     expect(screen.getByText("Production outcomes")).toBeInTheDocument();
     expect(screen.getAllByText("100%", { exact: false }).length).toBeGreaterThan(0);
     expect(screen.getByText("Completed → Done")).toBeInTheDocument();
+    expect(screen.getByText("Quality attributes")).toBeInTheDocument();
+    expect(screen.getAllByText("Line coverage").length).toBeGreaterThan(0);
+    expect(screen.getByText("Median 84 percent")).toBeInTheDocument();
     expect(screen.getByText(/complete cost/)).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "Compare workflow revisions" })).toBeInTheDocument();
+    expect(await screen.findByText("Manual trial assignment may introduce selection bias.", { exact: false })).toBeInTheDocument();
   });
 
   it("edits and saves the YAML-backed repository catalog through structured fields", async () => {
@@ -367,25 +603,92 @@ describe("operator UI", () => {
     expect(await screen.findByRole("heading", { name: "Repository catalog" })).toBeInTheDocument();
     expect(screen.getByLabelText("Repository ID 1")).toHaveValue("demo");
     expect(screen.getByLabelText("Enable Claude")).toBeChecked();
-    fireEvent.click(screen.getByLabelText("Enable Claude"));
     fireEvent.click(screen.getByRole("button", { name: "Add repository" }));
     fireEvent.change(screen.getByLabelText("Repository ID 2"), { target: { value: "other-api" } });
     fireEvent.change(screen.getByLabelText("Repository URL 2"), { target: { value: "https://github.com/example/other-api.git" } });
+    fireEvent.click(screen.getByRole("button", { name: "Add attribute" }));
+    fireEvent.change(screen.getByLabelText("Quality key 1"), { target: { value: "coverage.line_percent" } });
+    fireEvent.change(screen.getByLabelText("Quality label 1"), { target: { value: "Line coverage" } });
+    fireEvent.change(screen.getByLabelText("Quality unit 1"), { target: { value: "percent" } });
+    fireEvent.change(screen.getByLabelText("Quality maximum 1"), { target: { value: "100" } });
     fireEvent.click(screen.getByRole("button", { name: "Save configuration" }));
     await waitFor(() => expect(fetch).toHaveBeenCalledWith("/api/config", expect.objectContaining({
-      method: "PUT", body: expect.stringMatching(/"providers":\{"enabled":\["codex"\]\}/),
+      method: "PUT", body: expect.stringMatching(/"providers":\{"enabled":\["claude","codex"\]\}/),
     })));
+    expect(fetch).toHaveBeenCalledWith("/api/config", expect.objectContaining({ body: expect.stringMatching(/"quality":\{"attributes":\[\{"key":"coverage.line_percent"/) }));
     expect(await screen.findByText("r3")).toBeInTheDocument();
   });
 
-  it("hides disabled providers from new tickets without depending on supervisor presence", async () => {
+  it("shows Claude and Codex weekly estimates and persists provider-scoped account aliases", async () => {
+    // Arrange
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: "Configuration" }));
+
+    // Act
+    fireEvent.change(await screen.findByLabelText("Claude quota account alias coordinator-vm"), { target: { value: "team-claude" } });
+    fireEvent.change(screen.getByLabelText("Codex quota account alias coordinator-vm"), { target: { value: "personal-codex" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save configuration" }));
+
+    // Assert
+    expect(screen.getByRole("heading", { name: "Weekly allowances" })).toBeInTheDocument();
+    expect(screen.getByText("Claude quota account")).toBeInTheDocument();
+    expect(screen.getByText("Codex quota account")).toBeInTheDocument();
+    expect(screen.getByText("31%")).toBeInTheDocument();
+    expect(screen.getByText("45%")).toBeInTheDocument();
+    expect(screen.getByText("100M")).toBeInTheDocument();
+    expect(screen.getByText("80M")).toBeInTheDocument();
+    expect(screen.getByText("$200.00")).toBeInTheDocument();
+    expect(screen.getByText("$150.00")).toBeInTheDocument();
+    await waitFor(() => expect(fetch).toHaveBeenCalledWith("/api/config", expect.objectContaining({
+      method: "PUT", body: expect.stringMatching(/"claude:coordinator-vm":"team-claude"/),
+    })));
+    expect(fetch).toHaveBeenCalledWith("/api/config", expect.objectContaining({ body: expect.stringMatching(/"codex:coordinator-vm":"personal-codex"/) }));
+  });
+
+  it("does not invent a weekly allowance when the Codex plan reports no weekly window", async () => {
+    // Arrange
+    const codex = quotaReport.accounts.findIndex((account: any) => account.provider === "codex");
+    quotaReport.accounts[codex] = { ...quotaReport.accounts[codex], status: "not_reported", limit_id: null, used_percent: null, window_minutes: null, resets_at: null, observed_at: null, estimated_weekly_tokens: null, estimated_weekly_api_usd: null, token_samples: 0, cost_samples: 0, direct_samples: 0, percentage_points_observed: 0, confidence: null };
+
+    // Act
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: "Configuration" }));
+
+    // Assert
+    expect(await screen.findByText("No weekly allowance reported")).toBeInTheDocument();
+    expect(screen.getByText(/expected for API-key billing/)).toBeInTheDocument();
+    expect(screen.queryByText("100M")).not.toBeInTheDocument();
+  });
+
+  it("prevents duplicate quality keys and clears numeric-only settings for categorical attributes", async () => {
+    // Arrange
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: "Configuration" }));
+    fireEvent.click(screen.getByRole("button", { name: "Add attribute" }));
+    fireEvent.change(screen.getByLabelText("Quality minimum 1"), { target: { value: "0" } });
+    fireEvent.change(screen.getByLabelText("Quality maximum 1"), { target: { value: "100" } });
+
+    // Act
+    fireEvent.change(screen.getByLabelText("Quality type 1"), { target: { value: "boolean" } });
+    fireEvent.click(screen.getByRole("button", { name: "Add attribute" }));
+    fireEvent.change(screen.getByLabelText("Quality key 2"), { target: { value: "quality.attribute-1" } });
+
+    // Assert
+    expect(screen.getByLabelText("Quality direction 1")).toBeDisabled();
+    expect(screen.getByLabelText("Quality direction 1")).toHaveValue("neutral");
+    expect(screen.getByLabelText("Quality minimum 1")).toBeDisabled();
+    expect(screen.getByLabelText("Quality minimum 1")).toHaveValue(null);
+    expect(screen.getByRole("alert")).toHaveTextContent("Quality attribute keys must be unique.");
+    expect(screen.getByRole("button", { name: "Save configuration" })).toBeDisabled();
+  });
+
+  it("keeps model selection out of ticket creation", async () => {
     trackerConfig.providers.enabled = ["claude", "codex"];
     render(<App />);
     fireEvent.click(await screen.findByRole("button", { name: /New ticket/i }));
-    const workAgent = await screen.findByLabelText("Work agent");
-    expect(workAgent).toHaveValue("claude");
-    expect(within(workAgent).getByRole("option", { name: "Claude" })).toBeInTheDocument();
-    expect(within(workAgent).getByRole("option", { name: "Codex" })).toBeInTheDocument();
+    expect(await screen.findByLabelText("Workflow")).toHaveValue("standard-delivery");
+    expect(screen.queryByLabelText("Work agent")).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("Review agent")).not.toBeInTheDocument();
   });
 
   it("explains prompt triggers and renders a dummy assignment before saving", async () => {
@@ -423,7 +726,7 @@ describe("operator UI", () => {
     await waitFor(() => expect(fetch).toHaveBeenCalledWith("/api/prompts", expect.objectContaining({
       method: "POST", body: expect.stringContaining('"name":"release-check"'),
     })));
-    expect((await screen.findAllByText("release-check.md")).length).toBeGreaterThan(0);
+    expect((await screen.findAllByText(/release-check\.md/)).length).toBeGreaterThan(0);
   });
 
   it("renders and edits the workflow as a directed graph while preserving YAML revisions", async () => {
@@ -443,10 +746,29 @@ describe("operator UI", () => {
 
     fireEvent.change(screen.getByLabelText("Node name"), { target: { value: "Write specification" } });
     expect((screen.getByLabelText("Workflow YAML") as HTMLTextAreaElement).value).toContain("name: Write specification");
-    fireEvent.click(screen.getByRole("button", { name: "Publish revision" }));
+    fireEvent.click(screen.getByRole("button", { name: "Publish as trial" }));
     await waitFor(() => expect(fetch).toHaveBeenCalledWith("/api/workflows/standard-delivery", expect.objectContaining({
       method: "PUT", body: expect.stringContaining("Write specification"),
     })));
+  });
+
+  it("shows only the current default and trials until workflow history is requested", async () => {
+    workflowReleases.releases.push(
+      { ...structuredClone(workflowReleases.releases[0]!), revision: "workflow-r2", version: 2, label: "Review experiment", status: "trial", is_default: false },
+      { ...structuredClone(workflowReleases.releases[0]!), revision: "workflow-r3", version: 3, label: "Retired experiment", status: "retired", is_default: false },
+    );
+
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: "Workflows" }));
+    const releasesSection = (await screen.findByRole("heading", { name: "Current default and trials" })).closest("section")!;
+
+    expect(within(releasesSection).getByText("v1 · Initial release")).toBeInTheDocument();
+    expect(within(releasesSection).getByText("v2 · Review experiment")).toBeInTheDocument();
+    expect(within(releasesSection).queryByText("v3 · Retired experiment")).not.toBeInTheDocument();
+    fireEvent.click(within(releasesSection).getByRole("button", { name: "Show history (1)" }));
+    const retiredRelease = within(releasesSection).getByText("v3 · Retired experiment").closest("article")!;
+    expect(within(retiredRelease).getByRole("button", { name: "Restore as default" })).toBeInTheDocument();
+    expect(within(releasesSection).getByRole("button", { name: "Hide history" })).toBeInTheDocument();
   });
 
   it("starts a genuinely new minimal workflow and adds typed nodes", async () => {
@@ -513,10 +835,12 @@ describe("operator UI", () => {
     current.frontmatter.status = "waiting_approval";
     current.frontmatter.execution = null;
     current.frontmatter.pull_requests = [{ repository: "demo", url: "https://github.com/example/demo/pull/42", phase: "specification" }];
+    current.frontmatter.workflow.current_node = "specification-approval";
+    current.workflow_node = structuredClone(workflowDefinition.nodes.find((node) => node.id === "specification-approval"));
     render(<App />);
     fireEvent.click(await screen.findByRole("button", { name: /UI ticket/i }));
-    expect(await screen.findByRole("button", { name: "Approve specification" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Check specification PRs" })).toBeInTheDocument();
+    expect(await screen.findByRole("button", { name: "Approve" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Check GitHub feedback" })).toBeInTheDocument();
   });
 
   it("uses a structured editor while a ticket is pending", async () => {
@@ -534,17 +858,15 @@ describe("operator UI", () => {
     })));
   });
 
-  it("selects explicit work agents and pairs Claude and Codex for independent review", async () => {
+  it("edits workflow and stage choices without ticket-level model selectors", async () => {
     current.frontmatter.status = "pending";
     current.frontmatter.phase = "specification";
     current.frontmatter.execution = null;
     render(<App />);
     fireEvent.click(await screen.findByRole("button", { name: /UI ticket/i }));
-    expect(await screen.findByLabelText("Work agent")).toHaveValue("claude");
-    expect(screen.getByLabelText("Review agent")).toHaveValue("codex");
-    fireEvent.change(screen.getByLabelText("Work agent"), { target: { value: "codex" } });
-    expect(screen.getByLabelText("Review agent")).toHaveValue("claude");
-    expect(screen.getByLabelText("Review agent")).toBeDisabled();
+    expect(await screen.findByLabelText("Workflow")).toHaveValue("standard-delivery");
+    expect(screen.queryByLabelText("Work agent")).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("Review agent")).not.toBeInTheDocument();
   });
 
   it("keeps a failed creation draft visible and explains the validation failure", async () => {
@@ -589,26 +911,20 @@ describe("operator UI", () => {
     })));
   });
 
-  it("shows the shared work conversation without claiming a skipped specification ran", async () => {
-    current.frontmatter.spec_required = false;
-    current.frontmatter.review_required = false;
+  it("shows workflow conversations and the nodes that reuse them", async () => {
     current.frontmatter.phase = "done";
     current.frontmatter.status = "completed";
     current.frontmatter.execution = null;
-    current.frontmatter.attempts.specification.total = 0;
-    current.frontmatter.attempts.implementation.total = 1;
-    current.frontmatter.agents.specification = { provider: "claude", herdr_pane_id: "w4:p1", session_ref: "claude-work-session" };
-    current.frontmatter.agents.implementation = { ...current.frontmatter.agents.specification };
-    current.frontmatter.agents.review = { provider: null, herdr_pane_id: null, session_ref: null };
+    current.frontmatter.workflow.current_node = "done";
+    current.frontmatter.workflow.stage_enabled = { specification: false, implementation: true, review: false, done: true };
+    current.frontmatter.conversations = { work: { provider: "claude", herdr_pane_id: "w4:p1", session_ref: "claude-work-session" } };
     render(<App />);
     fireEvent.click(await screen.findByRole("button", { name: /UI ticket/i }));
     const sessions = within(await screen.findByRole("region", { name: "Agent sessions" }));
     expect(sessions.getByText("Work")).toBeInTheDocument();
-    expect(sessions.getByText("claude")).toBeInTheDocument();
-    expect(sessions.getByText("Specification skipped · Implementation 1 attempt")).toBeInTheDocument();
-    expect(sessions.queryByText("Specification", { exact: true })).not.toBeInTheDocument();
-    expect(sessions.getByText("Review")).toBeInTheDocument();
-    expect(sessions.getByText("Skipped")).toBeInTheDocument();
+    expect(sessions.getByText("Claude")).toBeInTheDocument();
+    expect(sessions.getByText("Specification · Implementation")).toBeInTheDocument();
+    expect(sessions.getByText("claude-work-session")).toBeInTheDocument();
   });
 
   it("reloads the queue with archived tickets when the archive filter is checked", async () => {
@@ -617,8 +933,8 @@ describe("operator UI", () => {
     current.frontmatter.archived_at = "2026-08-14T13:00:00Z";
     current.frontmatter.execution = null;
     render(<App />);
-    expect(await screen.findByText("No tickets yet. Create the first piece of work.")).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("checkbox", { name: "Archived" }));
+    expect(await screen.findByRole("heading", { name: "No tickets match this view" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("checkbox", { name: /Archived/ }));
     expect(await screen.findByRole("button", { name: /UI ticket/i })).toBeInTheDocument();
     expect(fetch).toHaveBeenCalledWith("/api/tickets?include_archived=true", expect.anything());
   });
@@ -652,26 +968,27 @@ describe("operator UI", () => {
       const call = vi.mocked(fetch).mock.calls.find(([path, init]) => path === "/api/tickets/APT-42" && init?.method === "PUT");
       expect(call).toBeDefined();
       const payload = JSON.parse(String(call?.[1]?.body));
-      expect(payload.mode).toBe("keep_phase");
+      expect(payload.mode).toBeUndefined();
       expect(payload.markdown).toContain("Use the revised live requirement.");
     });
   });
 
-  it("explicitly enables specification when a live restart selects the skipped phase", async () => {
-    current.frontmatter.spec_required = false;
-    current.frontmatter.attempts.specification.total = 0;
+  it("restarts edited live work at an explicit workflow node", async () => {
     render(<App />);
     fireEvent.click(await screen.findByRole("button", { name: /UI ticket/i }));
     fireEvent.click(await screen.findByRole("button", { name: "Edit description" }));
     fireEvent.change(screen.getByLabelText("Live ticket description"), { target: { value: "# Goal\n\nSpecify this revised scope first." } });
-    fireEvent.change(screen.getByLabelText("Restart phase"), { target: { value: "specification" } });
+    fireEvent.change(screen.getByLabelText("Restart node"), { target: { value: "specification" } });
     fireEvent.click(screen.getByRole("button", { name: "Save and restart" }));
     await waitFor(() => {
       const call = vi.mocked(fetch).mock.calls.find(([path, init]) => path === "/api/tickets/APT-42" && init?.method === "PUT");
       expect(call).toBeDefined();
       const payload = JSON.parse(String(call?.[1]?.body));
-      expect(payload).toMatchObject({ mode: "rewind", rewind_phase: "specification" });
-      expect(payload.markdown).toContain("spec_required: true");
+      expect(payload.mode).toBeUndefined();
+      expect(payload.markdown).toContain("Specify this revised scope first.");
     });
+    await waitFor(() => expect(fetch).toHaveBeenCalledWith("/api/tickets/APT-42/workflow/migrate", expect.objectContaining({
+      method: "POST", body: expect.stringContaining('"node_id":"specification"'),
+    })));
   });
 });

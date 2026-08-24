@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import { lstat, mkdir, rename, rm } from "node:fs/promises";
 import { basename, resolve, sep } from "node:path";
 import type { RepositoryConfig } from "./types.js";
+import { log } from "./logger.js";
 
 export type CloneRepository = (url: string, target: string) => Promise<void>;
 
@@ -48,7 +49,7 @@ export class RepositoryReconciler implements RepositoryReconcilerLike {
     try {
       await this.clone(repository.url, temporary);
       await rename(temporary, target);
-      console.log(`[repositories] cloned ${repository.id} into ${target}`);
+      log("info", "repository.cloned", { repository: repository.id, target });
     } catch (error) {
       await rm(temporary, { recursive: true, force: true });
       if (await exists(target)) return;

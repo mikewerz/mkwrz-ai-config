@@ -5,10 +5,11 @@ This directory packages the lightweight project workflow as one locally deployab
 - [`tracker/`](tracker/) stores authoritative Markdown tickets, serves the operator dashboard and REST API, and owns workflow transitions, leases, guidance, and history.
 - [`supervisor/`](supervisor/) claims eligible work and uses Herdr to start or resume full-capability Claude Code and Codex conversations.
 - [`herdr/`](herdr/) installs a pinned Herdr release, verifies its checksum, and installs Herdr's official Claude Code and Codex integrations.
+- [`system-tests/`](system-tests/) exercises the built tracker and supervisor together with a fake Herdr and browser smoke tests, without launching real agents.
 
 The tracker and supervisor default to localhost communication. Agents retain their normal tools, credentials, and reasoning behavior; only explicit callbacks advance ticket phases.
 
-The current source snapshot includes the V3 workflow library, nested and parallel graph execution, versioned prompts, agent profiles, factory metrics, durable assignment bundles, Claude/Codex session telemetry, and deterministic supervisor-side Script activities. See [`SOURCE_REVISIONS.md`](SOURCE_REVISIONS.md) for the exact standalone commits incorporated into this copy.
+The current source snapshot includes continuous intake, versioned workflow releases, artifact and checkpoint storage, quality and factory metrics, structured operational diagnostics, durable assignment bundles, Claude/Codex session telemetry, execution provenance, and deterministic supervisor-side activities. See [`SOURCE_REVISIONS.md`](SOURCE_REVISIONS.md) for the exact standalone commits incorporated into this copy.
 
 ## Local setup
 
@@ -18,6 +19,26 @@ Requirements:
 - Python 3.10 or newer
 - Git
 - initialized Claude Code and Codex installations
+
+From this directory, run the interactive installer:
+
+```bash
+python3 installer.py
+```
+
+It validates the prerequisites, installs or verifies the pinned Herdr release and official Claude/Codex integrations, installs locked Node dependencies, builds the production services, creates the data directories, and atomically writes private `tracker/.env` and `supervisor/.env` files. Existing values become the defaults on a later run, unknown environment settings and comments are preserved, and already-current installation steps are skipped.
+
+Useful repeatable modes:
+
+```bash
+python3 installer.py --check
+python3 installer.py --dry-run
+python3 installer.py --yes
+```
+
+The installer does not install or modify Claude Code or Codex themselves. They must already be installed and initialized for the user who will run the supervisor. It prints the two service commands when setup completes and does not start background processes automatically.
+
+### Manual setup
 
 Install and verify Herdr:
 
@@ -53,6 +74,8 @@ Use documentation-only addresses from `192.0.2.0/24` when illustrating remote ho
 
 ```bash
 (cd workflow/herdr && python3 -m unittest discover -s tests -v)
+(cd workflow && PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -v)
 (cd workflow/tracker && npm ci && npm run verify && python3 -m unittest discover -s skills/agentic-project-tracker/tests -v)
 (cd workflow/supervisor && npm ci && npm run verify)
+(cd workflow/system-tests && npm ci && npm run verify)
 ```

@@ -1,15 +1,14 @@
 import React, { useCallback, useEffect, useId, useMemo, useState } from "react";
 import { parse, stringify } from "yaml";
-import { api, type Execution, type HarnessTelemetryRecord, type MetricsReport, type NumberSummary, type PromptDocument, type RepositoryClaimBlocker, type RepositoryConfig, type RuntimeAgent, type SupervisorHealth, type TicketDetail, type TicketFrontmatter, type TicketSummary, type TrackerConfig, type WorkflowDocument, type WorkflowNode } from "./api.js";
+import { api, type Execution, type HarnessTelemetryRecord, type IntakeCampaign, type IntakeLimits, type IntakeOverview, type IntakeSource, type MetricsReport, type NumberSummary, type OperationalStatus, type PromptDocument, type QuotaReport, type RepositoryClaimBlocker, type RepositoryConfig, type RuntimeAgent, type SupervisorHealth, type TicketDetail, type TicketFrontmatter, type TicketSummary, type TrackerConfig, type WorkflowComparisonReport, type WorkflowDocument, type WorkflowNode, type WorkflowReleaseCatalog } from "./api.js";
 
 const LOG_START = "<!-- tracker:interaction-log:start -->";
 const LOG_END = "<!-- tracker:interaction-log:end -->";
-const PHASES = ["specification", "implementation", "review", "done"] as const;
 const THEMES = ["light", "dark", "retro"] as const;
 type Theme = (typeof THEMES)[number];
 type WorkProvider = "claude" | "codex";
-type ReviewProvider = "claude" | "codex";
 const ALL_WORK_PROVIDERS: WorkProvider[] = ["claude", "codex"];
+const MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024;
 type WorkflowInlineLanguage = NonNullable<WorkflowNode["inline"]>["language"];
 
 const SCRIPT_ENVIRONMENT_VARIABLES = [
@@ -25,7 +24,7 @@ const SCRIPT_ENVIRONMENT_VARIABLES = [
   ["AGENTIC_ATTEMPT", "Current lease attempt number."],
   ["AGENTIC_WORKFLOW_ID", "Pinned workflow identifier."],
   ["AGENTIC_WORKFLOW_REVISION", "Pinned workflow revision."],
-  ["AGENTIC_WORKFLOW_PHASE", "Ticket compatibility phase projected by the node."],
+  ["AGENTIC_WORKFLOW_PHASE", "Operational ticket phase projected by the current node."],
   ["AGENTIC_REPOSITORY_ID", "Selected repository identifier."],
   ["AGENTIC_REPOSITORY_PATH", "Absolute path to the selected repository."],
   ["AGENTIC_PRIMARY_REPOSITORY_ID", "Primary repository identifier."],
@@ -43,6 +42,7 @@ const SCRIPT_ENVIRONMENT_VARIABLES = [
   ["AGENTIC_INCOMING_HANDOFF", "Next-step handoff supplied by the preceding node."],
   ["AGENTIC_INCOMING_OUTPUT", "Configured stdout tail supplied by the preceding script node."],
   ["AGENTIC_INCOMING_OUTPUT_LOG", "Tracker API path for the preceding script node's persisted stdout."],
+  ["AGENTIC_RESULT_PATH", "Write optional structured JSON metadata and external references here before exit."],
 ] as const;
 
 function inlineEnvironmentHeader(language: WorkflowInlineLanguage): string {
@@ -61,6 +61,9 @@ const INLINE_CODE_SAMPLES: Record<WorkflowInlineLanguage, string> = {
 set -eu
 
 env | awk -F= '$1 ~ /^AGENTIC_/ { print }' | sort
+
+# Optional structured result example:
+# printf '%s\n' '{"metadata":{"deployment.id":"example"},"external_references":[]}' > "$AGENTIC_RESULT_PATH"
 `,
   python: `${inlineEnvironmentHeader("python")}
 import json
@@ -72,6 +75,10 @@ agentic_env = {
     if name.startswith("AGENTIC_")
 }
 print(json.dumps(agentic_env, indent=2, sort_keys=True))
+
+# Optional structured result example:
+# with open(os.environ["AGENTIC_RESULT_PATH"], "w", encoding="utf-8") as result_file:
+#     json.dump({"metadata": {"deployment.id": "example"}, "external_references": []}, result_file)
 `,
   javascript: `${inlineEnvironmentHeader("javascript")}
 const agenticEnv = Object.fromEntries(
@@ -81,6 +88,11 @@ const agenticEnv = Object.fromEntries(
 );
 
 console.log(JSON.stringify(agenticEnv, null, 2));
+
+// Optional structured result example:
+// const { writeFileSync } = await import("node:fs");
+// writeFileSync(process.env.AGENTIC_RESULT_PATH,
+//   JSON.stringify({ metadata: { "deployment.id": "example" }, external_references: [] }));
 `,
 };
 
@@ -99,12 +111,8 @@ function storedTheme(): Theme {
   } catch { return "dark"; }
 }
 
-function defaultReviewProvider(workProvider: WorkProvider): ReviewProvider {
-  return workProvider === "codex" ? "claude" : "codex";
-}
-
 function isInitialDraft(ticket: TicketFrontmatter): boolean {
-  return ticket.status === "pending" && ticket.phase === (ticket.spec_required ? "specification" : "implementation");
+  return ticket.status === "pending";
 }
 
 interface TicketDraft {
@@ -112,38 +120,46 @@ interface TicketDraft {
   autoId: boolean;
   title: string;
   description: string;
-  specRequired: boolean;
-  reviewRequired: boolean;
-  workProvider: WorkProvider;
-  reviewProvider: ReviewProvider;
   priority: number;
+  estimatedHumanDays: number | null;
   labels: string;
   repositories: Array<{ id: string; primary: boolean }>;
   jira: TicketFrontmatter["jira"];
   workflowId: string;
+  workflowRevision: string;
   workflowInputs: Record<string, boolean | string>;
   stageEnabled: Record<string, boolean>;
+  attachmentFiles: File[];
 }
 
-const emptyDraft = (id = "AGENT-0001", autoId = true, enabledProviders: WorkProvider[] = ALL_WORK_PROVIDERS): TicketDraft => {
-  const workProvider = enabledProviders.includes("claude") ? "claude" : enabledProviders[0] ?? "claude";
-  return {
+const emptyDraft = (id = "AGENT-0001", autoId = true): TicketDraft => ({
     id, autoId, title: "Describe the work", description: "# Goal\n\nDescribe the desired outcome.\n\n# Acceptance Criteria\n\n- Add an observable acceptance criterion.",
-    specRequired: true, reviewRequired: true, workProvider, reviewProvider: defaultReviewProvider(workProvider), priority: 0, labels: "",
-    repositories: [{ id: "", primary: true }], jira: null, workflowId: "standard-delivery", workflowInputs: {}, stageEnabled: {},
+    priority: 0, estimatedHumanDays: null, labels: "",
+    repositories: [{ id: "", primary: true }], jira: null, workflowId: "standard-delivery", workflowRevision: "", workflowInputs: {}, stageEnabled: {}, attachmentFiles: [],
+});
+
+function fallbackWorkflowReleases(workflows: WorkflowDocument[]): WorkflowReleaseCatalog {
+  return {
+    catalog: { version: 1, revision: 1, updated_at: new Date(0).toISOString(), default_workflow_id: workflows.some((item) => item.definition.id === "standard-delivery") ? "standard-delivery" : workflows[0]?.definition.id ?? "standard-delivery", workflows: Object.fromEntries(workflows.map((item) => [item.definition.id, { default_revision: item.revision }])) },
+    releases: workflows.map((workflow) => ({
+      workflow_id: workflow.definition.id, revision: workflow.revision, version: workflow.version, label: `v${workflow.version}`,
+      status: "active" as const, published_at: new Date(0).toISOString(), parent_revision: null, is_default: true, definition: workflow.definition,
+    })),
   };
-};
+}
 
 function draftErrors(draft: TicketDraft): string[] {
   const errors: string[] = [];
   if (!draft.id.trim()) errors.push("Ticket ID is required.");
   if (!draft.title.trim()) errors.push("Title is required.");
   if (!draft.description.trim()) errors.push("Description is required.");
+  if (draft.estimatedHumanDays !== null && (!Number.isFinite(draft.estimatedHumanDays) || draft.estimatedHumanDays < 0)) errors.push("Estimated human days must be a non-negative number.");
   if (draft.repositories.length === 0) errors.push("Add at least one repository.");
   if (draft.repositories.some((repository) => !repository.id.trim())) errors.push("Every repository needs a name.");
   if (draft.repositories.filter((repository) => repository.primary).length !== 1) errors.push("Choose exactly one primary repository.");
   const repositories = draft.repositories.map((repository) => repository.id.trim()).filter(Boolean);
   if (new Set(repositories).size !== repositories.length) errors.push("Repository names must be unique.");
+  if (draft.attachmentFiles.some((file) => file.size > MAX_ATTACHMENT_BYTES)) errors.push("Each attachment must be 25 MB or smaller.");
   return errors;
 }
 
@@ -162,20 +178,20 @@ function draftFromTicket(ticket: TicketDetail): TicketDraft {
   if (!frontmatter) return { ...emptyDraft(), description: ticket.markdown };
   return {
     id: frontmatter.id, autoId: false, title: frontmatter.title,
-    description: descriptionFromBody(ticket.body), specRequired: frontmatter.spec_required,
-    reviewRequired: frontmatter.review_required, workProvider: frontmatter.work_provider, reviewProvider: frontmatter.review_provider,
-    priority: frontmatter.priority, labels: frontmatter.labels.join(", "),
+    description: descriptionFromBody(ticket.body),
+    priority: frontmatter.priority, estimatedHumanDays: frontmatter.estimated_human_days ?? null, labels: frontmatter.labels.join(", "),
     repositories: frontmatter.repositories.map((repository) => ({ ...repository })), jira: frontmatter.jira,
     workflowId: frontmatter.workflow?.id ?? "standard-delivery",
-    workflowInputs: { ...(frontmatter.workflow?.inputs ?? {}) }, stageEnabled: { ...(frontmatter.workflow?.stage_enabled ?? {}) },
+    workflowRevision: frontmatter.workflow_assignment?.revision ?? frontmatter.workflow?.revision ?? "",
+    workflowInputs: { ...(frontmatter.workflow?.inputs ?? {}) }, stageEnabled: { ...(frontmatter.workflow?.stage_enabled ?? {}) }, attachmentFiles: [],
   };
 }
 
 function ticketMarkdown(draft: TicketDraft, current?: TicketDetail): string {
   const editable = {
     id: draft.id.trim(), title: draft.title.trim(),
-    spec_required: draft.specRequired, review_required: draft.reviewRequired,
-    work_provider: draft.workProvider, review_provider: draft.reviewProvider, priority: Number(draft.priority) || 0,
+    priority: Number(draft.priority) || 0,
+    estimated_human_days: draft.estimatedHumanDays,
     labels: draft.labels.split(",").map((label) => label.trim()).filter(Boolean),
     repositories: draft.repositories.map((repository) => ({ id: repository.id.trim(), primary: repository.primary })),
     jira: draft.jira,
@@ -194,9 +210,9 @@ function humanize(value: string): string {
 
 function resolvedWorkflowProvider(ticket: TicketFrontmatter, node: WorkflowNode | undefined): string | null {
   if (!node || node.type !== "agent") return null;
-  if (node.provider === "work") return ticket.work_provider;
-  if (node.provider === "review") return ticket.review_provider;
-  return node.provider ?? null;
+  const profiles = ticket.workflow?.resolved_agent_profiles ?? {};
+  const workflowId = ticket.workflow?.active_workflow_id ?? ticket.workflow?.id;
+  return workflowId ? profiles[`${workflowId}/${node.id}`]?.provider ?? null : null;
 }
 
 function duration(milliseconds: number): string {
@@ -215,6 +231,12 @@ function timeAgo(timestamp: string | null | undefined, now: number): string {
   return `${duration(now - Date.parse(timestamp))} ago`;
 }
 
+function fileSize(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
 function StatusPill({ value, subtle = false }: { value: string; subtle?: boolean }) {
   return <span className={`status-pill status-${value} ${subtle ? "subtle" : ""}`}><i />{humanize(value)}</span>;
 }
@@ -222,77 +244,27 @@ function StatusPill({ value, subtle = false }: { value: string; subtle?: boolean
 function WorkflowMap({ ticket, workflow }: { ticket: TicketFrontmatter; workflow: WorkflowDocument["definition"] | undefined }) {
   if (ticket.workflow && workflow) return <section className="workflow-panel" aria-label="Ticket workflow">
     <div className="section-heading"><div><span>Workflow · {workflow.id}@{ticket.workflow.revision.slice(0, 8)}</span><h2>{workflow.name}</h2></div><StatusPill value={ticket.status} /></div>
-    <WorkflowGraph workflow={workflow} currentNode={ticket.workflow.current_node} />
+    <WorkflowGraph workflow={workflow} currentNode={ticket.workflow.current_node} ticket={ticket} />
     <div className="workflow-loops"><span>{ticket.workflow.transition_count} / {workflow.max_transitions} transitions</span><span>{ticket.workflow.node_runs.length} durable node runs</span></div>
   </section>;
-  const currentIndex = PHASES.indexOf(ticket.phase as (typeof PHASES)[number]);
-  const stateFor = (phase: (typeof PHASES)[number], index: number) => {
-    if (phase === "specification" && !ticket.spec_required) return "skipped";
-    if (phase === "review" && !ticket.review_required) return "skipped";
-    if (ticket.phase === "done" || index < currentIndex) return "complete";
-    if (index === currentIndex) return "current";
-    return "upcoming";
-  };
-  const descriptions: Record<(typeof PHASES)[number], string> = {
-    specification: "Shape the approach", implementation: "Build and verify", review: "Independent review", done: "Ready for merge",
-  };
-  return <section className="workflow-panel" aria-label="Ticket workflow">
-    <div className="section-heading"><div><span>Workflow</span><h2>Path to completion</h2></div><StatusPill value={ticket.status} /></div>
-    <div className="workflow-map">
-      {PHASES.map((phase, index) => {
-        const state = stateFor(phase, index);
-        return <React.Fragment key={phase}>
-          {index > 0 && <div className={`workflow-edge edge-${stateFor(PHASES[index - 1]!, index - 1)}`}><span>→</span></div>}
-          <div className={`workflow-node node-${state}`} aria-current={state === "current" ? "step" : undefined}>
-            <div className="node-orbit"><span>{state === "complete" ? "✓" : state === "skipped" ? "—" : index + 1}</span></div>
-            <strong>{humanize(phase)}</strong>
-            <small>{state === "current" ? humanize(ticket.status) : state === "skipped" ? "Not required" : descriptions[phase]}</small>
-          </div>
-        </React.Fragment>;
-      })}
-    </div>
-    <div className="workflow-loops"><span>↶ Specification feedback</span><span>↶ Review changes return to implementation</span></div>
-  </section>;
+  return <section className="workflow-panel" aria-label="Ticket workflow"><p className="muted">This ticket has no loadable pinned workflow.</p></section>;
 }
 
-function phaseAttemptSummary(label: string, total: number, required = true): string {
-  if (!required) return `${label} skipped`;
-  if (total === 0) return `${label} not started`;
-  return `${label} ${total} attempt${total === 1 ? "" : "s"}`;
-}
-
-function AgentSessions({ ticket, workflow }: { ticket: TicketFrontmatter; workflow?: WorkflowDocument["definition"] }) {
+function AgentSessions({ ticket, workflow, onReset }: { ticket: TicketFrontmatter; workflow?: WorkflowDocument["definition"]; onReset?: (key: string) => void }) {
   if (ticket.workflow && workflow) {
     const conversations = Object.entries(ticket.conversations ?? {});
     return <section className="side-card" aria-label="Agent sessions">
       <div className="section-heading"><div><span>Conversations</span><h2>Agent sessions</h2></div></div>
       {conversations.length ? conversations.map(([key, conversation]) => {
         const nodes = workflow.nodes.filter((node) => node.type === "agent" && node.conversation_key === key).map((node) => node.name);
-        return <div className="session-item" key={key}><span>{humanize(key)}</span><strong>{conversation.provider ? humanize(conversation.provider) : "Unassigned"}</strong><small className="session-context">{nodes.join(" · ") || "Workflow conversation"}</small>{conversation.herdr_pane_id && <small>{conversation.herdr_pane_id}</small>}{conversation.session_ref && <code>{conversation.session_ref}</code>}</div>;
+        const policies = [...new Set(workflow.nodes.filter((node) => node.type === "agent" && node.conversation_key === key).map((node) => node.conversation_policy ?? "resume"))];
+        return <div className="session-item" key={key}><span>{humanize(key)}</span><strong>{conversation.provider ? humanize(conversation.provider) : "Unassigned"}</strong><small className="session-context">{nodes.join(" · ") || "Workflow conversation"}</small><small>Generation {conversation.generation ?? 1} · {policies.map(humanize).join(" / ")}{conversation.visits_in_generation !== undefined ? ` · ${conversation.visits_in_generation} visits` : ""}</small>{conversation.reset_reason && <small className="session-context">Last reset: {humanize(conversation.reset_reason)}</small>}{conversation.herdr_pane_id && <small>{conversation.herdr_pane_id}</small>}{conversation.session_ref && <code>{conversation.session_ref}</code>}{onReset && !ticket.execution && <button className="button-secondary button-compact" onClick={() => onReset(key)}>Start fresh next visit</button>}</div>;
       }) : <p className="muted">No agent conversation has started.</p>}
     </section>;
   }
-  const work = ticket.agents.implementation ?? ticket.agents.specification;
-  const review = ticket.agents.review;
-  const workSummary = [
-    phaseAttemptSummary("Specification", ticket.attempts.specification?.total ?? 0, ticket.spec_required),
-    phaseAttemptSummary("Implementation", ticket.attempts.implementation?.total ?? 0),
-  ].join(" · ");
-  const reviewSummary = phaseAttemptSummary("Review", ticket.attempts.review?.total ?? 0, ticket.review_required);
   return <section className="side-card" aria-label="Agent sessions">
     <div className="section-heading"><div><span>Conversations</span><h2>Agent sessions</h2></div></div>
-    <div className="session-item">
-      <span>Work</span><strong>{work?.provider ?? "Unassigned"}</strong>
-      <small className="session-context">{workSummary}</small>
-      {work?.herdr_pane_id && <small>{work.herdr_pane_id}</small>}
-      {work?.session_ref && <code>{work.session_ref}</code>}
-    </div>
-    <div className="session-item">
-      <span>Review</span><strong>{ticket.review_required ? review?.provider ?? "Unassigned" : "Skipped"}</strong>
-      <small className="session-context">{reviewSummary}</small>
-      {ticket.review_required && review?.herdr_pane_id && <small>{review.herdr_pane_id}</small>}
-      {ticket.review_required && review?.session_ref && <code>{review.session_ref}</code>}
-    </div>
+    <p className="muted">No workflow conversation is available.</p>
   </section>;
 }
 
@@ -346,32 +318,55 @@ function MarkdownContent({ markdown }: { markdown: string }) {
 function runtimeWarning(execution: Pick<Execution, "observed_herdr_state" | "last_heartbeat_at" | "lease_expires_at">, now: number): string | null {
   const state = execution.observed_herdr_state;
   if (state === "blocked") return "Agent needs attention in Herdr";
-  if (state === "idle" || state === "done") return "Agent settled without a ticket callback";
-  if (state === "unknown") return "Herdr cannot classify the agent state";
   if (now - Date.parse(execution.last_heartbeat_at) > 60_000) return "Supervisor heartbeat is stale";
   if (Date.parse(execution.lease_expires_at) - now < 30_000) return "Lease is close to expiring";
   return null;
+}
+
+function isDeterministicActivity(nodeType: string | null | undefined): boolean {
+  return nodeType === "script" || nodeType === "checkpoint" || nodeType === "restore_checkpoint";
 }
 
 function AgentFleet({ agents, now, onOpen }: { agents: RuntimeAgent[]; now: number; onOpen: (id: string) => void }) {
   return <section className="fleet-bar" aria-label="Active agents">
     <div className="fleet-label"><span>Live operations</span><strong>{agents.length} active agent{agents.length === 1 ? "" : "s"}</strong></div>
     <div className="fleet-list">{agents.length ? agents.map((agent) => {
-      const state = agent.node_type === "script" ? "running" : agent.herdr?.state ?? "unobserved";
-      const warning = runtimeWarning({ observed_herdr_state: state, last_heartbeat_at: agent.last_heartbeat_at, lease_expires_at: agent.lease_expires_at }, now);
+      const activity = isDeterministicActivity(agent.node_type);
+      const herdrState = activity ? "unobserved" : agent.herdr?.state ?? "unobserved";
+      const state = activity || (agent.delivery_status ?? "delivered") === "delivered" ? "running" : "starting";
+      const warning = runtimeWarning({ observed_herdr_state: herdrState, last_heartbeat_at: agent.last_heartbeat_at, lease_expires_at: agent.lease_expires_at }, now);
       return <button key={agent.ticket_id} className={`fleet-agent ${warning ? "needs-attention" : ""}`} onClick={() => onOpen(agent.ticket_id)}>
         <span className={`agent-dot state-${state}`} />
-        <span><strong>{agent.node_type === "script" ? "Script" : agent.telemetry?.latest.model.id ?? agent.provider}</strong><small>{agent.ticket_id} · {humanize(agent.node_id ?? agent.phase)}{agent.telemetry?.delta.usage ? ` · ${tokenCount(agent.telemetry.delta.usage.total_tokens)} tokens` : ""}</small></span>
-        <span className="fleet-state">{warning ?? `${humanize(state)} · ${timeAgo(agent.last_heartbeat_at, now)}`}</span>
+        <span><strong>{activity ? humanize(agent.node_type ?? "activity") : agent.telemetry?.latest.model.id ?? agent.provider}</strong><small>{agent.ticket_id} · {humanize(agent.node_id ?? agent.phase)}{agent.telemetry?.delta.usage ? ` · ${tokenCount(agent.telemetry.delta.usage.total_tokens)} tokens` : ""}</small></span>
+        <span className="fleet-state">{warning ?? `${humanize(state)}${activity ? "" : ` · Herdr ${humanize(herdrState)}`} · ${timeAgo(agent.last_heartbeat_at, now)}`}</span>
       </button>;
     }) : <p className="fleet-empty">No agents currently hold a ticket lease.</p>}</div>
   </section>;
 }
 
-function SupervisorHealthPage({ supervisors, now, onOpenTicket }: { supervisors: SupervisorHealth[]; now: number; onOpenTicket: (id: string) => void }) {
+function SupervisorHealthPage({ supervisors, operations, now, onOpenTicket }: { supervisors: SupervisorHealth[]; operations: OperationalStatus | null; now: number; onOpenTicket: (id: string) => void }) {
   const online = supervisors.filter((supervisor) => supervisor.status === "online").length;
   return <main className="supervisors-page">
-    <div className="health-heading"><div><span>Infrastructure</span><h1>Supervisor health</h1><p>Each supervisor owns one isolated project root and one ticket end-to-end.</p></div><div className="health-summary"><strong>{online}/{supervisors.length}</strong><span>online</span></div></div>
+    <div className="health-heading"><div><span>Infrastructure</span><h1>System operations</h1><p>Tracker readiness, background maintenance, and supervisor capacity.</p></div><div className="health-summary"><strong>{online}/{supervisors.length}</strong><span>supervisors online</span></div></div>
+    <section className="operations-grid">
+      <article className={`supervisor-card operations-card operations-${operations?.status ?? "unknown"}`}>
+        <div className="supervisor-card-heading"><div><span className={`agent-dot state-${operations?.ready ? "working" : "blocked"}`} /><div><h2>Tracker readiness</h2><small>{operations ? humanize(operations.status) : "Unavailable"}</small></div></div><StatusPill value={operations?.status ?? "unknown"} /></div>
+        <dl className="supervisor-details">
+          <DetailRow label="Ticket index">{operations?.ticket_store ? `${operations.ticket_store.valid_tickets}/${operations.ticket_store.ticket_count} valid · generation ${operations.ticket_store.index_generation}` : "Unavailable"}</DetailRow>
+          <DetailRow label="Markdown root"><code>{operations?.ticket_store?.root ?? "Unavailable"}</code></DetailRow>
+          <DetailRow label="Last rebuild">{timeAgo(operations?.ticket_store?.index_rebuilt_at, now)}</DetailRow>
+          <DetailRow label="Disk available">{operations?.ticket_store?.disk ? fileSize(operations.ticket_store.disk.available_bytes) : "Unavailable"}</DetailRow>
+          <DetailRow label="Libraries">{operations ? `${operations.libraries.prompts ?? 0} prompts · ${operations.libraries.workflows ?? 0} workflows` : "Unavailable"}</DetailRow>
+        </dl>
+        {!!operations?.failures.length && <div className="operations-messages failure">{operations.failures.map((message) => <p key={message}>{message}</p>)}</div>}
+        {!!operations?.warnings.length && <div className="operations-messages warning">{operations.warnings.map((message) => <p key={message}>{message}</p>)}</div>}
+      </article>
+      <article className="supervisor-card operations-card">
+        <div className="supervisor-card-heading"><div><span className="agent-dot state-working" /><div><h2>Background operations</h2><small>Last observed scheduler results</small></div></div></div>
+        <div className="operation-list">{operations ? Object.entries(operations.background_operations).map(([name, operation]) => <div key={name}><div><strong>{humanize(name)}</strong><StatusPill value={operation.in_progress ? "running" : operation.last_error ? "failed" : operation.last_succeeded_at ? "completed" : "pending"} subtle /></div><small>{operation.in_progress ? "In progress" : operation.last_error ? operation.last_error : operation.last_succeeded_at ? `Succeeded ${timeAgo(operation.last_succeeded_at, now)} in ${duration(operation.last_duration_ms ?? 0)}` : "Not run yet"}</small></div>) : <p>Operational status is unavailable.</p>}</div>
+      </article>
+    </section>
+    <div className="health-subheading"><span>Execution capacity</span><h2>Supervisors</h2><p>Each supervisor owns an isolated project root and one ticket end-to-end.</p></div>
     {supervisors.length ? <div className="supervisor-grid">{supervisors.map((supervisor) => <article className={`supervisor-card supervisor-${supervisor.status}`} key={supervisor.supervisor_id}>
       <div className="supervisor-card-heading"><div><span className={`agent-dot state-${supervisor.status === "online" ? "working" : "blocked"}`} /><div><h2>{supervisor.supervisor_id}</h2><small>{supervisor.hostname}</small></div></div><StatusPill value={supervisor.status} /></div>
       <dl className="supervisor-details">
@@ -387,13 +382,23 @@ function SupervisorHealthPage({ supervisors, now, onOpenTicket }: { supervisors:
   </main>;
 }
 
-function ConfigurationPage({ config, busy, onSave }: { config: TrackerConfig | null; busy: boolean; onSave: (update: Pick<TrackerConfig, "providers" | "agent_profiles" | "repositories" | "jira" | "github">) => void }) {
+function ConfigurationPage({ config, quota, busy, onSave, onRestoreDefaults }: { config: TrackerConfig | null; quota: QuotaReport | null; busy: boolean; onSave: (update: Pick<TrackerConfig, "providers" | "agent_profiles" | "pricing" | "metrics" | "quality" | "artifacts" | "repositories" | "jira" | "github">) => void; onRestoreDefaults: () => void }) {
   const [enabledProviders, setEnabledProviders] = useState<WorkProvider[]>(config?.providers?.enabled ?? ALL_WORK_PROVIDERS);
   const [repositories, setRepositories] = useState<RepositoryConfig[]>(config?.repositories ?? []);
   const [jira, setJira] = useState(config?.jira ?? { enabled: false, site_url: "", project_key: "", issue_type: "Task" });
   const [github, setGithub] = useState(config?.github ?? { observation_enabled: false, observation_interval_minutes: 30, ignored_logins: [] });
-  const [agentProfiles, setAgentProfiles] = useState(config?.agent_profiles ?? { default: "default", profiles: [{ id: "default", label: "Default", provider: "codex" as const, model: "gpt-5.6-sol", reasoning: "high" }] });
-  useEffect(() => { setEnabledProviders(config?.providers?.enabled ?? ALL_WORK_PROVIDERS); setRepositories(config?.repositories ?? []); if (config?.jira) setJira(config.jira); if (config?.github) setGithub(config.github); if (config?.agent_profiles) setAgentProfiles(config.agent_profiles); }, [config?.revision]);
+  const [pricing, setPricing] = useState(config?.pricing ?? { estimate_missing_costs: true, models: [] });
+  const [metrics, setMetrics] = useState(config?.metrics ?? { human_day_rate_usd: 1_000, quota_account_aliases: {} });
+  const [quality, setQuality] = useState(config?.quality ?? { attributes: [] });
+  const [artifacts, setArtifacts] = useState(config?.artifacts ?? { max_total_bytes: 50 * 1024 ** 3, max_ticket_bytes: 5 * 1024 ** 3, orphan_grace_hours: 24, retention_days: 365, auto_gc_enabled: true, gc_interval_minutes: 60 });
+  const [agentProfiles, setAgentProfiles] = useState(config?.agent_profiles ?? {
+    default: "claude",
+    profiles: [
+      { id: "claude", label: "Claude Opus", provider: "claude" as const, model: "claude-opus-4-8", reasoning: "high" },
+      { id: "codex", label: "Codex Sol", provider: "codex" as const, model: "gpt-5.6-sol", reasoning: "high" },
+    ],
+  });
+  useEffect(() => { setEnabledProviders(config?.providers?.enabled ?? ALL_WORK_PROVIDERS); setRepositories(config?.repositories ?? []); if (config?.jira) setJira(config.jira); if (config?.github) setGithub(config.github); if (config?.agent_profiles) setAgentProfiles(config.agent_profiles); if (config?.pricing) setPricing(config.pricing); if (config?.metrics) setMetrics(config.metrics); if (config?.quality) setQuality(config.quality); if (config?.artifacts) setArtifacts(config.artifacts); }, [config?.revision]);
   const errors: string[] = [];
   if (enabledProviders.length === 0) errors.push("Enable at least one work agent.");
   if (repositories.some((repository) => !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(repository.id) || repository.id === "." || repository.id === "..")) errors.push("Repository IDs must be safe directory names.");
@@ -403,13 +408,34 @@ function ConfigurationPage({ config, busy, onSave }: { config: TrackerConfig | n
   if (jira.enabled && !/^https:\/\/[A-Za-z0-9.-]+\.atlassian\.net\/?$/.test(jira.site_url)) errors.push("Jira site must be an atlassian.net URL.");
   if (jira.enabled && !jira.project_key.trim()) errors.push("Jira project key is required when Jira is enabled.");
   if (!agentProfiles.profiles.length) errors.push("Configure at least one agent profile.");
+  if (agentProfiles.profiles.some((profile) => !enabledProviders.includes(profile.provider))) errors.push("Every agent profile must use an enabled provider.");
   if (!agentProfiles.profiles.some((profile) => profile.id === agentProfiles.default)) errors.push("The default agent profile must reference an alias.");
   if (agentProfiles.profiles.some((profile) => !/^[a-z][a-z0-9-]{0,63}$/.test(profile.id) || !profile.label.trim() || !profile.model.trim() || !profile.reasoning.trim())) errors.push("Every agent profile needs a valid alias, label, model, and reasoning value.");
   if (new Set(agentProfiles.profiles.map((profile) => profile.id)).size !== agentProfiles.profiles.length) errors.push("Agent profile aliases must be unique.");
+  if (!Number.isFinite(metrics.human_day_rate_usd) || metrics.human_day_rate_usd < 0) errors.push("Human day rate must be a non-negative number.");
+  if (pricing.models.some((entry) => !entry.id.trim() || !entry.model.trim() || !entry.source_url.startsWith("https://") || !Number.isFinite(Date.parse(entry.effective_at)))) errors.push("Every pricing entry needs an ID, model, HTTPS source, and effective date.");
+  if (pricing.models.some((entry) => [entry.input_per_million_usd, entry.cached_input_per_million_usd, entry.cache_write_input_per_million_usd, entry.output_per_million_usd].some((value) => !Number.isFinite(value) || value < 0))) errors.push("Token prices must be non-negative numbers.");
+  if (quality.attributes.some((attribute) => !/^[a-z][a-z0-9._-]{0,127}$/.test(attribute.key) || !attribute.label.trim())) errors.push("Every quality attribute needs a valid namespaced key and label.");
+  if (new Set(quality.attributes.map((attribute) => attribute.key)).size !== quality.attributes.length) errors.push("Quality attribute keys must be unique.");
+  if (quality.attributes.some((attribute) => attribute.minimum !== null && attribute.maximum !== null && attribute.minimum > attribute.maximum)) errors.push("Quality attribute minimums cannot exceed maximums.");
+  if (!Number.isSafeInteger(artifacts.max_total_bytes) || !Number.isSafeInteger(artifacts.max_ticket_bytes) || artifacts.max_ticket_bytes < 1024 ** 2 || artifacts.max_total_bytes < artifacts.max_ticket_bytes) errors.push("Artifact quotas must be whole bytes, at least 1 MiB, with the total quota no smaller than the per-ticket quota.");
+  if (![artifacts.orphan_grace_hours, artifacts.retention_days, artifacts.gc_interval_minutes].every((value) => Number.isSafeInteger(value) && value > 0)) errors.push("Artifact grace, retention, and maintenance intervals must be positive whole numbers.");
   const update = (index: number, patch: Partial<RepositoryConfig>) => setRepositories((current) => current.map((repository, candidate) => candidate === index ? { ...repository, ...patch } : repository));
   const toggleProvider = (provider: WorkProvider, enabled: boolean) => setEnabledProviders((current) => enabled
     ? ALL_WORK_PROVIDERS.filter((candidate) => candidate === provider || current.includes(candidate))
     : current.filter((candidate) => candidate !== provider));
+  const quotaAliasKey = (provider: "claude" | "codex", supervisorId: string) => `${provider}:${supervisorId}`;
+  const quotaAliasValue = (provider: "claude" | "codex", supervisorId: string) => metrics.quota_account_aliases?.[quotaAliasKey(provider, supervisorId)]
+    ?? (provider === "codex" ? metrics.quota_account_aliases?.[supervisorId] : undefined)
+    ?? "";
+  const updateQuotaAccount = (provider: "claude" | "codex", supervisorId: string, value: string) => setMetrics((current) => {
+    const quota_account_aliases = { ...(current.quota_account_aliases ?? {}) };
+    const key = quotaAliasKey(provider, supervisorId);
+    if (value.trim()) quota_account_aliases[key] = value.trim();
+    else delete quota_account_aliases[key];
+    if (provider === "codex") delete quota_account_aliases[supervisorId];
+    return { ...current, quota_account_aliases };
+  });
   return <main className="configuration-page">
     <div className="health-heading"><div><span>Local configuration</span><h1>Repository catalog</h1><p>Every supervisor clones missing repositories into its own project root.</p></div>{config && <div className="health-summary"><strong>r{config.revision}</strong><span>tracker-config.yaml</span></div>}</div>
     <section className="configuration-card">
@@ -421,18 +447,56 @@ function ConfigurationPage({ config, busy, onSave }: { config: TrackerConfig | n
         <button className="icon-button" aria-label={`Remove configured repository ${index + 1}`} onClick={() => setRepositories((current) => current.filter((_, candidate) => candidate !== index))}>×</button>
       </div>)}
       {!repositories.length && <div className="config-empty"><strong>No repositories configured</strong><span>Add the repositories that should exist beneath every supervisor project root.</span></div>}
-      <div className="section-heading"><div><span>Ticket creation</span><h2>Enabled work agents</h2></div></div>
-      <p className="config-help">Choose which providers appear in the Work agent selector for new tickets. Supervisor availability is reported separately and does not change this list automatically.</p>
-      <div className="provider-config-grid">{ALL_WORK_PROVIDERS.map((provider) => <label className="toggle" key={provider}><input aria-label={`Enable ${humanize(provider)}`} type="checkbox" checked={enabledProviders.includes(provider)} onChange={(event) => toggleProvider(provider, event.target.checked)} /><span><strong>{humanize(provider)}</strong><small>{enabledProviders.includes(provider) ? "Available for new tickets" : "Hidden from new tickets"}</small></span></label>)}</div>
-      <div className="section-heading"><div><span>Agent runtime</span><h2>Provider profiles</h2></div><button className="button-secondary" onClick={() => setAgentProfiles((current) => ({ ...current, profiles: [...current.profiles, { id: `profile-${current.profiles.length + 1}`, label: "New profile", provider: "codex", model: "gpt-5.6-sol", reasoning: "high" }] }))}>Add profile</button></div>
+      <div className="section-heading"><div><span>Agent runtime</span><h2>Enabled harnesses</h2></div></div>
+      <p className="config-help">Choose which harnesses may be used by workflow agent profiles. Supervisor availability is reported separately.</p>
+      <div className="provider-config-grid">{ALL_WORK_PROVIDERS.map((provider) => <label className="toggle" key={provider}><input aria-label={`Enable ${humanize(provider)}`} type="checkbox" checked={enabledProviders.includes(provider)} onChange={(event) => toggleProvider(provider, event.target.checked)} /><span><strong>{humanize(provider)}</strong><small>{enabledProviders.includes(provider) ? "Available to workflow profiles" : "Hidden from workflow profiles"}</small></span></label>)}</div>
+      <div className="section-heading"><div><span>Workflow routing</span><h2>Agent profiles</h2></div><button className="button-secondary" onClick={() => setAgentProfiles((current) => ({ ...current, profiles: [...current.profiles, { id: `profile-${current.profiles.length + 1}`, label: "New profile", provider: enabledProviders[0] ?? "codex", model: "gpt-5.6-sol", reasoning: "high" }] }))}>Add profile</button></div>
       <p className="config-help">Workflow nodes reference an alias. Each ticket pins the alias's resolved provider, model, and reasoning when it is created.</p>
       <div className="config-column-labels"><span>Alias / label</span><span>Provider / model / reasoning</span><span /></div>
       {agentProfiles.profiles.map((profile, index) => <div className="config-repository-row" key={`${profile.id}:${index}`}>
         <div><input aria-label={`Agent profile alias ${index + 1}`} value={profile.id} onChange={(event) => setAgentProfiles((current) => ({ ...current, profiles: current.profiles.map((item, candidate) => candidate === index ? { ...item, id: event.target.value.toLowerCase().replace(/[^a-z0-9-]/g, "-") } : item) }))} /><input aria-label={`Agent profile label ${index + 1}`} value={profile.label} onChange={(event) => setAgentProfiles((current) => ({ ...current, profiles: current.profiles.map((item, candidate) => candidate === index ? { ...item, label: event.target.value } : item) }))} /></div>
-        <div className="field-row"><select aria-label={`Agent profile provider ${index + 1}`} value={profile.provider} onChange={(event) => setAgentProfiles((current) => ({ ...current, profiles: current.profiles.map((item, candidate) => candidate === index ? { ...item, provider: event.target.value as WorkProvider } : item) }))}>{ALL_WORK_PROVIDERS.map((provider) => <option key={provider} value={provider}>{humanize(provider)}</option>)}</select><input aria-label={`Agent profile model ${index + 1}`} value={profile.model} onChange={(event) => setAgentProfiles((current) => ({ ...current, profiles: current.profiles.map((item, candidate) => candidate === index ? { ...item, model: event.target.value } : item) }))} /><input aria-label={`Agent profile reasoning ${index + 1}`} value={profile.reasoning} onChange={(event) => setAgentProfiles((current) => ({ ...current, profiles: current.profiles.map((item, candidate) => candidate === index ? { ...item, reasoning: event.target.value } : item) }))} /></div>
+        <div className="field-row"><select aria-label={`Agent profile provider ${index + 1}`} value={profile.provider} onChange={(event) => setAgentProfiles((current) => ({ ...current, profiles: current.profiles.map((item, candidate) => candidate === index ? { ...item, provider: event.target.value as WorkProvider } : item) }))}>{enabledProviders.map((provider) => <option key={provider} value={provider}>{humanize(provider)}</option>)}</select><input aria-label={`Agent profile model ${index + 1}`} value={profile.model} onChange={(event) => setAgentProfiles((current) => ({ ...current, profiles: current.profiles.map((item, candidate) => candidate === index ? { ...item, model: event.target.value } : item) }))} /><input aria-label={`Agent profile reasoning ${index + 1}`} value={profile.reasoning} onChange={(event) => setAgentProfiles((current) => ({ ...current, profiles: current.profiles.map((item, candidate) => candidate === index ? { ...item, reasoning: event.target.value } : item) }))} /></div>
         <button className="icon-button" disabled={agentProfiles.profiles.length === 1} onClick={() => setAgentProfiles((current) => { const profiles = current.profiles.filter((_, candidate) => candidate !== index); return { default: current.default === profile.id ? profiles[0]!.id : current.default, profiles }; })}>×</button>
       </div>)}
       <label>Default profile<select aria-label="Default agent profile" value={agentProfiles.default} onChange={(event) => setAgentProfiles({ ...agentProfiles, default: event.target.value })}>{agentProfiles.profiles.map((profile) => <option key={profile.id} value={profile.id}>{profile.label} ({profile.id})</option>)}</select></label>
+      <div className="section-heading"><div><span>Cost accounting</span><h2>Model pricing</h2></div><button className="button-secondary" onClick={() => setPricing((current) => ({ ...current, models: [...current.models, { id: `custom-price-${current.models.length + 1}`, provider: enabledProviders[0] ?? "codex", model: "", input_per_million_usd: 0, cached_input_per_million_usd: 0, cache_write_input_per_million_usd: 0, output_per_million_usd: 0, source_url: "https://", effective_at: new Date().toISOString() }] }))}>Add price</button></div>
+      <label className="toggle"><input type="checkbox" checked={pricing.estimate_missing_costs} onChange={(event) => setPricing({ ...pricing, estimate_missing_costs: event.target.checked })} /><span><strong>Estimate missing harness costs</strong><small>Reported cost wins. These rates are used only when the harness supplies tokens but no USD total.</small></span></label>
+      <div className="pricing-table"><div className="pricing-header"><span>Provider / model</span><span>Per million tokens</span><span>Source / effective date</span><span /></div>{pricing.models.map((entry, index) => {
+        const updatePrice = (patch: Partial<typeof entry>) => setPricing((current) => ({ ...current, models: current.models.map((item, candidate) => candidate === index ? { ...item, ...patch } : item) }));
+        return <div className="pricing-row" key={`${entry.id}:${index}`}><div><input aria-label={`Pricing ID ${index + 1}`} value={entry.id} onChange={(event) => updatePrice({ id: event.target.value.toLowerCase().replace(/[^a-z0-9-]/g, "-") })} /><select aria-label={`Pricing provider ${index + 1}`} value={entry.provider} onChange={(event) => updatePrice({ provider: event.target.value as WorkProvider })}>{enabledProviders.map((provider) => <option key={provider} value={provider}>{humanize(provider)}</option>)}</select><input aria-label={`Pricing model ${index + 1}`} value={entry.model} onChange={(event) => updatePrice({ model: event.target.value })} /></div><div className="price-inputs"><label>Input<input type="number" min="0" step="0.01" value={entry.input_per_million_usd} onChange={(event) => updatePrice({ input_per_million_usd: Number(event.target.value) })} /></label><label>Cached<input type="number" min="0" step="0.01" value={entry.cached_input_per_million_usd} onChange={(event) => updatePrice({ cached_input_per_million_usd: Number(event.target.value) })} /></label><label>Write<input type="number" min="0" step="0.01" value={entry.cache_write_input_per_million_usd} onChange={(event) => updatePrice({ cache_write_input_per_million_usd: Number(event.target.value) })} /></label><label>Output<input type="number" min="0" step="0.01" value={entry.output_per_million_usd} onChange={(event) => updatePrice({ output_per_million_usd: Number(event.target.value) })} /></label></div><div><input aria-label={`Pricing source ${index + 1}`} value={entry.source_url} onChange={(event) => updatePrice({ source_url: event.target.value })} /><input aria-label={`Pricing effective date ${index + 1}`} type="date" value={entry.effective_at.slice(0, 10)} onChange={(event) => updatePrice({ effective_at: new Date(`${event.target.value}T00:00:00.000Z`).toISOString() })} /></div><button className="icon-button" aria-label={`Remove pricing entry ${index + 1}`} onClick={() => setPricing((current) => ({ ...current, models: current.models.filter((_, candidate) => candidate !== index) }))}>×</button></div>;
+      })}</div>
+      <div className="section-heading"><div><span>Subscription observation</span><h2>Weekly allowances</h2></div></div>
+      <p className="config-help">When Claude or Codex reports a seven-day percentage window, the tracker compares that change with completed node usage. The result is an observed-workload estimate, not a contractual token quota. API-key billing and some plans may not report a weekly allowance at all.</p>
+      {quota?.accounts.length ? <div className="quota-estimate-grid">{quota.accounts.map((account) => <article className="quota-estimate-card" key={`${account.provider}:${account.account_id}:${account.limit_id ?? "none"}`}>
+        <header><div><span>{humanize(account.provider)} quota account</span><h3>{account.account_id}</h3><small>{account.supervisor_ids.join(", ")}</small></div><StatusPill value={account.status} /></header>
+        {account.status === "not_reported" ? <div className="quota-unavailable"><strong>No weekly allowance reported</strong><p>{account.provider === "claude" ? "Claude requires its optional supervisor status-line feed to expose a fixed seven-day window." : "This is expected for API-key billing and any Codex plan that does not expose a fixed weekly window."}</p></div> : <>
+          <div className="quota-meter-heading"><span>Latest observed weekly use</span><strong>{account.used_percent === null ? "—" : `${account.used_percent.toLocaleString()}%`}</strong></div>
+          <div className="quota-meter" aria-label={`${account.account_id} weekly usage`}><span style={{ width: `${Math.min(100, Math.max(0, account.used_percent ?? 0))}%` }} /></div>
+          <div className="quota-estimate-values"><div><span>Token equivalent</span><strong>{tokenCount(account.estimated_weekly_tokens)}</strong></div><div><span>API-cost equivalent</span><strong>{usd(account.estimated_weekly_api_usd)}</strong></div></div>
+          <p>{account.status === "estimated" ? `${humanize(account.confidence ?? "low")} confidence from ${account.token_samples} sample${account.token_samples === 1 ? "" : "s"} spanning ${account.percentage_points_observed.toLocaleString()} percentage point${account.percentage_points_observed === 1 ? "" : "s"}.` : "More observed percentage movement is needed before an allowance estimate can be calculated."}</p>
+          <small>{account.resets_at ? `Observed window reset ${new Date(account.resets_at).toLocaleString()}.` : "Reset time was not reported."}{account.observed_at ? ` Last observed ${new Date(account.observed_at).toLocaleString()}.` : ""}{account.plan_types.length ? ` Plan: ${account.plan_types.join(", ")}.` : ""}</small>
+        </>}
+        <div className="quota-account-aliases"><span>Combine supervisors sharing one {humanize(account.provider)} account</span>{account.supervisor_ids.map((supervisorId) => <label key={supervisorId}>{supervisorId}<input aria-label={`${humanize(account.provider)} quota account alias ${supervisorId}`} placeholder={supervisorId} value={quotaAliasValue(account.provider, supervisorId)} onChange={(event) => updateQuotaAccount(account.provider, supervisorId, event.target.value)} /></label>)}</div>
+      </article>)}</div> : <div className="config-empty quota-empty"><strong>No subscription quota observations</strong><span>A Claude- or Codex-enabled supervisor will appear after it checks in. An estimate requires completed nodes plus a reported seven-day rate-limit window.</span></div>}
+      <div className="section-heading"><div><span>Human comparison</span><h2>Metrics assumptions</h2></div></div>
+      <div className="field-row"><label>Human day rate (USD)<input aria-label="Human day rate" type="number" min="0" step="1" value={metrics.human_day_rate_usd} onChange={(event) => setMetrics({ ...metrics, human_day_rate_usd: Number(event.target.value) })} /></label></div>
+      <p className="config-help">Tickets may record estimated human days. Metrics compare that estimate at this rate with factory cost for tickets that have complete cost coverage.</p>
+      <div className="section-heading"><div><span>Evaluation vocabulary</span><h2>Quality registry</h2></div><button className="button-secondary" onClick={() => setQuality((current) => ({ attributes: [...current.attributes, { key: `quality.attribute-${current.attributes.length + 1}`, label: "New quality attribute", type: "number", unit: "", direction: "higher_is_better", minimum: null, maximum: null }] }))}>Add attribute</button></div>
+      <p className="config-help">Registered keys provide stable types, units, and direction for workflow comparisons. Unregistered report attributes remain visible on their ticket but are excluded from aggregate evaluations.</p>
+      <div className="quality-registry"><div className="quality-registry-header"><span>Key / label</span><span>Type / unit / direction</span><span>Bounds</span><span /></div>{quality.attributes.map((attribute, index) => {
+        const updateQuality = (patch: Partial<typeof attribute>) => setQuality((current) => ({ attributes: current.attributes.map((item, candidate) => candidate === index ? { ...item, ...patch } : item) }));
+        return <div className="quality-registry-row" key={`${attribute.key}:${index}`}><div><input aria-label={`Quality key ${index + 1}`} value={attribute.key} onChange={(event) => updateQuality({ key: event.target.value.toLowerCase().replace(/[^a-z0-9._-]/g, "-") })} /><input aria-label={`Quality label ${index + 1}`} value={attribute.label} onChange={(event) => updateQuality({ label: event.target.value })} /></div><div><select aria-label={`Quality type ${index + 1}`} value={attribute.type} onChange={(event) => updateQuality({ type: event.target.value as typeof attribute.type, direction: event.target.value === "number" ? attribute.direction : "neutral", minimum: event.target.value === "number" ? attribute.minimum : null, maximum: event.target.value === "number" ? attribute.maximum : null })}><option value="number">Number</option><option value="boolean">Boolean</option><option value="string">String</option></select><input aria-label={`Quality unit ${index + 1}`} placeholder="percent, ratio, findings…" value={attribute.unit} onChange={(event) => updateQuality({ unit: event.target.value })} /><select aria-label={`Quality direction ${index + 1}`} disabled={attribute.type !== "number"} value={attribute.direction} onChange={(event) => updateQuality({ direction: event.target.value as typeof attribute.direction })}><option value="higher_is_better">Higher is better</option><option value="lower_is_better">Lower is better</option><option value="neutral">Neutral</option></select></div><div><input aria-label={`Quality minimum ${index + 1}`} type="number" disabled={attribute.type !== "number"} placeholder="Minimum" value={attribute.minimum ?? ""} onChange={(event) => updateQuality({ minimum: event.target.value === "" ? null : Number(event.target.value) })} /><input aria-label={`Quality maximum ${index + 1}`} type="number" disabled={attribute.type !== "number"} placeholder="Maximum" value={attribute.maximum ?? ""} onChange={(event) => updateQuality({ maximum: event.target.value === "" ? null : Number(event.target.value) })} /></div><button className="icon-button" aria-label={`Remove quality attribute ${index + 1}`} onClick={() => setQuality((current) => ({ attributes: current.attributes.filter((_, candidate) => candidate !== index) }))}>×</button></div>;
+      })}{!quality.attributes.length && <div className="config-empty"><strong>No quality attributes registered</strong><span>Quality YAML may still be stored, but cross-workflow metrics require registered keys.</span></div>}</div>
+      <div className="section-heading"><div><span>Tracker storage</span><h2>Artifact retention & quotas</h2></div></div>
+      <label className="toggle"><input type="checkbox" checked={artifacts.auto_gc_enabled} onChange={(event) => setArtifacts({ ...artifacts, auto_gc_enabled: event.target.checked })} /><span><strong>Run automatic maintenance</strong><small>Recover crash-orphaned records after the grace window; remove only unreferenced data after both grace and retention have elapsed.</small></span></label>
+      <div className="field-row">
+        <label>Total quota (MiB)<input aria-label="Artifact total quota" type="number" min="1" step="1" value={Math.round(artifacts.max_total_bytes / 1024 ** 2)} onChange={(event) => setArtifacts({ ...artifacts, max_total_bytes: Number(event.target.value) * 1024 ** 2 })} /></label>
+        <label>Per-ticket quota (MiB)<input aria-label="Artifact ticket quota" type="number" min="1" step="1" value={Math.round(artifacts.max_ticket_bytes / 1024 ** 2)} onChange={(event) => setArtifacts({ ...artifacts, max_ticket_bytes: Number(event.target.value) * 1024 ** 2 })} /></label>
+        <label>Orphan grace (hours)<input aria-label="Artifact orphan grace" type="number" min="1" step="1" value={artifacts.orphan_grace_hours} onChange={(event) => setArtifacts({ ...artifacts, orphan_grace_hours: Number(event.target.value) })} /></label>
+        <label>Retention (days)<input aria-label="Artifact retention" type="number" min="1" step="1" value={artifacts.retention_days} onChange={(event) => setArtifacts({ ...artifacts, retention_days: Number(event.target.value) })} /></label>
+        <label>Maintenance interval (minutes)<input aria-label="Artifact maintenance interval" type="number" min="1" step="1" value={artifacts.gc_interval_minutes} onChange={(event) => setArtifacts({ ...artifacts, gc_interval_minutes: Number(event.target.value) })} /></label>
+      </div>
+      <p className="config-help">Run <code>npm run artifacts:diagnose -- /path/to/tickets</code> for a read-only orphan and integrity report.</p>
       <div className="section-heading"><div><span>Optional integration</span><h2>Jira Cloud</h2></div></div>
       <label className="toggle"><input type="checkbox" checked={jira.enabled} onChange={(event) => setJira({ ...jira, enabled: event.target.checked })} /><span><strong>Enable Jira</strong><small>Disabled personal installs make no Jira requests.</small></span></label>
       {jira.enabled && <div className="field-row"><label>Atlassian site<input aria-label="Jira site" placeholder="https://company.atlassian.net" value={jira.site_url} onChange={(event) => setJira({ ...jira, site_url: event.target.value })} /></label><label>Project key<input aria-label="Jira project key" value={jira.project_key} onChange={(event) => setJira({ ...jira, project_key: event.target.value })} /></label><label>Issue type<input aria-label="Jira issue type" value={jira.issue_type} onChange={(event) => setJira({ ...jira, issue_type: event.target.value })} /></label></div>}
@@ -440,7 +504,8 @@ function ConfigurationPage({ config, busy, onSave }: { config: TrackerConfig | n
       <label className="toggle"><input type="checkbox" checked={github.observation_enabled} onChange={(event) => setGithub({ ...github, observation_enabled: event.target.checked })} /><span><strong>Check reviewable tickets periodically</strong><small>GitHub feedback follows the explicit outcome or target configured on the current workflow node.</small></span></label>
       <div className="field-row"><label>Interval (minutes)<input aria-label="GitHub observation interval" type="number" min="1" value={github.observation_interval_minutes} onChange={(event) => setGithub({ ...github, observation_interval_minutes: Number(event.target.value) })} /></label><label>Ignored GitHub logins<input aria-label="Ignored GitHub logins" value={github.ignored_logins.join(", ")} onChange={(event) => setGithub({ ...github, ignored_logins: event.target.value.split(",").map((item) => item.trim()).filter(Boolean) })} /></label></div>
       {errors.length > 0 && <div className="draft-validation" role="alert"><strong>Configuration needs attention</strong><ul>{errors.map((item) => <li key={item}>{item}</li>)}</ul></div>}
-      <div className="config-footer"><p>Credentials stay in environment variables: JIRA_EMAIL, JIRA_API_TOKEN, and GITHUB_TOKEN.</p><button className="button-primary" disabled={!config || busy || errors.length > 0} onClick={() => onSave({ providers: { enabled: enabledProviders }, agent_profiles: agentProfiles, repositories: repositories.map((repository) => ({ id: repository.id.trim(), url: repository.url.trim() })), jira: { ...jira, site_url: jira.site_url.replace(/\/$/, ""), project_key: jira.project_key.trim(), issue_type: jira.issue_type.trim() }, github })}>Save configuration</button></div>
+      <div className="section-heading"><div><span>Built-in artifacts</span><h2>Restore defaults</h2></div><button className="button-danger" disabled={busy} onClick={onRestoreDefaults}>Restore prompts & workflows</button></div><p className="config-help">Custom artifacts are preserved. Built-in prompts and workflows return to their shipped content revision; tickets pinned to other revisions do not change.</p>
+      <div className="config-footer"><p>Credentials stay in environment variables: JIRA_EMAIL, JIRA_API_TOKEN, and GITHUB_TOKEN.</p><button className="button-primary" disabled={!config || busy || errors.length > 0} onClick={() => onSave({ providers: { enabled: enabledProviders }, agent_profiles: agentProfiles, pricing, metrics, quality, artifacts, repositories: repositories.map((repository) => ({ id: repository.id.trim(), url: repository.url.trim() })), jira: { ...jira, site_url: jira.site_url.replace(/\/$/, ""), project_key: jira.project_key.trim(), issue_type: jira.issue_type.trim() }, github })}>Save configuration</button></div>
     </section>
   </main>;
 }
@@ -455,32 +520,112 @@ function RepositoryBlockers({ blockers }: { blockers: RepositoryClaimBlocker[] }
   </section>;
 }
 
-function TicketEditor({ draft, setDraft, existing, busy, onSave, onCancel, onReady, onCustomizeWorkflow, onMigrateWorkflow, readyDisabled = false, repositories, enabledWorkProviders = ALL_WORK_PROVIDERS, workflows = [] }: {
+type QualityDisplayAttribute = { key: string; label: string; value: string | number | boolean; unit: string; status: "pass" | "warn" | "fail" | "unknown"; registered: boolean };
+function TicketQuality({ ticket }: { ticket: TicketFrontmatter }) {
+  const latest = new Map<string, { attribute: QualityDisplayAttribute; artifact: TicketFrontmatter["artifacts"][number]; reportName: string; nodeId: string; subject: string }>();
+  for (const artifact of [...(ticket.artifacts ?? [])].sort((left, right) => left.created_at.localeCompare(right.created_at))) {
+    if (artifact.kind !== "quality_report") continue;
+    const report = artifact.metadata?.quality_report;
+    if (!report || typeof report !== "object" || Array.isArray(report)) continue;
+    const record = report as Record<string, unknown>;
+    if (!Array.isArray(record.attributes)) continue;
+    const nodeId = ticket.workflow?.node_runs.find((run) => run.id === artifact.node_run_id)?.node_id ?? "unknown-node";
+    const subjectRecord = record.subject && typeof record.subject === "object" && !Array.isArray(record.subject) ? record.subject as Record<string, unknown> : {};
+    const subject = [subjectRecord.type, subjectRecord.repository, subjectRecord.ref, subjectRecord.commit].filter((value) => typeof value === "string").join(" · ");
+    for (const candidate of record.attributes) {
+      if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) continue;
+      const attribute = candidate as Record<string, unknown>;
+      if (typeof attribute.key !== "string" || !["string", "number", "boolean"].includes(typeof attribute.value)) continue;
+      latest.set(`${nodeId}/${JSON.stringify(subjectRecord)}/${attribute.key}`, {
+        artifact, reportName: typeof record.name === "string" ? record.name : artifact.filename, nodeId, subject,
+        attribute: {
+          key: attribute.key, label: typeof attribute.label === "string" ? attribute.label : attribute.key,
+          value: attribute.value as string | number | boolean, unit: typeof attribute.unit === "string" ? attribute.unit : "",
+          status: ["pass", "warn", "fail", "unknown"].includes(String(attribute.status)) ? attribute.status as QualityDisplayAttribute["status"] : "unknown",
+          registered: attribute.registered === true,
+        },
+      });
+    }
+  }
+  if (!latest.size) return null;
+  return <section className="side-card quality-card"><div className="section-heading"><div><span>Evaluation evidence</span><h2>Quality</h2></div><small>{latest.size} attribute{latest.size === 1 ? "" : "s"}</small></div><div className="quality-list">{[...latest.entries()].sort((left, right) => left[1].attribute.label.localeCompare(right[1].attribute.label)).map(([identity, { attribute, artifact, reportName, nodeId, subject }]) => <div className={`quality-item quality-${attribute.status}`} key={identity}><span><i />{attribute.label}<small>{attribute.key} · {humanize(nodeId)}{subject ? ` · ${subject}` : ""}{attribute.registered ? "" : " · unregistered"}</small></span><strong>{String(attribute.value)}{attribute.unit ? ` ${attribute.unit}` : ""}</strong><a href={api.artifactUrl(ticket.id, artifact.id)} target="_blank" rel="noreferrer" title={reportName}>YAML ↗</a></div>)}</div></section>;
+}
+
+type EvidenceTab = "artifacts" | "runs" | "manifests" | "outputs" | "checkpoints" | "attachments";
+
+function TicketEvidence({ ticket, workflow, busy, now, onUpload, onRemoveAttachment, onCreateCheckpoint, onRestoreCheckpoint }: {
+  ticket: TicketDetail; workflow?: WorkflowDocument["definition"]; busy: boolean; now: number;
+  onUpload: (files: File[]) => void; onRemoveAttachment: (id: string) => void;
+  onCreateCheckpoint: (nodeId: string) => void; onRestoreCheckpoint: (nodeId: string, checkpointId: string) => void;
+}) {
+  const [tab, setTab] = useState<EvidenceTab>("artifacts");
+  const frontmatter = ticket.frontmatter!;
+  const artifacts = [...(frontmatter.artifacts ?? [])].sort((left, right) => right.created_at.localeCompare(left.created_at));
+  const runs = [...(frontmatter.workflow?.node_runs ?? [])].reverse();
+  const manifests = artifacts.filter((artifact) => artifact.kind === "execution_manifest" || artifact.kind === "checkpoint_manifest");
+  const outputArtifacts = artifacts.filter((artifact) => ["script_output", "script_artifact", "quality_report"].includes(artifact.kind));
+  const outputRuns = runs.filter((run) => Boolean(run.output_path));
+  const checkpoints = [...(frontmatter.checkpoints ?? [])].reverse();
+  const attachments = frontmatter.attachments ?? [];
+  const runById = new Map(runs.map((run) => [run.id, run]));
+  const nodeName = (nodeId: string) => workflow?.nodes.find((node) => node.id === nodeId)?.name ?? humanize(nodeId);
+  const tabs: Array<{ id: EvidenceTab; label: string; count: number }> = [
+    { id: "artifacts", label: "All artifacts", count: artifacts.length },
+    { id: "runs", label: "Run history", count: runs.length },
+    { id: "manifests", label: "Manifests", count: manifests.length },
+    { id: "outputs", label: "Outputs", count: outputArtifacts.length + outputRuns.length },
+    { id: "checkpoints", label: "Checkpoints", count: checkpoints.length },
+    { id: "attachments", label: "Attachments", count: attachments.length },
+  ];
+  const artifactList = (items: typeof artifacts) => items.length ? <div className="evidence-list">{items.map((artifact) => {
+    const run = artifact.node_run_id ? runById.get(artifact.node_run_id) : undefined;
+    return <article className="evidence-item" key={artifact.id}><div className="evidence-kind"><span>{humanize(artifact.kind)}</span><small>{artifact.content_type}</small></div><div><strong>{artifact.filename}</strong><small>{fileSize(artifact.size_bytes)} · {timeAgo(artifact.created_at, now)}{run ? ` · ${nodeName(run.node_id)} attempt ${run.attempt}` : ""}</small><code>sha256:{artifact.sha256}</code></div><div className="evidence-actions"><a href={api.artifactUrl(frontmatter.id, artifact.id)} target="_blank" rel="noreferrer">Open ↗</a><a href={api.artifactUrl(frontmatter.id, artifact.id, true)}>Download</a></div></article>;
+  })}</div> : <div className="evidence-empty">No evidence is available in this category.</div>;
+  const runList = runs.length ? <div className="run-evidence-list">{runs.map((run) => <details className="run-evidence" key={run.id}><summary><span><strong>{nodeName(run.node_id)}</strong><small>{humanize(run.node_type)} · visit {run.visit} · attempt {run.attempt}{run.conversation_generation ? ` · conversation g${run.conversation_generation}` : ""}</small></span><span><StatusPill value={run.status} subtle /><small>{run.outcome ? humanize(run.outcome) : "No outcome"}</small></span></summary><div className="run-evidence-body"><NodeTimingDetails run={run} now={now} />{run.telemetry && <TelemetryDetails telemetry={run.telemetry} compact />}{(run.supervisor_id || run.provider) && <p><strong>Executor</strong>{[run.supervisor_id, run.provider && humanize(run.provider)].filter(Boolean).join(" · ")}</p>}{run.lease_id && <p><strong>Lease / run</strong><code>{run.lease_id} · {run.id}</code></p>}<p><strong>Workflow revision</strong><code>{run.workflow_revision}{run.input_revision === undefined ? "" : ` · ticket r${run.input_revision}`}</code></p>{run.wait && <p><strong>Durable wait</strong>Wake {timeAgo(run.wait.wake_at, now)} · deadline {timeAgo(run.wait.deadline_at, now)} · {run.wait.delay_seconds}s delay</p>}{run.summary && <p><strong>Summary</strong>{run.summary}</p>}{run.handoff && <p><strong>Handoff</strong>{run.handoff}</p>}{run.script_path && <p><strong>Script</strong><code>{run.script_path}</code></p>}{run.working_directory && <p><strong>Working directory</strong><code>{run.working_directory}</code></p>}{Object.keys(run.metadata_writes ?? {}).length > 0 && <p><strong>Metadata writes</strong><code>{JSON.stringify(run.metadata_writes)}</code></p>}{(run.external_references ?? []).map((reference) => <p key={`${reference.type}:${reference.id}`}><strong>{humanize(reference.type)}</strong>{reference.url ? <a href={reference.url} target="_blank" rel="noreferrer">{reference.id} ↗</a> : reference.id}</p>)}<div className="evidence-actions">{run.output_path && <a href={`/api/tickets/${encodeURIComponent(frontmatter.id)}/runs/${encodeURIComponent(run.id)}/output`} target="_blank" rel="noreferrer">Full output ({fileSize(run.output_bytes ?? 0)}) ↗</a>}{run.manifest_artifact_id && <a href={api.artifactUrl(frontmatter.id, run.manifest_artifact_id)} target="_blank" rel="noreferrer">Execution manifest ↗</a>}</div></div></details>)}</div> : <div className="evidence-empty">No node runs have been recorded.</div>;
+  return <section className="content-card evidence-card" aria-label="Evidence and artifacts">
+    <div className="section-heading"><div><span>Durable execution record</span><h2>Evidence &amp; artifacts</h2><p>Browse tracker-owned files, complete run history, manifests, outputs, checkpoints, and supporting files.</p></div><strong>{artifacts.length} stored</strong></div>
+    <div className="evidence-tabs" role="tablist" aria-label="Evidence categories">{tabs.map((item) => <button type="button" role="tab" aria-selected={tab === item.id} className={tab === item.id ? "active" : ""} key={item.id} onClick={() => setTab(item.id)}>{item.label}<span>{item.count}</span></button>)}</div>
+    <div className="evidence-panel" role="tabpanel">
+      {tab === "artifacts" && artifactList(artifacts)}
+      {tab === "runs" && runList}
+      {tab === "manifests" && artifactList(manifests)}
+      {tab === "outputs" && <>{outputRuns.length > 0 && <div className="persisted-output-list">{outputRuns.map((run) => <a key={run.id} href={`/api/tickets/${encodeURIComponent(frontmatter.id)}/runs/${encodeURIComponent(run.id)}/output`} target="_blank" rel="noreferrer"><span><strong>{nodeName(run.node_id)} output</strong><small>Visit {run.visit} · attempt {run.attempt} · {fileSize(run.output_bytes ?? 0)}</small></span><span>Open ↗</span></a>)}</div>}{outputArtifacts.length > 0 ? artifactList(outputArtifacts) : outputRuns.length === 0 ? <div className="evidence-empty">No persisted outputs have been recorded.</div> : null}</>}
+      {tab === "checkpoints" && <><div className="checkpoint-toolbar">{workflow?.nodes.filter((node) => node.type === "checkpoint").map((node) => <button key={node.id} className="button-secondary button-compact" disabled={busy || Boolean(frontmatter.execution?.interrupt_request)} onClick={() => onCreateCheckpoint(node.id)}>＋ {node.name}</button>)}</div>{checkpoints.length ? <div className="evidence-list">{checkpoints.map((checkpoint) => <article className="checkpoint-evidence" key={checkpoint.id}><header><span><strong>{checkpoint.label}</strong><small>{humanize(checkpoint.kind)} · {timeAgo(checkpoint.created_at, now)} · {checkpoint.id}</small></span><a href={api.artifactUrl(frontmatter.id, checkpoint.manifest_artifact_id)} target="_blank" rel="noreferrer">Manifest ↗</a></header>{checkpoint.repositories.map((repository) => <div key={repository.repository}><span><strong>{repository.repository}</strong><small>{repository.branch ?? "detached"} · {repository.dirty ? "working changes included" : "clean"}</small></span><code>{repository.snapshot_sha}</code><a href={api.artifactUrl(frontmatter.id, repository.bundle_artifact_id, true)}>Bundle</a></div>)}<footer>{workflow?.nodes.filter((node) => node.type === "restore_checkpoint").map((node) => <button key={node.id} className="button-secondary button-compact" disabled={busy || Boolean(frontmatter.execution?.interrupt_request)} onClick={() => { if (window.confirm(`Restore ${checkpoint.label}? Current repository state will first be checkpointed.`)) onRestoreCheckpoint(node.id, checkpoint.id); }}>Restore via {node.name}</button>)}</footer></article>)}</div> : <div className="evidence-empty">No checkpoints have been recorded.</div>}</>}
+      {tab === "attachments" && <><div className="attachment-evidence-toolbar"><p>Supporting files are materialized into every new assignment bundle.</p><label className="attachment-picker compact"><input aria-label="Add ticket attachments" type="file" multiple disabled={busy} onChange={(event) => { const files = Array.from(event.target.files ?? []); if (files.length) onUpload(files); event.target.value = ""; }} /><span>＋ Add files</span></label></div>{attachments.length ? <div className="attachment-grid">{attachments.map((attachment) => { const source = api.attachmentUrl(ticket.id, attachment.id); return <article className="attachment-item" key={attachment.id}>{attachment.content_type.startsWith("image/") && <a className="attachment-preview" href={source} target="_blank" rel="noreferrer"><img src={source} alt={attachment.filename} /></a>}<div><a href={api.attachmentUrl(ticket.id, attachment.id, true)}><strong>{attachment.filename}</strong></a><small>{fileSize(attachment.size_bytes)} · {attachment.content_type}</small></div><button className="icon-button" aria-label={`Remove ${attachment.filename}`} disabled={busy} onClick={() => onRemoveAttachment(attachment.id)}>×</button></article>; })}</div> : <div className="evidence-empty">No files are attached to this ticket.</div>}</>}
+    </div>
+  </section>;
+}
+
+function TicketEditor({ draft, setDraft, existing, busy, onSave, onCancel, onReady, onCustomizeWorkflow, onMigrateWorkflow, readyDisabled = false, repositories, workflows = [], workflowReleases, existingAttachments = [], onRemoveAttachment }: {
   draft: TicketDraft; setDraft: React.Dispatch<React.SetStateAction<TicketDraft>>; existing: boolean; busy: boolean;
-  onSave: () => void; onCancel: () => void; onReady?: () => void; onCustomizeWorkflow?: () => void; onMigrateWorkflow?: () => void; readyDisabled?: boolean; repositories?: RepositoryConfig[]; enabledWorkProviders?: WorkProvider[]; workflows?: WorkflowDocument[];
+  onSave: () => void; onCancel: () => void; onReady?: () => void; onCustomizeWorkflow?: () => void; onMigrateWorkflow?: () => void; readyDisabled?: boolean; repositories?: RepositoryConfig[]; workflows?: WorkflowDocument[]; workflowReleases?: WorkflowReleaseCatalog;
+  existingAttachments?: TicketFrontmatter["attachments"]; onRemoveAttachment?: (id: string) => void;
 }) {
   const validationErrors = draftErrors(draft);
-  const selectableWorkProviders = existing && !enabledWorkProviders.includes(draft.workProvider)
-    ? [draft.workProvider, ...enabledWorkProviders] : enabledWorkProviders;
-  const selectedWorkflow = workflows.find((workflow) => workflow.definition.id === draft.workflowId)?.definition;
+  const availableReleases = workflowReleases?.releases.filter((release) => release.workflow_id === draft.workflowId && release.status !== "retired") ?? [];
+  const selectedRelease = availableReleases.find((release) => release.revision === draft.workflowRevision)
+    ?? availableReleases.find((release) => release.is_default);
+  const selectedWorkflow = selectedRelease?.definition ?? workflows.find((workflow) => workflow.definition.id === draft.workflowId)?.definition;
   const update = <K extends keyof TicketDraft>(key: K, value: TicketDraft[K]) => setDraft((current) => ({ ...current, [key]: value }));
-  const updateWorkProvider = (workProvider: WorkProvider) => setDraft((current) => ({
-    ...current, workProvider, reviewProvider: defaultReviewProvider(workProvider),
-  }));
   const selectWorkflow = (workflowId: string) => {
-    const workflow = workflows.find((item) => item.definition.id === workflowId)?.definition;
+    const release = workflowReleases?.releases.find((item) => item.workflow_id === workflowId && item.is_default);
+    const workflow = release?.definition ?? workflows.find((item) => item.definition.id === workflowId)?.definition;
     setDraft((current) => ({
-      ...current, workflowId,
+      ...current, workflowId, workflowRevision: release?.revision ?? "",
       workflowInputs: Object.fromEntries(workflow?.inputs.map((input) => [input.id, input.default]) ?? []),
       stageEnabled: Object.fromEntries(workflow?.stages.map((stage) => [stage.id, stage.skippable ? stage.default_enabled : true]) ?? []),
-      specRequired: workflow ? workflow.stages.some((stage) => stage.phase === "specification" && stage.default_enabled) : current.specRequired,
-      reviewRequired: workflow ? workflow.stages.some((stage) => stage.phase === "review" && stage.default_enabled) : current.reviewRequired,
+    }));
+  };
+  const selectRevision = (revision: string) => {
+    const release = availableReleases.find((item) => item.revision === revision);
+    if (!release) return;
+    setDraft((current) => ({ ...current, workflowRevision: revision,
+      workflowInputs: Object.fromEntries(release.definition.inputs.map((input) => [input.id, input.default])),
+      stageEnabled: Object.fromEntries(release.definition.stages.map((stage) => [stage.id, stage.skippable ? stage.default_enabled : true])),
     }));
   };
   const setStageEnabled = (stage: WorkflowDocument["definition"]["stages"][number], enabled: boolean) => setDraft((current) => ({
     ...current, stageEnabled: { ...current.stageEnabled, [stage.id]: stage.skippable ? enabled : true },
-    ...(stage.phase === "specification" ? { specRequired: enabled } : {}),
-    ...(stage.phase === "review" ? { reviewRequired: enabled } : {}),
   }));
   const updateRepository = (index: number, patch: Partial<{ id: string; primary: boolean }>) => setDraft((current) => ({
     ...current,
@@ -494,14 +639,22 @@ function TicketEditor({ draft, setDraft, existing, busy, onSave, onCancel, onRea
         <label>Title<input aria-label="Title" value={draft.title} onChange={(event) => update("title", event.target.value)} /></label>
         <label>Ticket ID <span>{existing ? "Ticket IDs cannot be changed after creation" : draft.jira ? "Imported from Jira" : draft.autoId ? "Suggested automatically; edit to use a custom ID" : "Custom ticket ID"}</span><input aria-label="Ticket ID" disabled={existing || draft.jira !== null} value={draft.id} onChange={(event) => setDraft((current) => ({ ...current, id: event.target.value, autoId: false }))} /></label>
         <label>Description <span>Markdown supported</span><textarea className="description-editor" aria-label="Description" value={draft.description} onChange={(event) => update("description", event.target.value)} /></label>
+        <div className="ticket-attachments-editor">
+          <div><strong>Attachments</strong><span>Images, documents, logs, and other supporting files · 25 MB each</span></div>
+          <label className="attachment-picker"><input aria-label="Ticket attachments" type="file" multiple onChange={(event) => { const files = Array.from(event.target.files ?? []); update("attachmentFiles", [...draft.attachmentFiles, ...files]); event.target.value = ""; }} /><span>＋ Choose files</span></label>
+          {(existingAttachments.length > 0 || draft.attachmentFiles.length > 0) && <div className="attachment-edit-list">
+            {existingAttachments.map((attachment) => <div key={attachment.id}><span><strong>{attachment.filename}</strong><small>{fileSize(attachment.size_bytes)}</small></span>{onRemoveAttachment && <button type="button" className="icon-button" aria-label={`Remove ${attachment.filename}`} disabled={busy} onClick={() => onRemoveAttachment(attachment.id)}>×</button>}</div>)}
+            {draft.attachmentFiles.map((file, index) => <div key={`${file.name}-${file.lastModified}-${index}`}><span><strong>{file.name}</strong><small>{fileSize(file.size)} · uploads when saved</small></span><button type="button" className="icon-button" aria-label={`Remove queued ${file.name}`} onClick={() => update("attachmentFiles", draft.attachmentFiles.filter((_, candidate) => candidate !== index))}>×</button></div>)}
+          </div>}
+        </div>
       </section>
       <aside className="form-card form-properties">
         <h2>Work settings</h2>
-        <label>Work agent<select aria-label="Work agent" value={draft.workProvider} onChange={(event) => updateWorkProvider(event.target.value as WorkProvider)}>{selectableWorkProviders.map((provider) => <option key={provider} value={provider}>{humanize(provider)}</option>)}</select></label>
-        <label>Review agent<select aria-label="Review agent" disabled value={draft.reviewProvider} onChange={(event) => update("reviewProvider", event.target.value as ReviewProvider)}><option value="codex">Codex</option><option value="claude">Claude</option></select><span>{`${humanize(draft.workProvider)} work is reviewed by ${humanize(draft.reviewProvider)}`}</span></label>
         <label>Priority<input aria-label="Priority" type="number" value={draft.priority} onChange={(event) => update("priority", Number(event.target.value))} /></label>
+        <label>Estimated human days <span>Optional comparison baseline</span><input aria-label="Estimated human days" type="number" min="0" step="0.25" value={draft.estimatedHumanDays ?? ""} onChange={(event) => update("estimatedHumanDays", event.target.value === "" ? null : Number(event.target.value))} /></label>
         <label>Labels <span>Comma separated</span><input aria-label="Labels" value={draft.labels} onChange={(event) => update("labels", event.target.value)} /></label>
         <label>Workflow<select aria-label="Workflow" disabled={existing} value={draft.workflowId} onChange={(event) => selectWorkflow(event.target.value)}>{workflows.filter((workflow) => workflow.valid).map((workflow) => <option key={workflow.definition.id} value={workflow.definition.id}>{workflow.definition.name}</option>)}</select><span>{existing ? "Pinned when the ticket was created" : "A versioned workflow revision will be pinned"}</span></label>
+        {!existing && availableReleases.length > 0 && <label>Workflow revision<select aria-label="Workflow revision" value={selectedRelease?.revision ?? ""} onChange={(event) => selectRevision(event.target.value)}>{availableReleases.map((release) => <option key={release.revision} value={release.revision}>v{release.version} · {release.label}{release.is_default ? " · Default" : " · Trial"}</option>)}</select><span>Trials are pinned only to this ticket.</span></label>}
       </aside>
       {selectedWorkflow && (selectedWorkflow.inputs.length > 0 || selectedWorkflow.stages.length > 0) && <section className="form-card workflow-ticket-options"><div className="section-heading"><div><span>Workflow</span><h2>Ticket path</h2></div></div>
         {selectedWorkflow.stages.length > 0 && <div className="ticket-stage-options"><h3>Stages</h3>{selectedWorkflow.stages.map((stage) => <label className="toggle" key={stage.id}><input type="checkbox" disabled={!stage.skippable} checked={stage.skippable ? draft.stageEnabled[stage.id] ?? stage.default_enabled : true} onChange={(event) => setStageEnabled(stage, event.target.checked)} /><span><strong>{stage.name}</strong><small>{stage.skippable ? `Configurable · bypasses to ${selectedWorkflow.nodes.find((node) => node.id === stage.bypass_to)?.name ?? stage.bypass_to}` : "Required stage"}</small></span></label>)}</div>}
@@ -537,6 +690,18 @@ function PriorityEditor({ value, busy, onSave }: { value: number; busy: boolean;
   </form>;
 }
 
+function HumanEstimateEditor({ value, busy, onSave }: { value: number | null; busy: boolean; onSave: (days: number | null) => void }) {
+  const [draft, setDraft] = useState(value === null ? "" : String(value));
+  useEffect(() => setDraft(value === null ? "" : String(value)), [value]);
+  const days = draft.trim() === "" ? null : Number(draft);
+  const valid = days === null || Number.isFinite(days) && days >= 0;
+  const unchanged = days === value;
+  return <form className="priority-editor" onSubmit={(event) => { event.preventDefault(); if (valid && !unchanged) onSave(days); }}>
+    <input aria-label="Estimated human days" type="number" min="0" step="0.25" placeholder="Not set" value={draft} onChange={(event) => setDraft(event.target.value)} />
+    <button className="button-secondary button-compact" type="submit" disabled={busy || !valid || unchanged}>Update</button>
+  </form>;
+}
+
 function tokenCount(value: number | null | undefined): string {
   return value === null || value === undefined ? "—" : new Intl.NumberFormat("en-US", { notation: "compact", maximumFractionDigits: 1 }).format(value);
 }
@@ -552,6 +717,7 @@ function nodeTiming(run: TicketNodeRun, now: number) {
   let activeMs = run.timing.active_ms;
   let quotaPausedMs = run.timing.quota_paused_ms;
   let humanWaitMs = run.timing.human_wait_ms;
+  let externalWaitMs = run.timing.external_wait_ms ?? 0;
   if (run.status === "running" && run.timing.last_accounted_at) {
     const prior = Date.parse(run.timing.last_accounted_at);
     if (Number.isFinite(prior) && now > prior) {
@@ -563,20 +729,22 @@ function nodeTiming(run: TicketNodeRun, now: number) {
         elapsed -= paused;
         activeMs += elapsed;
       } else if (run.timing.state === "human_wait") humanWaitMs += elapsed;
+      else if (run.timing.state === "external_wait") externalWaitMs += elapsed;
       else activeMs += elapsed;
     }
   }
   const end = run.completed_at ? Date.parse(run.completed_at) : now;
   const wallMs = Math.max(0, end - Date.parse(run.started_at));
-  return { activeMs, quotaPausedMs, humanWaitMs, wallMs };
+  return { activeMs, quotaPausedMs, humanWaitMs, externalWaitMs, wallMs };
 }
 
 function NodeTimingDetails({ run, now }: { run: TicketNodeRun; now: number }) {
   const timing = nodeTiming(run, now);
   const parts = [`${duration(timing.wallMs)} wall`];
-  if (timing.activeMs > 0 || run.node_type === "agent" || run.node_type === "script") parts.push(`${duration(timing.activeMs)} active`);
+  if (timing.activeMs > 0 || run.node_type === "agent" || isDeterministicActivity(run.node_type)) parts.push(`${duration(timing.activeMs)} active`);
   if (timing.quotaPausedMs > 0 || run.timing.state === "quota_paused") parts.push(`${duration(timing.quotaPausedMs)} quota paused`);
   if (timing.humanWaitMs > 0 || run.node_type === "human_gate") parts.push(`${duration(timing.humanWaitMs)} human wait`);
+  if (timing.externalWaitMs > 0 || run.node_type === "wait") parts.push(`${duration(timing.externalWaitMs)} external wait`);
   return <small className="run-telemetry">{parts.join(" · ")}{run.timing.state === "quota_paused" && run.timing.pause_until ? ` · resets in ${duration(Date.parse(run.timing.pause_until) - now)}` : ""}</small>;
 }
 
@@ -604,6 +772,7 @@ function TelemetryDetails({ telemetry, compact = false }: { telemetry: HarnessTe
       <DetailRow label="Reasoning">{reasoning}</DetailRow>
       {delta.usage && <DetailRow label="Cached input">{tokenCount(delta.usage.cached_input_tokens)} read · {tokenCount(delta.usage.cache_write_input_tokens)} written</DetailRow>}
       {delta.usage && delta.usage.reasoning_output_tokens > 0 && <DetailRow label="Reasoning tokens">{tokenCount(delta.usage.reasoning_output_tokens)}</DetailRow>}
+      {latest.cost.pricing_id && <DetailRow label="Pricing"><a href={latest.cost.source ?? undefined} target="_blank" rel="noreferrer"><code>{latest.cost.pricing_id}</code>{latest.cost.effective_at ? ` · ${latest.cost.effective_at.slice(0, 10)}` : ""}</a></DetailRow>}
       {latest.context.window_tokens !== null && <DetailRow label="Context">{tokenCount(latest.context.used_tokens)} / {tokenCount(latest.context.window_tokens)}{latest.context.used_percent !== null ? ` (${latest.context.used_percent.toFixed(1)}%)` : ""}</DetailRow>}
       <DetailRow label="Observed">{timeAgo(latest.observed_at, Date.now())}</DetailRow>
     </dl>
@@ -612,7 +781,7 @@ function TelemetryDetails({ telemetry, compact = false }: { telemetry: HarnessTe
   </div>;
 }
 
-function TicketUsage({ ticket, now }: { ticket: TicketFrontmatter; now: number }) {
+function TicketUsage({ ticket, now, humanDayRate }: { ticket: TicketFrontmatter; now: number; humanDayRate: number }) {
   const agentRuns = ticket.workflow?.node_runs.filter((run) => run.node_type === "agent") ?? [];
   const measured = agentRuns.filter((run) => run.telemetry);
   const totalTokens = measured.reduce((sum, run) => sum + (run.telemetry?.delta.usage?.total_tokens ?? 0), 0);
@@ -626,6 +795,8 @@ function TicketUsage({ ticket, now }: { ticket: TicketFrontmatter; now: number }
   const quotaPausedMs = runTimings.reduce((sum, timing) => sum + timing.quotaPausedMs, 0);
   const humanWaitMs = runTimings.reduce((sum, timing) => sum + timing.humanWaitMs, 0);
   const workflowElapsed = ticket.workflow ? Math.max(0, Date.parse(ticket.workflow.completed_at ?? new Date(now).toISOString()) - Date.parse(ticket.workflow.started_at)) : 0;
+  const humanCost = ticket.estimated_human_days === null ? null : ticket.estimated_human_days * humanDayRate;
+  const completeCost = agentRuns.length > 0 && costRuns.length === agentRuns.length;
   if (!ticket.workflow?.node_runs.length && !measured.length) return null;
   return <section className="side-card" aria-label="Ticket usage">
     <div className="section-heading"><div><span>Accounting</span><h2>Ticket totals</h2></div></div>
@@ -636,6 +807,8 @@ function TicketUsage({ ticket, now }: { ticket: TicketFrontmatter; now: number }
       <div><span>Active runtime</span><strong>{duration(activeMs)}</strong></div>
       <div><span>Quota paused</span><strong>{duration(quotaPausedMs)}</strong></div>
       <div><span>Human wait</span><strong>{duration(humanWaitMs)}</strong></div>
+      <div><span>Human estimate</span><strong>{ticket.estimated_human_days === null ? "Not set" : `${ticket.estimated_human_days}d · ${usd(humanCost)}`}</strong></div>
+      <div><span>Estimated savings</span><strong>{humanCost !== null && completeCost ? usd(humanCost - totalCost) : "Unavailable"}</strong></div>
     </div>
     <p className="telemetry-coverage">Token coverage: {tokenCoverage}/{agentRuns.length} agent runs · Cost coverage: {costRuns.length}/{agentRuns.length}{estimatedCostRuns ? ` (${estimatedCostRuns} estimated)` : ""}. Subscription-backed harnesses may not expose per-ticket USD cost. Quota-pause accounting requires harness rate-limit telemetry; wall time does not.</p>
     {models.length > 0 && <div className="model-list">{models.map((model) => <code key={model}>{model}</code>)}</div>}
@@ -643,24 +816,29 @@ function TicketUsage({ ticket, now }: { ticket: TicketFrontmatter; now: number }
 }
 
 function RuntimePanel({ execution, now }: { execution: Execution; now: number }) {
-  const activity = execution.node_type === "script";
+  const activity = isDeterministicActivity(execution.node_type);
   const herdr = execution.herdr_observation;
-  const state = herdr?.state ?? execution.observed_herdr_state ?? "unobserved";
+  const herdrState = herdr?.state ?? execution.observed_herdr_state ?? "unobserved";
+  const deliveryStatus = execution.delivery_status ?? "delivered";
+  const state = activity || deliveryStatus === "delivered" ? "running" : "starting";
   const warning = runtimeWarning(execution, now);
   const title = herdr?.terminal_title_stripped ?? herdr?.terminal_title;
   return <section className="side-card runtime-panel">
-    <div className="section-heading"><div><span>{activity ? "Deterministic activity" : "Herdr runtime"}</span><h2>{activity ? humanize(execution.node_id ?? execution.node_type ?? "activity") : herdr?.display_name ?? execution.provider}</h2></div><StatusPill value={activity ? "running" : state} /></div>
+    <div className="section-heading"><div><span>{activity ? "Deterministic activity" : "Herdr runtime"}</span><h2>{activity ? humanize(execution.node_id ?? execution.node_type ?? "activity") : herdr?.display_name ?? execution.provider}</h2></div><StatusPill value={state} /></div>
     {title && <p className="activity-title">{title}</p>}
+    {!activity && deliveryStatus === "starting" && <p className="activity-title">Preparing the agent and confirming assignment delivery.</p>}
     {execution.interrupt_request && <div className="attention-banner"><strong>Interrupt requested</strong><span>Waiting for {activity ? "the running script" : "Herdr"} to stop before {execution.interrupt_request.terminal_status ? `marking the ticket ${execution.interrupt_request.terminal_status}` : `restarting at ${humanize(execution.interrupt_request.target_phase)}`}.</span></div>}
     {warning && <div className="attention-banner"><strong>Attention</strong><span>{warning}</span></div>}
     <div className="metric-grid">
       <div><span>Running</span><strong>{duration(now - Date.parse(execution.claimed_at))}</strong></div>
-      <div><span>State for</span><strong>{herdr ? duration(now - Date.parse(herdr.state_changed_at)) : "—"}</strong></div>
+      <div><span>Herdr state for</span><strong>{herdr ? duration(now - Date.parse(herdr.state_changed_at)) : "—"}</strong></div>
       <div><span>Heartbeat</span><strong>{timeAgo(execution.last_heartbeat_at, now)}</strong></div>
       <div><span>Lease left</span><strong>{duration(Date.parse(execution.lease_expires_at) - now)}</strong></div>
     </div>
     <dl className="details-list">
       <DetailRow label="Supervisor">{execution.supervisor_id}</DetailRow>
+      {!activity && <DetailRow label="Herdr observation">{humanize(herdrState)}</DetailRow>}
+      {!activity && <DetailRow label="Assignment delivered">{execution.delivery_confirmed_at ? new Date(execution.delivery_confirmed_at).toLocaleString() : "Pending"}</DetailRow>}
       <DetailRow label="Attempt">#{execution.attempt}</DetailRow>
       {herdr?.pane_id && <DetailRow label="Herdr location">{[herdr.workspace_id, herdr.tab_id, herdr.pane_id].filter(Boolean).join(" / ")}</DetailRow>}
       {herdr?.foreground_cwd && <DetailRow label="Working directory"><code>{herdr.foreground_cwd}</code></DetailRow>}
@@ -746,9 +924,9 @@ function PromptEditorPage({ prompts, onUpdated, onError }: {
   return <main className="prompt-page">
     <div className="health-heading"><div><span>Agent messages</span><h1>Prompt editor</h1><p>Create, reuse, and publish versioned Markdown instructions for workflow nodes.</p></div><div className="artifact-actions"><button className="button-secondary" disabled={busy || !cloneable} title={cloneable ? "Copy the selected prompt into a new artifact" : "System envelope and live-guidance prompts cannot be used as workflow-node prompts"} onClick={beginClone}>Clone prompt</button><button className="button-primary" disabled={busy} onClick={beginNew}>New prompt</button></div></div>
     <div className="prompt-layout">
-      <aside className="prompt-list" aria-label="Prompt templates">{creatingName && <button className="active artifact-draft"><strong>{activeTitle}</strong><small>{creatingName}.md · unsaved</small></button>}{prompts.map((prompt) => <button className={!creatingName && prompt.name === selected.name ? "active" : ""} key={prompt.name} onClick={() => { setCreatingName(null); setSelectedName(prompt.name); }}><strong>{prompt.title}</strong><small>{prompt.name}.md</small>{!prompt.valid && <em>Invalid</em>}</button>)}</aside>
+      <aside className="prompt-list" aria-label="Prompt templates">{creatingName && <button className="active artifact-draft"><strong>{activeTitle}</strong><small>{creatingName}.md · unsaved</small></button>}{prompts.map((prompt) => <button className={!creatingName && prompt.name === selected.name ? "active" : ""} key={prompt.name} onClick={() => { setCreatingName(null); setSelectedName(prompt.name); }}><strong>{prompt.title}</strong><small>{prompt.name}.md · v{prompt.version}</small>{!prompt.valid && <em>Invalid</em>}</button>)}</aside>
       <section className="prompt-editor-card">
-        <div className="prompt-heading"><div><span>{activeName}.md</span><h2>{activeTitle}</h2><p>{creatingName ? "New reusable workflow-node instructions." : selected.purpose}</p></div>{creatingName ? <span className="prompt-validity draft">Draft</span> : <span className={`prompt-validity ${selected.valid ? "valid" : "invalid"}`}>{selected.valid ? "Valid" : "Needs repair"}</span>}</div>
+        <div className="prompt-heading"><div><span>{activeName}.md{!creatingName ? ` · v${selected.version}` : ""}</span><h2>{activeTitle}</h2><p>{creatingName ? "New reusable workflow-node instructions." : selected.purpose}</p></div>{creatingName ? <span className="prompt-validity draft">Draft</span> : <span className={`prompt-validity ${selected.valid ? "valid" : "invalid"}`}>{selected.valid ? "Valid" : "Needs repair"}</span>}</div>
         {creatingName && <label className="artifact-id-field"><span>Prompt ID</span><input aria-label="Prompt ID" value={creatingName} onChange={(event) => setCreatingName(event.target.value.toLowerCase().replace(/[^a-z0-9-]/g, "-"))} /><small>Lowercase letters, numbers, and hyphens. This becomes the Markdown filename.</small></label>}
         {!creatingName && <section className="prompt-trigger"><span>When this runs</span><strong>{selected.trigger}</strong><div>{selected.stages.map((stage) => <small key={stage}>{stage}</small>)}</div>{(selected.workflow_references ?? []).map((reference) => <p key={`${reference.workflow_id}:${reference.node_id}`}><b>{reference.workflow_name}</b> · {reference.node_name} · outcomes {reference.outcomes.join(", ")}</p>)}</section>}
         {!creatingName && !selected.valid && <div className="draft-validation" role="alert"><strong>Saved prompt is invalid</strong><ul>{selected.errors.map((error) => <li key={error}>{error}</li>)}</ul></div>}
@@ -762,7 +940,7 @@ function PromptEditorPage({ prompts, onUpdated, onError }: {
 }
 
 const GRAPH_NODE_WIDTH = 208;
-const GRAPH_NODE_HEIGHT = 112;
+const GRAPH_NODE_HEIGHT = 148;
 const GRAPH_COLUMN_GAP = 92;
 
 type WorkflowRoute = WorkflowNode["outcomes"][number];
@@ -770,10 +948,14 @@ type WorkflowRoute = WorkflowNode["outcomes"][number];
 function nodeRoutes(node: WorkflowNode): WorkflowRoute[] {
   if (node.type === "agent") return node.outcomes;
   if (node.type === "human_gate") return node.choices;
-  if (node.type === "script") return node.exit_codes;
+  if (["script", "checkpoint", "restore_checkpoint"].includes(node.type)) return node.exit_codes;
   if (node.type === "read") return node.metadata_cases ?? [];
   if (node.type === "workflow") return node.status_codes ?? [];
   if (node.type === "fan_out") return node.branches ?? [];
+  if (node.type === "wait" && node.next && node.timeout_to) return [
+    { id: "elapsed", label: "Interval elapsed", description: "Continue with the next readiness check.", target: node.next, metric_class: "neutral" },
+    { id: "timed_out", label: "Deadline expired", description: "The external wait deadline expired.", target: node.timeout_to, metric_class: "failure" },
+  ];
   if ((node.type === "write" || node.type === "fan_in") && node.next) return [{ id: "completed", label: "Continue", description: "Continue", target: node.next }];
   return [];
 }
@@ -787,20 +969,21 @@ function replaceNodeTargets(node: WorkflowNode, from: string, to: string): Workf
     ...(node.status_codes ? { status_codes: replace(node.status_codes) } : {}),
     ...(node.branches ? { branches: replace(node.branches) } : {}),
     ...(node.next === from ? { next: to } : {}),
+    ...(node.timeout_to === from ? { timeout_to: to } : {}),
     ...(node.fan_in === from ? { fan_in: to } : {}),
     ...(node.otherwise === from ? { otherwise: to } : {}),
     ...(node.github_watch?.feedback_target === from ? { github_watch: { ...node.github_watch, feedback_target: to } } : {}),
   };
 }
 
-function WorkflowGraph({ workflow, currentNode, selectedNode, onSelect }: {
-  workflow: WorkflowDocument["definition"]; currentNode?: string; selectedNode?: string; onSelect?: (nodeId: string) => void;
+function WorkflowGraph({ workflow, currentNode, selectedNode, onSelect, ticket }: {
+  workflow: WorkflowDocument["definition"]; currentNode?: string; selectedNode?: string; onSelect?: (nodeId: string) => void; ticket?: TicketFrontmatter;
 }) {
   const markerId = useId().replaceAll(":", "");
   const columns = Math.min(3, Math.max(1, workflow.nodes.length));
   const rows = Math.ceil(workflow.nodes.length / columns);
   const positions = new Map(workflow.nodes.map((node, index) => [node.id, {
-    x: 34 + (index % columns) * (GRAPH_NODE_WIDTH + GRAPH_COLUMN_GAP), y: 55 + Math.floor(index / columns) * 190, index,
+    x: 34 + (index % columns) * (GRAPH_NODE_WIDTH + GRAPH_COLUMN_GAP), y: 55 + Math.floor(index / columns) * 226, index,
     row: Math.floor(index / columns), column: index % columns,
   }]));
   const edges = workflow.nodes.flatMap((node) => [
@@ -812,7 +995,7 @@ function WorkflowGraph({ workflow, currentNode, selectedNode, onSelect }: {
   ]);
   const backward = edges.filter((edge) => (positions.get(edge.target)?.index ?? Number.MAX_SAFE_INTEGER) <= (positions.get(edge.source)?.index ?? -1));
   const width = Math.max(760, 68 + columns * GRAPH_NODE_WIDTH + Math.max(0, columns - 1) * GRAPH_COLUMN_GAP);
-  const loopBase = 55 + rows * 190 - 35;
+  const loopBase = 55 + rows * 226 - 35;
   const height = loopBase + Math.max(1, backward.length) * 34 + 26;
   return <div className="factory-graph-scroll" aria-label="Workflow graph">
     <div className="factory-graph" style={{ width, height }}>
@@ -844,6 +1027,13 @@ function WorkflowGraph({ workflow, currentNode, selectedNode, onSelect }: {
       </svg>
       {workflow.nodes.map((node) => {
         const position = positions.get(node.id)!;
+        const runs = ticket?.workflow?.node_runs.filter((run) => run.node_id === node.id && run.workflow_revision === ticket.workflow?.revision && (run.workflow_id ?? ticket.workflow?.id) === workflow.id) ?? [];
+        const totalWall = runs.reduce((sum, run) => sum + nodeTiming(run, Date.now()).wallMs, 0);
+        const totalActive = runs.reduce((sum, run) => sum + nodeTiming(run, Date.now()).activeMs, 0);
+        const totalTokens = runs.reduce((sum, run) => sum + (run.telemetry?.delta.usage?.total_tokens ?? 0), 0);
+        const costRuns = runs.filter((run) => run.telemetry?.delta.cost_usd !== null && run.telemetry?.delta.cost_usd !== undefined);
+        const totalCost = costRuns.reduce((sum, run) => sum + (run.telemetry?.delta.cost_usd ?? 0), 0);
+        const hasEstimatedCost = costRuns.some((run) => run.telemetry?.latest.cost.kind === "estimated");
         return <button type="button" key={node.id} style={{ left: position.x, top: position.y, width: GRAPH_NODE_WIDTH, height: GRAPH_NODE_HEIGHT }} onClick={() => onSelect?.(node.id)} aria-pressed={selectedNode === node.id} className={`factory-node node-kind-${node.type} ${currentNode === node.id ? "current" : ""} ${selectedNode === node.id ? "selected" : ""}`}>
           <header><span>{humanize(node.type)}</span>{currentNode === node.id && <em>Current</em>}</header>
           <strong>{node.name}</strong><code>{node.id}</code>
@@ -852,6 +1042,7 @@ function WorkflowGraph({ workflow, currentNode, selectedNode, onSelect }: {
           {node.script_file && <p>Script: <b>{node.script_file.path ?? `ticket:${node.script_file.path_input}`}</b></p>}
           {node.inline && <p>Inline: <b>{humanize(node.inline.language)}</b></p>}
           {node.github_watch && <p>GitHub feedback: <b>{humanize(node.github_watch.feedback_outcome ?? node.github_watch.feedback_target ?? "configured")}</b></p>}
+          {ticket && <footer className="factory-node-metrics"><span>{runs.length} visit{runs.length === 1 ? "" : "s"}</span><span>{runs.length ? `${duration(totalWall)} wall · ${duration(totalActive)} active` : "Not run"}</span><span>{runs.some((run) => run.telemetry?.delta.usage) ? `${tokenCount(totalTokens)} tok` : "Tokens —"} · {costRuns.length ? `${usd(totalCost)}${hasEstimatedCost ? " est" : ""}` : "Cost —"}</span></footer>}
         </button>;
       })}
     </div>
@@ -899,15 +1090,15 @@ function workflowErrors(workflow: WorkflowDocument["definition"] | null): string
     if (node.type !== "terminal" && node.phase === "done") errors.push(`${node.name} cannot use the Done operational role unless it is terminal.`);
     if (!stageIds.includes(node.stage)) errors.push(`${node.name} references a missing stage.`);
     if (workflow.stages.find((stage) => stage.id === node.stage)?.phase !== node.phase) errors.push(`${node.name} must use its stage's operational role.`);
-    if (node.when && !inputIds.includes(node.when.input) && !["spec_required", "review_required"].includes(node.when.input)) errors.push(`${node.name} references a missing input.`);
+    if (node.when && !inputIds.includes(node.when.input)) errors.push(`${node.name} references a missing input.`);
     if (node.when && !node.otherwise) errors.push(`${node.name} needs an otherwise target.`);
     if (node.when && node.otherwise === node.id) errors.push(`${node.name} must bypass to another node.`);
     if (node.max_visits !== undefined && (!Number.isInteger(node.max_visits) || node.max_visits < 1 || node.max_visits > 100)) errors.push(`${node.name} maximum visits must be between 1 and 100.`);
     for (const target of [...nodeRoutes(node).map((route) => route.target), ...(node.otherwise ? [node.otherwise] : [])]) if (!ids.includes(target)) errors.push(`${node.name} points to missing node ${target}.`);
-    if (node.type === "agent" && (!node.prompt || (!node.provider && !node.agent_profile) || !node.conversation_key)) errors.push(`${node.name} needs a prompt, agent profile, and conversation key.`);
+    if (node.type === "agent" && (!node.prompt || !node.agent_profile || !node.conversation_key)) errors.push(`${node.name} needs a prompt, agent profile, and conversation key.`);
     if (node.type === "agent" && node.outcomes.length === 0) errors.push(`${node.name} needs at least one declared outcome.`);
-    if (node.type === "agent" && (node.provider || node.agent_profile) && node.conversation_key) {
-      const selector = node.agent_profile ? `profile:${node.agent_profile}` : node.provider!;
+    if (node.type === "agent" && node.agent_profile && node.conversation_key) {
+      const selector = `profile:${node.agent_profile}`;
       const priorProvider = conversationProviders.get(node.conversation_key);
       if (priorProvider && priorProvider !== selector) errors.push(`${node.name} reuses conversation ${node.conversation_key} with a different agent profile.`);
       else conversationProviders.set(node.conversation_key, selector);
@@ -920,6 +1111,10 @@ function workflowErrors(workflow: WorkflowDocument["definition"] | null): string
       const workingDirectoryValid = validPathReference(node.working_directory, true);
       const inlineValid = Boolean(node.inline?.code.trim()) && ["shell", "python", "javascript"].includes(node.inline?.language ?? "");
       if (!node.repository?.trim() || fileValid === inlineValid || !workingDirectoryValid || !node.exit_codes.some((route) => route.codes?.includes(0)) || node.exit_codes.filter((route) => route.default).length !== 1) errors.push(`${node.name} needs exactly one script file or inline program, an explicit working directory, an exit-code 0 route, and one default route.`);
+      for (const artifact of node.artifacts ?? []) {
+        if (artifact.interpretation && !["application/yaml", "application/x-yaml", "text/yaml"].includes(artifact.content_type)) errors.push(`${node.name} quality artifact ${artifact.name} must use a YAML content type.`);
+        if (artifact.interpretation?.required_attributes.some((key) => !/^[a-z][a-z0-9._-]{0,127}$/.test(key))) errors.push(`${node.name} quality artifact ${artifact.name} has an invalid required key.`);
+      }
     }
     if (node.type === "read" && (!node.metadata_key || !node.metadata_cases?.length || node.metadata_cases.filter((route) => route.default).length !== 1)) errors.push(`${node.name} needs a metadata key, cases, and one default case.`);
     if (node.type === "write" && (!node.metadata_key || !("metadata_value" in node) || !node.next)) errors.push(`${node.name} needs a metadata key, JSON value, and next node.`);
@@ -951,7 +1146,7 @@ function workflowErrors(workflow: WorkflowDocument["definition"] | null): string
   return [...new Set(errors)];
 }
 
-function newWorkflowDefinition(id = "new-workflow"): WorkflowDocument["definition"] {
+function newWorkflowDefinition(id = "new-workflow", agentProfile = "claude"): WorkflowDocument["definition"] {
   return {
     version: 2, id, name: "New workflow", description: "A reusable software-delivery workflow.", start: "work", max_transitions: 40,
     inputs: [], stages: [
@@ -959,7 +1154,7 @@ function newWorkflowDefinition(id = "new-workflow"): WorkflowDocument["definitio
       { id: "done", name: "Done", phase: "done", skippable: false, default_enabled: true },
     ],
     nodes: [
-      { id: "work", name: "Work", type: "agent", phase: "implementation", stage: "work", prompt: "implementation", provider: "work", conversation_key: "work", max_visits: 10, outcomes: [{ id: "completed", label: "Work completed", description: "The work is finished and verified.", target: "done", metric_class: "success" }], choices: [], exit_codes: [] },
+      { id: "work", name: "Work", type: "agent", phase: "implementation", stage: "work", prompt: "implementation", agent_profile: agentProfile, conversation_key: "work", max_visits: 10, outcomes: [{ id: "completed", label: "Work completed", description: "The work is finished and verified.", target: "done", metric_class: "success" }], choices: [], exit_codes: [] },
       { id: "done", name: "Done", type: "terminal", phase: "done", stage: "done", terminal_status: "completed", outcomes: [], choices: [], exit_codes: [] },
     ],
   };
@@ -1007,9 +1202,12 @@ function WorkflowNodeInspector({ workflow, node, prompts, agentProfiles, workflo
     const target = workflow.nodes.find((item) => item.id !== node.id)?.id ?? node.id;
     const stage = type === "terminal" ? workflow.stages.find((item) => item.phase === "done")?.id ?? node.stage : node.stage;
     const replacement: WorkflowNode = { id: node.id, name: node.name, type, phase: type === "terminal" ? "done" : node.phase, stage, max_visits: node.max_visits ?? 10, outcomes: [], choices: [], exit_codes: [] };
-    if (type === "agent") Object.assign(replacement, { prompt: "implementation", agent_profile: "default", conversation_key: "work", outcomes: [{ id: "completed", label: "Work completed", description: "The assigned work is finished.", target, metric_class: "success" }] });
+    if (type === "agent") Object.assign(replacement, { prompt: "implementation", agent_profile: agentProfiles?.default ?? "claude", conversation_key: "work", outcomes: [{ id: "completed", label: "Work completed", description: "The assigned work is finished.", target, metric_class: "success" }] });
     if (type === "script") Object.assign(replacement, { repository: "primary", script_file: { path: ".agents/actions/run.sh", relative_to: "selected_repository" }, working_directory: { path: ".", relative_to: "selected_repository" }, script_output: { persist_stdout: true, prompt_tail_lines: 20 }, exit_codes: [{ id: "success", label: "Success", description: "Exited with code 0.", target, metric_class: "success", codes: [0] }, { id: "failure", label: "Failure", description: "Any other exit code or execution error.", target: node.id, metric_class: "failure", default: true }] });
+    if (type === "checkpoint") Object.assign(replacement, { checkpoint_label: "Workflow checkpoint", exit_codes: [{ id: "created", label: "Created", description: "All declared repositories were captured.", target, metric_class: "success", codes: [0] }, { id: "failed", label: "Failed", description: "Checkpoint capture failed.", target: node.id, metric_class: "failure", default: true }] });
+    if (type === "restore_checkpoint") Object.assign(replacement, { checkpoint_source: { mode: "latest" }, exit_codes: [{ id: "restored", label: "Restored", description: "All declared repositories were restored.", target, metric_class: "success", codes: [0] }, { id: "failed", label: "Failed", description: "Restore failed and compensation was attempted.", target: node.id, metric_class: "failure", default: true }] });
     if (type === "human_gate") Object.assign(replacement, { choices: [{ id: "approved", label: "Approve", description: "Continue the workflow.", target, metric_class: "success" }, { id: "changes_requested", label: "Request changes", description: "Return for another iteration.", target: node.id, metric_class: "failure", comment_required: true }] });
+    if (type === "wait") Object.assign(replacement, { wait_schedule: { initial_seconds: 30, multiplier: 1.5, maximum_seconds: 300, jitter_percent: 10, deadline_seconds: 3600 }, next: target, timeout_to: target });
     if (type === "read") Object.assign(replacement, { metadata_key: "result", metadata_cases: [{ id: "matched", label: "Matched", description: "Value matched.", target, metric_class: "success", equals: true }, { id: "default", label: "Default", description: "No value matched.", target: node.id, metric_class: "neutral", default: true }] });
     if (type === "write") Object.assign(replacement, { metadata_key: "result", metadata_value: true, next: target });
     if (type === "workflow") Object.assign(replacement, { workflow_id: "standard-delivery", status_codes: [{ id: "success", label: "Success", description: "Child returned zero.", target, metric_class: "success", codes: [0] }, { id: "failure", label: "Failure", description: "All other child statuses.", target: node.id, metric_class: "failure", default: true }] });
@@ -1021,17 +1219,17 @@ function WorkflowNodeInspector({ workflow, node, prompts, agentProfiles, workflo
   const setActivitySource = (source: "file" | "inline") => onChange({ ...workflow, nodes: workflow.nodes.map((item) => {
     if (item.id !== node.id) return item;
     if (source === "inline") {
-      const { action: _action, script_file: _scriptFile, ...rest } = item;
+      const { script_file: _scriptFile, ...rest } = item;
       return { ...rest, inline: item.inline ?? { language: "shell", code: defaultInlineCode("shell") } };
     }
-    const { inline: _inline, action: _action, ...rest } = item;
+    const { inline: _inline, ...rest } = item;
     return { ...rest, script_file: item.script_file ?? { path: ".agents/actions/run.sh", relative_to: "selected_repository" } };
   }) });
   const routes = nodeRoutes(node);
   const replaceRoutes = (next: WorkflowRoute[]) => {
     if (node.type === "agent") patchNode({ outcomes: next });
     if (node.type === "human_gate") patchNode({ choices: next.map((route, index) => ({ ...route, ...(node.choices[index]?.comment_required ? { comment_required: true } : {}) })) });
-    if (node.type === "script") patchNode({ exit_codes: next.map((route, index) => ({ ...node.exit_codes[index], ...route })) });
+    if (["script", "checkpoint", "restore_checkpoint"].includes(node.type)) patchNode({ exit_codes: next.map((route, index) => ({ ...node.exit_codes[index], ...route })) });
     if (node.type === "read") patchNode({ metadata_cases: next.map((route, index) => ({ ...node.metadata_cases?.[index], ...route })) });
     if (node.type === "workflow") patchNode({ status_codes: next.map((route, index) => ({ ...node.status_codes?.[index], ...route })) });
     if (node.type === "fan_out") patchNode({ branches: next });
@@ -1044,7 +1242,7 @@ function WorkflowNodeInspector({ workflow, node, prompts, agentProfiles, workflo
   }));
   const addRoute = () => {
     const target = workflow.nodes.find((item) => item.id !== node.id)?.id ?? node.id;
-    if (node.type === "script") patchNode({ exit_codes: [...node.exit_codes, { id: `exit_${node.exit_codes.length + 1}`, label: "Additional exit", description: "", target, metric_class: "neutral", codes: [1] }] });
+    if (["script", "checkpoint", "restore_checkpoint"].includes(node.type)) patchNode({ exit_codes: [...node.exit_codes, { id: `exit_${node.exit_codes.length + 1}`, label: "Additional exit", description: "", target, metric_class: "neutral", codes: [1] }] });
     else if (node.type === "read") patchNode({ metadata_cases: [...(node.metadata_cases ?? []), { id: `case-${(node.metadata_cases?.length ?? 0) + 1}`, label: "New case", description: "", target, metric_class: "neutral", equals: "value" }] });
     else if (node.type === "workflow") patchNode({ status_codes: [...(node.status_codes ?? []), { id: `status-${(node.status_codes?.length ?? 0) + 1}`, label: "New status", description: "", target, metric_class: "neutral", codes: [1] }] });
     else replaceRoutes([...routes, { id: `outcome-${routes.length + 1}`, label: "New outcome", description: "", target, metric_class: "neutral" }]);
@@ -1055,14 +1253,18 @@ function WorkflowNodeInspector({ workflow, node, prompts, agentProfiles, workflo
     <div className="inspector-fields">
       <label><span>Name</span><input aria-label="Node name" value={node.name} onChange={(event) => patchNode({ name: event.target.value })} /></label>
       <label><span>Node ID</span><input aria-label="Node ID" value={node.id} onChange={(event) => renameNode(event.target.value)} /></label>
-      <label><span>Type</span><select aria-label="Node type" value={node.type} onChange={(event) => changeType(event.target.value as WorkflowNode["type"])}><option value="agent">Agent</option><option value="script">Script</option><option value="human_gate">Human gate</option><option value="read">Read metadata</option><option value="write">Write metadata</option><option value="workflow">Workflow</option><option value="fan_out">Fan out</option><option value="fan_in">Fan in</option><option value="terminal">Terminal</option></select></label>
+      <label><span>Type</span><select aria-label="Node type" value={node.type} onChange={(event) => changeType(event.target.value as WorkflowNode["type"])}><option value="agent">Agent</option><option value="script">Script</option><option value="checkpoint">Checkpoint</option><option value="restore_checkpoint">Restore checkpoint</option><option value="human_gate">Human gate</option><option value="wait">External wait</option><option value="read">Read metadata</option><option value="write">Write metadata</option><option value="workflow">Workflow</option><option value="fan_out">Fan out</option><option value="fan_in">Fan in</option><option value="terminal">Terminal</option></select></label>
       <label><span>Stage</span><select aria-label="Node stage" value={node.stage} onChange={(event) => { const stage = workflow.stages.find((item) => item.id === event.target.value); patchNode({ stage: event.target.value, ...(stage ? { phase: stage.phase } : {}) }); }}>{workflow.stages.map((stage) => <option key={stage.id} value={stage.id}>{stage.name}</option>)}</select></label>
       {node.type !== "terminal" && <><label><span>Run condition</span><select aria-label="Node condition" value={node.when?.input ?? ""} onChange={(event) => {
         if (event.target.value) patchNode({ when: { input: event.target.value, equals: workflow.inputs.find((input) => input.id === event.target.value)?.default ?? true }, otherwise: node.otherwise ?? workflow.nodes.find((item) => item.id !== node.id)?.id ?? node.id });
         else onChange({ ...workflow, nodes: workflow.nodes.map((item) => { if (item.id !== node.id) return item; const copy = { ...item }; delete copy.when; delete copy.otherwise; return copy; }) });
       }}><option value="">Always run</option>{workflow.inputs.map((input) => <option key={input.id} value={input.id}>{input.label}</option>)}</select></label>{node.when && <><label><span>Required value</span>{conditionInput?.type === "select" ? <select aria-label="Condition value" value={String(node.when.equals)} onChange={(event) => patchNode({ when: { ...node.when!, equals: event.target.value } })}>{conditionInput.options?.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select> : conditionInput?.type === "text" ? <input aria-label="Condition value" value={String(node.when.equals)} onChange={(event) => patchNode({ when: { ...node.when!, equals: event.target.value } })} /> : <select aria-label="Condition value" value={String(node.when.equals)} onChange={(event) => patchNode({ when: { ...node.when!, equals: event.target.value === "true" } })}><option value="true">Enabled</option><option value="false">Disabled</option></select>}</label><label><span>Otherwise go to</span><select aria-label="Condition bypass target" value={node.otherwise} onChange={(event) => patchNode({ otherwise: event.target.value })}>{workflow.nodes.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label></>}</>}
       {node.type !== "terminal" && <label><span>Maximum visits</span><input aria-label="Maximum visits" type="number" min="1" value={node.max_visits ?? 10} onChange={(event) => patchNode({ max_visits: Number(event.target.value) })} /></label>}
-      {node.type === "agent" && <><label><span>Prompt</span><select aria-label="Node prompt" value={node.prompt ?? ""} onChange={(event) => patchNode({ prompt: event.target.value })}>{prompts.filter((prompt) => prompt.valid && !["assignment", "guidance", "callback-reminder"].includes(prompt.name)).map((prompt) => <option key={prompt.name} value={prompt.name}>{prompt.title}</option>)}</select></label><label><span>Agent profile</span><select aria-label="Node agent profile" value={node.agent_profile ?? `legacy:${node.provider ?? "work"}`} onChange={(event) => onChange({ ...workflow, nodes: workflow.nodes.map((item) => { if (item.id !== node.id) return item; const copy = { ...item }; if (event.target.value.startsWith("legacy:")) { delete copy.agent_profile; copy.provider = event.target.value.slice(7) as NonNullable<WorkflowNode["provider"]>; } else { delete copy.provider; copy.agent_profile = event.target.value; } return copy; }) })}><option value="default">Default alias</option>{agentProfiles?.profiles.filter((profile) => profile.id !== "default").map((profile) => <option key={profile.id} value={profile.id}>{profile.label} · {profile.provider}/{profile.model}/{profile.reasoning}</option>)}<option value="legacy:work">Legacy ticket work agent</option><option value="legacy:review">Legacy opposite reviewer</option></select></label><label><span>Conversation key</span><input aria-label="Conversation key" value={node.conversation_key ?? "work"} onChange={(event) => patchNode({ conversation_key: event.target.value })} /></label></>}
+      {node.type === "agent" && <><label><span>Prompt</span><select aria-label="Node prompt" value={node.prompt ?? ""} onChange={(event) => patchNode({ prompt: event.target.value })}>{prompts.filter((prompt) => prompt.valid && !["assignment", "guidance", "callback-reminder"].includes(prompt.name)).map((prompt) => <option key={prompt.name} value={prompt.name}>{prompt.title}</option>)}</select></label><label><span>Agent profile</span><select aria-label="Node agent profile" value={node.agent_profile ?? "default"} onChange={(event) => patchNode({ agent_profile: event.target.value })}><option value="default">Default alias</option>{agentProfiles?.profiles.filter((profile) => profile.id !== "default").map((profile) => <option key={profile.id} value={profile.id}>{profile.label} · {profile.provider}/{profile.model}/{profile.reasoning}</option>)}</select></label><label><span>Conversation key</span><input aria-label="Conversation key" value={node.conversation_key ?? "work"} onChange={(event) => patchNode({ conversation_key: event.target.value })} /></label><label><span>Conversation policy</span><select aria-label="Conversation policy" value={node.conversation_policy ?? "resume"} onChange={(event) => {
+        const policy = event.target.value as NonNullable<WorkflowNode["conversation_policy"]>;
+        if (policy === "reset_after_visits") patchNode({ conversation_policy: policy, maximum_visits_per_session: node.maximum_visits_per_session ?? 3 });
+        else onChange({ ...workflow, nodes: workflow.nodes.map((item) => { if (item.id !== node.id) return item; const copy = { ...item, conversation_policy: policy }; delete copy.maximum_visits_per_session; return copy; }) });
+      }}><option value="resume">Resume for every visit</option><option value="fresh_each_visit">Fresh session each visit</option><option value="reset_after_visits">Reset after N visits</option></select></label>{node.conversation_policy === "reset_after_visits" && <label><span>Visits per session</span><input aria-label="Conversation maximum visits" type="number" min="1" max="100" value={node.maximum_visits_per_session ?? 3} onChange={(event) => patchNode({ maximum_visits_per_session: Number(event.target.value) })} /></label>}</>}
       {node.type === "agent" && <><label><span>Required PR</span><select aria-label="Pull request requirement" value={node.pull_request_requirement?.scope ?? "none"} onChange={(event) => event.target.value === "none" ? clearNodeKey("pull_request_requirement") : patchNode({ pull_request_requirement: { scope: event.target.value as "any" | "primary", phase: node.phase as "specification" | "implementation" | "review" } })}><option value="none">No PR required</option><option value="any">Any repository</option><option value="primary">Primary repository</option></select></label>{node.pull_request_requirement && <label><span>PR phase</span><select aria-label="Required pull request phase" value={node.pull_request_requirement.phase} onChange={(event) => patchNode({ pull_request_requirement: { ...node.pull_request_requirement!, phase: event.target.value as "specification" | "implementation" | "review" } })}><option value="specification">Specification</option><option value="implementation">Implementation</option><option value="review">Review</option></select></label>}</>}
       {node.type === "human_gate" && <><label className="toggle"><input aria-label="Watch GitHub feedback" type="checkbox" checked={Boolean(node.github_watch)} onChange={(event) => event.target.checked ? patchNode({ github_watch: { pull_request_phase: node.phase === "done" ? "all" : node.phase, feedback_outcome: node.choices.find((choice) => choice.id === "changes_requested")?.id ?? node.choices[0]?.id ?? "" } }) : clearNodeKey("github_watch")} /><span><strong>Watch GitHub feedback</strong><small>New human PR feedback follows a declared gate choice.</small></span></label>{node.github_watch && <><label><span>PR phase</span><select aria-label="GitHub PR phase" value={node.github_watch.pull_request_phase} onChange={(event) => patchNode({ github_watch: { ...node.github_watch!, pull_request_phase: event.target.value as NonNullable<WorkflowNode["github_watch"]>["pull_request_phase"] } })}><option value="specification">Specification PRs</option><option value="implementation">Implementation PRs</option><option value="review">Review PRs</option><option value="all">All ticket PRs</option></select></label><label><span>Feedback follows</span><select aria-label="GitHub feedback outcome" value={node.github_watch.feedback_outcome ?? ""} onChange={(event) => patchNode({ github_watch: { ...node.github_watch!, feedback_outcome: event.target.value } })}>{node.choices.map((choice) => <option key={choice.id} value={choice.id}>{choice.label}</option>)}</select></label></>}</>}
       {node.type === "script" && <><label><span>Repository context</span><input aria-label="Script repository" value={node.repository ?? "primary"} onChange={(event) => patchNode({ repository: event.target.value })} /></label><label><span>Activity source</span><select aria-label="Activity source" value={node.inline ? "inline" : "file"} onChange={(event) => setActivitySource(event.target.value as "file" | "inline")}><option value="file">Script file</option><option value="inline">Inline code</option></select></label>{node.inline ? <><label><span>Language</span><select aria-label="Inline language" value={node.inline.language} onChange={(event) => {
@@ -1070,6 +1272,10 @@ function WorkflowNodeInspector({ workflow, node, prompts, agentProfiles, workflo
         patchNode({ inline: { language, code: !node.inline!.code.trim() || isDefaultInlineCode(node.inline!.code) ? defaultInlineCode(language) : node.inline!.code } });
       }}><option value="shell">Shell</option><option value="python">Python</option><option value="javascript">JavaScript</option></select></label><label className="inline-code-field"><span>Inline code</span><textarea aria-label="Inline code" spellCheck={false} value={node.inline.code} onChange={(event) => patchNode({ inline: { ...node.inline!, code: event.target.value } })} /></label><p className="field-warning">Trusted configuration: this code runs with the supervisor process credentials from the configured working directory.</p></> : <><label><span>Script path source</span><select aria-label="Script path source" value={node.script_file?.path_input ? "input" : "path"} onChange={(event) => setPathSource("script_file", event.target.value as "path" | "input")}><option value="path">Workflow path</option><option value="input">Ticket input</option></select></label><label><span>Script path base</span><select aria-label="Script path base" value={node.script_file?.relative_to ?? "selected_repository"} onChange={(event) => patchPathReference("script_file", { relative_to: event.target.value as NonNullable<WorkflowNode["script_file"]>["relative_to"] })}><option value="selected_repository">Selected repository</option><option value="primary_repository">Primary repository</option><option value="project_root">Supervisor project root</option></select></label>{node.script_file?.path_input !== undefined ? <label><span>Ticket input</span><select aria-label="Script path input" value={node.script_file.path_input} onChange={(event) => patchPathReference("script_file", { path_input: event.target.value })}><option value="">Choose an input</option>{workflow.inputs.filter((input) => input.type !== "boolean").map((input) => <option key={input.id} value={input.id}>{input.label}</option>)}</select></label> : <label><span>Relative script path</span><input aria-label="Script path" value={node.script_file?.path ?? ""} onChange={(event) => patchPathReference("script_file", { path: event.target.value })} /></label>}</>}<label><span>Working-directory source</span><select aria-label="Working directory source" value={node.working_directory?.path_input ? "input" : "path"} onChange={(event) => setPathSource("working_directory", event.target.value as "path" | "input")}><option value="path">Workflow path</option><option value="input">Ticket input</option></select></label><label><span>Working-directory base</span><select aria-label="Working directory base" value={node.working_directory?.relative_to ?? "selected_repository"} onChange={(event) => patchPathReference("working_directory", { relative_to: event.target.value as NonNullable<WorkflowNode["working_directory"]>["relative_to"] })}><option value="selected_repository">Selected repository</option><option value="primary_repository">Primary repository</option><option value="project_root">Supervisor project root</option></select></label>{node.working_directory?.path_input !== undefined ? <label><span>Ticket input</span><select aria-label="Working directory input" value={node.working_directory.path_input} onChange={(event) => patchPathReference("working_directory", { path_input: event.target.value })}><option value="">Choose an input</option>{workflow.inputs.filter((input) => input.type !== "boolean").map((input) => <option key={input.id} value={input.id}>{input.label}</option>)}</select></label> : <label><span>Relative working directory</span><input aria-label="Working directory path" value={node.working_directory?.path ?? "."} onChange={(event) => patchPathReference("working_directory", { path: event.target.value })} /></label>}<p className="field-warning">Resolution preview: {node.inline ? "inline program" : `${humanize(node.script_file?.relative_to ?? "selected_repository")} / ${node.script_file?.path ?? `ticket input ${node.script_file?.path_input ?? "not selected"}`}`} runs from {humanize(node.working_directory?.relative_to ?? "selected_repository")} / {node.working_directory?.path ?? `ticket input ${node.working_directory?.path_input ?? "not selected"}`}. Paths are contained beneath their selected base.</p><p className="field-warning">Scripts receive the resolved script path and working directory, selected and primary repository paths, branches, SHAs, PRs, ticket repositories, and workflow context through AGENTIC_* variables. Script files also receive matching CLI flags.</p></>}
       {node.type === "script" && <><label className="toggle"><input aria-label="Persist script stdout" type="checkbox" checked={node.script_output?.persist_stdout !== false} onChange={(event) => patchNode({ script_output: { persist_stdout: event.target.checked, prompt_tail_lines: node.script_output?.prompt_tail_lines ?? 0 } })} /><span><strong>Persist stdout log</strong><small>The next agent receives a tracker URL.</small></span></label><label><span>Pass last lines to next prompt</span><input aria-label="Script prompt tail lines" type="number" min="0" max="500" value={node.script_output?.prompt_tail_lines ?? 0} onChange={(event) => patchNode({ script_output: { persist_stdout: node.script_output?.persist_stdout !== false, prompt_tail_lines: Number(event.target.value) } })} /></label></>}
+      {node.type === "script" && <label><span>Artifacts (name:path:MIME:required|optional:file|quality:required keys)</span><textarea aria-label="Script artifacts" value={(node.artifacts ?? []).map((artifact) => `${artifact.name}:${artifact.path}:${artifact.content_type}:${artifact.required ? "required" : "optional"}:${artifact.interpretation ? "quality" : "file"}:${artifact.interpretation?.required_attributes.join(",") ?? ""}`).join("\n")} onChange={(event) => patchNode({ artifacts: event.target.value.split(/\r?\n/).filter(Boolean).map((line) => { const [name = "", path = "", content_type = "application/octet-stream", requirement = "optional", interpretation = "file", required = ""] = line.split(":"); return { name, path, content_type, required: requirement === "required", ...(interpretation === "quality" ? { interpretation: { kind: "quality_report" as const, schema: "agentic-quality/v1" as const, required_attributes: required.split(",").map((item) => item.trim()).filter(Boolean) } } : {}) }; }) })} /><small>Quality artifacts are YAML validated against agentic-quality/v1. Required keys are comma-separated.</small></label>}
+      {node.type === "checkpoint" && <label><span>Checkpoint label</span><input aria-label="Checkpoint label" value={node.checkpoint_label ?? ""} onChange={(event) => patchNode({ checkpoint_label: event.target.value })} /></label>}
+      {node.type === "restore_checkpoint" && <><label><span>Checkpoint source</span><select aria-label="Checkpoint source" value={node.checkpoint_source?.mode ?? "latest"} onChange={(event) => patchNode({ checkpoint_source: { mode: event.target.value as "latest" | "id" | "metadata", ...(event.target.value === "id" ? { checkpoint_id: "checkpoint-id" } : event.target.value === "metadata" ? { metadata_key: "checkpoint.restore_id" } : {}) } })}><option value="latest">Latest checkpoint</option><option value="id">Fixed checkpoint ID</option><option value="metadata">Ticket metadata key</option></select></label>{node.checkpoint_source?.mode === "id" && <label><span>Checkpoint ID</span><input aria-label="Checkpoint ID" value={node.checkpoint_source.checkpoint_id ?? ""} onChange={(event) => patchNode({ checkpoint_source: { mode: "id", checkpoint_id: event.target.value } })} /></label>}{node.checkpoint_source?.mode === "metadata" && <label><span>Metadata key</span><input aria-label="Checkpoint metadata key" value={node.checkpoint_source.metadata_key ?? ""} onChange={(event) => patchNode({ checkpoint_source: { mode: "metadata", metadata_key: event.target.value } })} /></label>}</>}
+      {node.type === "wait" && <><label><span>Initial wait (seconds)</span><input aria-label="Wait initial seconds" type="number" min="1" value={node.wait_schedule?.initial_seconds ?? 30} onChange={(event) => patchNode({ wait_schedule: { ...(node.wait_schedule ?? { initial_seconds: 30, multiplier: 1.5, maximum_seconds: 300, jitter_percent: 10, deadline_seconds: 3600 }), initial_seconds: Number(event.target.value) } })} /></label><label><span>Backoff multiplier</span><input aria-label="Wait multiplier" type="number" min="1" max="10" step="0.1" value={node.wait_schedule?.multiplier ?? 1.5} onChange={(event) => patchNode({ wait_schedule: { ...(node.wait_schedule ?? { initial_seconds: 30, multiplier: 1.5, maximum_seconds: 300, jitter_percent: 10, deadline_seconds: 3600 }), multiplier: Number(event.target.value) } })} /></label><label><span>Maximum interval (seconds)</span><input aria-label="Wait maximum seconds" type="number" min="1" value={node.wait_schedule?.maximum_seconds ?? 300} onChange={(event) => patchNode({ wait_schedule: { ...(node.wait_schedule ?? { initial_seconds: 30, multiplier: 1.5, maximum_seconds: 300, jitter_percent: 10, deadline_seconds: 3600 }), maximum_seconds: Number(event.target.value) } })} /></label><label><span>Jitter percent</span><input aria-label="Wait jitter percent" type="number" min="0" max="50" value={node.wait_schedule?.jitter_percent ?? 10} onChange={(event) => patchNode({ wait_schedule: { ...(node.wait_schedule ?? { initial_seconds: 30, multiplier: 1.5, maximum_seconds: 300, jitter_percent: 10, deadline_seconds: 3600 }), jitter_percent: Number(event.target.value) } })} /></label><label><span>Deadline (seconds)</span><input aria-label="Wait deadline seconds" type="number" min="1" value={node.wait_schedule?.deadline_seconds ?? 3600} onChange={(event) => patchNode({ wait_schedule: { ...(node.wait_schedule ?? { initial_seconds: 30, multiplier: 1.5, maximum_seconds: 300, jitter_percent: 10, deadline_seconds: 3600 }), deadline_seconds: Number(event.target.value) } })} /></label><label><span>After interval</span><select aria-label="Wait next node" value={node.next ?? ""} onChange={(event) => patchNode({ next: event.target.value })}>{workflow.nodes.filter((item) => item.id !== node.id).map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label><label><span>On deadline</span><select aria-label="Wait timeout node" value={node.timeout_to ?? ""} onChange={(event) => patchNode({ timeout_to: event.target.value })}>{workflow.nodes.filter((item) => item.id !== node.id).map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label><p className="field-warning">Pair this with a Script node whose “not ready” exit loops back here. The tracker owns the timer, so no supervisor slot or process remains active while waiting.</p></>}
       {node.type === "read" && <label><span>Metadata key</span><input aria-label="Read metadata key" value={node.metadata_key ?? ""} onChange={(event) => patchNode({ metadata_key: event.target.value })} /></label>}
       {node.type === "write" && <><label><span>Metadata key</span><input aria-label="Write metadata key" value={node.metadata_key ?? ""} onChange={(event) => patchNode({ metadata_key: event.target.value })} /></label><label><span>JSON value</span><input aria-label="Write metadata value" value={JSON.stringify(node.metadata_value ?? null)} onChange={(event) => { try { patchNode({ metadata_value: JSON.parse(event.target.value) }); } catch { /* retain the last valid JSON value */ } }} /></label><label><span>Next node</span><select aria-label="Write next node" value={node.next ?? ""} onChange={(event) => patchNode({ next: event.target.value })}>{workflow.nodes.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label></>}
       {node.type === "workflow" && <label><span>Child workflow</span><select aria-label="Child workflow" value={node.workflow_id ?? ""} onChange={(event) => patchNode({ workflow_id: event.target.value })}>{workflows?.filter((item) => item.definition.id !== workflow.id).map((item) => <option key={item.definition.id} value={item.definition.id}>{item.definition.name}</option>)}</select></label>}
@@ -1079,17 +1285,17 @@ function WorkflowNodeInspector({ workflow, node, prompts, agentProfiles, workflo
       {node.type === "terminal" && <label><span>Return status code</span><input aria-label="Terminal status code" type="number" min="0" max="255" value={node.status_code ?? (node.terminal_status === "completed" ? 0 : 1)} onChange={(event) => patchNode({ status_code: Number(event.target.value) })} /></label>}
       {node.type === "terminal" && node.terminal_status === "completed" && <><label className="toggle"><input aria-label="Watch completed PR feedback" type="checkbox" checked={Boolean(node.github_watch)} onChange={(event) => event.target.checked ? patchNode({ github_watch: { pull_request_phase: "all", feedback_target: workflow.nodes.find((item) => item.type === "agent")?.id ?? workflow.start } }) : clearNodeKey("github_watch")} /><span><strong>Watch completed PR feedback</strong><small>New feedback follows an explicit workflow target.</small></span></label>{node.github_watch && <><label><span>PR phase</span><select aria-label="Completed GitHub PR phase" value={node.github_watch.pull_request_phase} onChange={(event) => patchNode({ github_watch: { ...node.github_watch!, pull_request_phase: event.target.value as NonNullable<WorkflowNode["github_watch"]>["pull_request_phase"] } })}><option value="specification">Specification PRs</option><option value="implementation">Implementation PRs</option><option value="review">Review PRs</option><option value="all">All ticket PRs</option></select></label><label><span>Feedback target</span><select aria-label="Completed GitHub feedback target" value={node.github_watch.feedback_target ?? ""} onChange={(event) => patchNode({ github_watch: { ...node.github_watch!, feedback_target: event.target.value } })}>{workflow.nodes.filter((item) => item.type !== "terminal").map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label></>}</>}
     </div>
-    {(["agent", "script", "human_gate", "read", "workflow", "fan_out"] as const).includes(node.type as never) && <section className="outcome-editor"><div><span>{node.type === "human_gate" ? "Choices shown to the human" : node.type === "script" ? "Exit-code routes" : node.type === "read" ? "Metadata cases" : node.type === "workflow" ? "Child status-code routes" : node.type === "fan_out" ? "Branches" : "Agent outcomes"}</span><button type="button" onClick={addRoute}>＋ Add</button></div>{routes.map((route, index) => <div className="typed-outcome-row" key={`${route.id}:${index}`}>
+    {(["agent", "script", "checkpoint", "restore_checkpoint", "human_gate", "read", "workflow", "fan_out"] as const).includes(node.type as never) && <section className="outcome-editor"><div><span>{node.type === "human_gate" ? "Choices shown to the human" : ["script", "checkpoint", "restore_checkpoint"].includes(node.type) ? "Exit-code routes" : node.type === "read" ? "Metadata cases" : node.type === "workflow" ? "Child status-code routes" : node.type === "fan_out" ? "Branches" : "Agent outcomes"}</span><button type="button" onClick={addRoute}>＋ Add</button></div>{routes.map((route, index) => <div className="typed-outcome-row" key={`${route.id}:${index}`}>
       <label><span>Label</span><input aria-label={`Outcome ${index + 1} label`} value={route.label} onChange={(event) => patchRoute(index, { label: event.target.value, id: event.target.value.toLowerCase().replace(/[^a-z0-9-]/g, "-") })} /></label>
       <label><span>ID</span><input aria-label={`Outcome ${index + 1} id`} value={route.id} onChange={(event) => patchRoute(index, { id: event.target.value.toLowerCase().replace(/[^a-z0-9-]/g, "-") })} /></label>
-      {node.type === "script" && <label><span>Exit codes</span><input aria-label={`Outcome ${index + 1} exit codes`} disabled={node.exit_codes[index]?.default === true} value={node.exit_codes[index]?.default ? "All other / error" : (node.exit_codes[index]?.codes ?? []).join(", ")} onChange={(event) => patchNode({ exit_codes: node.exit_codes.map((item, candidate) => candidate === index ? { ...item, codes: event.target.value.split(",").map((value) => Number(value.trim())).filter(Number.isInteger) } : item) })} /></label>}
+      {["script", "checkpoint", "restore_checkpoint"].includes(node.type) && <label><span>Exit codes</span><input aria-label={`Outcome ${index + 1} exit codes`} disabled={node.exit_codes[index]?.default === true} value={node.exit_codes[index]?.default ? "All other / error" : (node.exit_codes[index]?.codes ?? []).join(", ")} onChange={(event) => patchNode({ exit_codes: node.exit_codes.map((item, candidate) => candidate === index ? { ...item, codes: event.target.value.split(",").map((value) => Number(value.trim())).filter(Number.isInteger) } : item) })} /></label>}
       {node.type === "workflow" && <label><span>Status codes</span><input aria-label={`Outcome ${index + 1} status codes`} disabled={node.status_codes?.[index]?.default === true} value={node.status_codes?.[index]?.default ? "All other" : (node.status_codes?.[index]?.codes ?? []).join(", ")} onChange={(event) => patchNode({ status_codes: (node.status_codes ?? []).map((item, candidate) => candidate === index ? { ...item, codes: event.target.value.split(",").map((value) => Number(value.trim())).filter(Number.isInteger) } : item) })} /></label>}
       {node.type === "read" && <label><span>Equals JSON</span><input aria-label={`Outcome ${index + 1} metadata value`} disabled={node.metadata_cases?.[index]?.default === true} value={node.metadata_cases?.[index]?.default ? "Any other / missing" : JSON.stringify(node.metadata_cases?.[index]?.equals ?? null)} onChange={(event) => { try { patchNode({ metadata_cases: (node.metadata_cases ?? []).map((item, candidate) => candidate === index ? { ...item, equals: JSON.parse(event.target.value) } : item) }); } catch { /* retain last valid JSON */ } }} /></label>}
       <label><span>Next node</span><select aria-label={`Outcome ${index + 1} target`} value={route.target} onChange={(event) => patchRoute(index, { target: event.target.value })}>{workflow.nodes.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label>
       <label><span>Metrics</span><select aria-label={`Outcome ${index + 1} metric class`} value={route.metric_class ?? "unclassified"} onChange={(event) => setRouteMetricClass(index, event.target.value)}><option value="success">Success</option><option value="failure">Failure</option><option value="neutral">Neutral</option><option value="unclassified">Unclassified</option></select></label>
       <label className="route-description"><span>Description</span><input aria-label={`Outcome ${index + 1} description`} value={route.description} onChange={(event) => patchRoute(index, { description: event.target.value })} /></label>
       {node.type === "human_gate" && <label className="toggle"><input type="checkbox" checked={node.choices[index]?.comment_required === true} onChange={(event) => patchNode({ choices: node.choices.map((item, candidate) => candidate === index ? { ...item, comment_required: event.target.checked } : item) })} /><span><strong>Require comment</strong></span></label>}
-      {node.type === "script" && <label className="toggle"><input type="checkbox" checked={node.exit_codes[index]?.default === true} onChange={(event) => patchNode({ exit_codes: node.exit_codes.map((item, candidate) => {
+      {["script", "checkpoint", "restore_checkpoint"].includes(node.type) && <label className="toggle"><input type="checkbox" checked={node.exit_codes[index]?.default === true} onChange={(event) => patchNode({ exit_codes: node.exit_codes.map((item, candidate) => {
         if (candidate === index) {
           if (event.target.checked) { const { codes: _codes, ...rest } = item; return { ...rest, default: true }; }
           return { ...item, default: false, codes: item.codes ?? [1] };
@@ -1162,8 +1368,8 @@ function WorkflowContractEditor({ workflow, onChange }: { workflow: WorkflowDocu
   </section>;
 }
 
-function WorkflowEditorPage({ workflows, prompts, agentProfiles, onChanged, onError }: {
-  workflows: WorkflowDocument[]; prompts: PromptDocument[]; agentProfiles: TrackerConfig["agent_profiles"] | undefined; onChanged: (workflows: WorkflowDocument[]) => void; onError: (message: string | null) => void;
+function WorkflowEditorPage({ workflows, releases, prompts, agentProfiles, onChanged, onReleasesChanged, onError }: {
+  workflows: WorkflowDocument[]; releases: WorkflowReleaseCatalog | null; prompts: PromptDocument[]; agentProfiles: TrackerConfig["agent_profiles"] | undefined; onChanged: (workflows: WorkflowDocument[]) => void; onReleasesChanged: (catalog: WorkflowReleaseCatalog) => void; onError: (message: string | null) => void;
 }) {
   const [selectedId, setSelectedId] = useState("standard-delivery");
   const [draft, setDraft] = useState("");
@@ -1171,8 +1377,11 @@ function WorkflowEditorPage({ workflows, prompts, agentProfiles, onChanged, onEr
   const [returnId, setReturnId] = useState<string | null>(null);
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [releaseLabel, setReleaseLabel] = useState("");
+  const [showRetiredReleases, setShowRetiredReleases] = useState(false);
   const selected = workflows.find((workflow) => workflow.definition.id === selectedId) ?? workflows[0];
   useEffect(() => { if (selected && !creating) { setDraft(editableWorkflowContent(selected)); setSelectedNodeId(selected.definition.start); } }, [selected?.revision, creating]);
+  useEffect(() => { setShowRetiredReleases(false); }, [selected?.definition.id]);
   let preview: WorkflowDocument["definition"] | null = null;
   let parseError: string | null = null;
   try {
@@ -1182,7 +1391,7 @@ function WorkflowEditorPage({ workflows, prompts, agentProfiles, onChanged, onEr
   } catch (error) { parseError = (error as Error).message; }
   const errors = [...(parseError ? [parseError] : []), ...workflowErrors(preview)];
   const setDefinition = (definition: WorkflowDocument["definition"], nextSelectedNode = selectedNodeId ?? definition.start) => { setDraft(stringify(definition, { lineWidth: 0 })); setSelectedNodeId(nextSelectedNode); };
-  const beginNew = () => { const definition = newWorkflowDefinition(); setReturnId(selected?.definition.id ?? null); setCreating("new"); setSelectedId(definition.id); setDefinition(definition, definition.start); onError(null); };
+  const beginNew = () => { const definition = newWorkflowDefinition("new-workflow", agentProfiles?.default ?? "claude"); setReturnId(selected?.definition.id ?? null); setCreating("new"); setSelectedId(definition.id); setDefinition(definition, definition.start); onError(null); };
   const clone = () => {
     if (!selected) return;
     const definition = structuredClone(selected.definition);
@@ -1200,9 +1409,12 @@ function WorkflowEditorPage({ workflows, prompts, agentProfiles, onChanged, onEr
     const stage = type === "terminal" ? preview.stages.find((item) => item.phase === "done")?.id ?? preview.stages[0]?.id ?? "done" : source?.stage ?? preview.stages.find((item) => item.phase === "implementation")?.id ?? preview.stages[0]?.id ?? "work";
     const phase = preview.stages.find((item) => item.id === stage)?.phase ?? (type === "terminal" ? "done" : "implementation");
     const node: WorkflowNode = { id, name: humanize(type), type, phase, stage, max_visits: 10, outcomes: [], choices: [], exit_codes: [] };
-    if (type === "agent") Object.assign(node, { prompt: "implementation", agent_profile: "default", conversation_key: "work", outcomes: [{ id: "completed", label: "Work completed", description: "The assigned work is finished.", target, metric_class: "success" }] });
+    if (type === "agent") Object.assign(node, { prompt: "implementation", agent_profile: agentProfiles?.default ?? "claude", conversation_key: "work", outcomes: [{ id: "completed", label: "Work completed", description: "The assigned work is finished.", target, metric_class: "success" }] });
     if (type === "script") Object.assign(node, { repository: "primary", script_file: { path: ".agents/actions/run.sh", relative_to: "selected_repository" }, working_directory: { path: ".", relative_to: "selected_repository" }, script_output: { persist_stdout: true, prompt_tail_lines: 20 }, exit_codes: [{ id: "success", label: "Success", description: "Exited with code 0.", target, metric_class: "success", codes: [0] }, { id: "failure", label: "Failure", description: "All other exit codes and execution errors.", target: id, metric_class: "failure", default: true }] });
+    if (type === "checkpoint") Object.assign(node, { checkpoint_label: "Workflow checkpoint", exit_codes: [{ id: "created", label: "Created", description: "All declared repositories were captured.", target, metric_class: "success", codes: [0] }, { id: "failed", label: "Failed", description: "Checkpoint capture failed.", target: id, metric_class: "failure", default: true }] });
+    if (type === "restore_checkpoint") Object.assign(node, { checkpoint_source: { mode: "latest" }, exit_codes: [{ id: "restored", label: "Restored", description: "All declared repositories were restored.", target, metric_class: "success", codes: [0] }, { id: "failed", label: "Failed", description: "Restore failed and compensation was attempted.", target: id, metric_class: "failure", default: true }] });
     if (type === "human_gate") Object.assign(node, { choices: [{ id: "approved", label: "Approve", description: "Continue the workflow.", target, metric_class: "success" }, { id: "changes-requested", label: "Request changes", description: "Return for another iteration.", target: id, metric_class: "failure", comment_required: true }] });
+    if (type === "wait") Object.assign(node, { wait_schedule: { initial_seconds: 30, multiplier: 1.5, maximum_seconds: 300, jitter_percent: 10, deadline_seconds: 3600 }, next: target, timeout_to: target });
     if (type === "read") Object.assign(node, { metadata_key: "result", metadata_cases: [{ id: "matched", label: "Matched", description: "Value matched.", target, metric_class: "success", equals: true }, { id: "default", label: "Default", description: "No case matched.", target: id, metric_class: "neutral", default: true }] });
     if (type === "write") Object.assign(node, { metadata_key: "result", metadata_value: true, next: target });
     if (type === "workflow") Object.assign(node, { workflow_id: workflows.find((item) => item.definition.id !== preview.id)?.definition.id ?? "standard-delivery", status_codes: [{ id: "success", label: "Success", description: "Child returned zero.", target, metric_class: "success", codes: [0] }, { id: "failure", label: "Failure", description: "All other statuses.", target: id, metric_class: "failure", default: true }] });
@@ -1226,31 +1438,44 @@ function WorkflowEditorPage({ workflows, prompts, agentProfiles, onChanged, onEr
     const stages = preview.stages.map((stage) => stage.bypass_to === selectedNodeId && replacement ? { ...stage, bypass_to: replacement } : stage);
     setDefinition({ ...preview, start: preview.start === selectedNodeId ? nodes[0]!.id : preview.start, nodes, stages }, nodes[0]!.id);
   };
-  const save = async () => {
+  const save = async (makeDefault = false) => {
     setBusy(true); onError(null);
     try {
-      const result = creating ? await api.createWorkflow(draft) : await api.updateWorkflow(selected!, draft);
+      const result = creating ? await api.createWorkflow(draft, releaseLabel.trim() || undefined) : await api.updateWorkflow(selected!, draft, makeDefault, releaseLabel.trim() || undefined);
       const next = [...workflows.filter((workflow) => workflow.definition.id !== result.workflow.definition.id), result.workflow]
         .sort((a, b) => a.definition.name.localeCompare(b.definition.name));
-      onChanged(next); setSelectedId(result.workflow.definition.id); setCreating(null); setReturnId(null); setDraft(result.workflow.content); setSelectedNodeId(result.workflow.definition.start);
+      onChanged(next); onReleasesChanged(await api.workflowReleases()); setSelectedId(result.workflow.definition.id); setCreating(null); setReturnId(null); setDraft(result.workflow.content); setSelectedNodeId(result.workflow.definition.start); setReleaseLabel("");
     } catch (error) { onError((error as Error).message); }
+    finally { setBusy(false); }
+  };
+  const promote = async (revision: string) => {
+    if (!selected) return;
+    setBusy(true); onError(null);
+    try { await api.promoteWorkflow(selected.definition.id, revision); onReleasesChanged(await api.workflowReleases()); }
+    catch (error) { onError((error as Error).message); }
     finally { setBusy(false); }
   };
   if (!selected && !creating) return <main className="configuration-page"><div className="empty-health"><h2>Workflow library unavailable</h2></div></main>;
   const selectedNode = preview?.nodes.find((node) => node.id === selectedNodeId) ?? preview?.nodes[0];
+  const familyReleases = releases?.releases.filter((release) => release.workflow_id === selected?.definition.id) ?? [];
+  const retiredReleaseCount = familyReleases.filter((release) => release.status === "retired").length;
+  const visibleReleases = familyReleases
+    .filter((release) => showRetiredReleases || release.status !== "retired")
+    .sort((left, right) => Number(right.is_default) - Number(left.is_default) || right.version - left.version);
   return <main className="workflow-page">
     <div className="health-heading"><div><span>Software factory</span><h1>Workflow editor</h1><p>Build a directed graph of durable boundaries while agents remain autonomous inside agent nodes.</p></div><div className="artifact-actions"><button className="button-secondary" disabled={busy || !selected} onClick={clone}>Clone workflow</button><button className="button-primary" disabled={busy} onClick={beginNew}>New workflow</button></div></div>
     <div className="workflow-editor-layout">
-      <aside className="prompt-list">{creating && preview && <button className="active artifact-draft"><strong>{preview.name}</strong><small>{preview.id}.yaml · unsaved</small></button>}{workflows.map((workflow) => <button className={!creating && workflow.definition.id === selected?.definition.id ? "active" : ""} key={workflow.definition.id} onClick={() => { setCreating(null); setSelectedId(workflow.definition.id); }}><strong>{workflow.definition.name}</strong><small>{workflow.definition.id}.yaml</small>{!workflow.valid && <em>Invalid</em>}</button>)}</aside>
+      <aside className="prompt-list">{creating && preview && <button className="active artifact-draft"><strong>{preview.name}</strong><small>{preview.id}.yaml · unsaved</small></button>}{workflows.map((workflow) => <button className={!creating && workflow.definition.id === selected?.definition.id ? "active" : ""} key={workflow.definition.id} onClick={() => { setCreating(null); setSelectedId(workflow.definition.id); }}><strong>{workflow.definition.name}</strong><small>{workflow.definition.id}.yaml · v{workflow.version}</small>{!workflow.valid && <em>Invalid</em>}</button>)}</aside>
       <section className="workflow-editor-main">
-        <div className="prompt-heading"><div><span>{creating ? `${creating === "clone" ? "Cloned" : "New"} artifact` : `${selected?.definition.id}.yaml`}</span><h2>{preview?.name ?? "Workflow draft"}</h2><p>{preview?.description}</p></div>{selected && !creating && <code>{selected.revision.slice(0, 12)}</code>}</div>
+        <div className="prompt-heading"><div><span>{creating ? `${creating === "clone" ? "Cloned" : "New"} artifact` : `${selected?.definition.id}.yaml · v${selected?.version}`}</span><h2>{preview?.name ?? "Workflow draft"}</h2><p>{preview?.description}</p></div>{selected && !creating && <code>{selected.revision.slice(0, 12)}</code>}</div>
+        {selected && !creating && <section className="workflow-releases"><div className="section-heading"><div><span>Releases</span><h3>Current default and trials</h3><p>Versions identify unique workflow content, not activation order. Restoring shipped content can make an earlier version the default.</p></div>{retiredReleaseCount > 0 && <button className="button-secondary button-compact" type="button" onClick={() => setShowRetiredReleases((value) => !value)}>{showRetiredReleases ? "Hide history" : `Show history (${retiredReleaseCount})`}</button>}</div><div>{visibleReleases.map((release) => <article key={release.revision} className={release.is_default ? "default-release" : ""}><span><strong>v{release.version} · {release.label}</strong><small>{release.revision.slice(0, 12)} · {release.is_default ? "Default" : humanize(release.status)} · {timeAgo(release.published_at, Date.now())}</small></span>{!release.is_default && <button className="button-secondary button-compact" disabled={busy} onClick={() => void promote(release.revision)}>{release.status === "retired" ? "Restore as default" : "Make default"}</button>}</article>)}</div></section>}
         {preview && <section className="workflow-settings" aria-label="Workflow settings"><label><span>Workflow ID</span><input aria-label="Workflow ID" disabled={!creating} value={preview.id} onChange={(event) => { const id = event.target.value.toLowerCase().replace(/[^a-z0-9-]/g, "-"); setSelectedId(id); setDefinition({ ...preview, id }); }} /></label><label><span>Name</span><input aria-label="Workflow name" value={preview.name} onChange={(event) => setDefinition({ ...preview, name: event.target.value })} /></label><label className="wide"><span>Description</span><input aria-label="Workflow description" value={preview.description} onChange={(event) => setDefinition({ ...preview, description: event.target.value })} /></label><label><span>Start node</span><select aria-label="Workflow start node" value={preview.start} onChange={(event) => setDefinition({ ...preview, start: event.target.value })}>{preview.nodes.map((node) => <option key={node.id} value={node.id}>{node.name}</option>)}</select></label><label><span>Transition limit</span><input aria-label="Workflow transition limit" type="number" min="1" value={preview.max_transitions} onChange={(event) => setDefinition({ ...preview, max_transitions: Number(event.target.value) })} /></label></section>}
         {preview && <WorkflowContractEditor workflow={preview} onChange={setDefinition} />}
-        <div className="workflow-toolbar"><div><strong>Add node</strong>{(["agent", "script", "human_gate", "read", "write", "workflow", "fan_out", "fan_in", "terminal"] as const).map((type) => <button type="button" key={type} onClick={() => addNode(type)}>＋ {humanize(type)}</button>)}</div><span>Select a node to edit its behavior and outcomes.</span></div>
+        <div className="workflow-toolbar"><div><strong>Add node</strong>{(["agent", "script", "checkpoint", "restore_checkpoint", "human_gate", "wait", "read", "write", "workflow", "fan_out", "fan_in", "terminal"] as const).map((type) => <button type="button" key={type} onClick={() => addNode(type)}>＋ {humanize(type)}</button>)}</div><span>Select a node to edit its behavior and outcomes.</span></div>
         {preview && <div className="workflow-builder"><WorkflowGraph workflow={preview} {...(selectedNode ? { selectedNode: selectedNode.id } : {})} onSelect={setSelectedNodeId} />{selectedNode && <WorkflowNodeInspector workflow={preview} node={selectedNode} prompts={prompts} agentProfiles={agentProfiles} workflows={workflows} onChange={setDefinition} onDelete={deleteNode} />}</div>}
         {errors.length > 0 && <div className="draft-validation" role="alert"><strong>Workflow draft needs attention</strong><ul>{errors.map((error) => <li key={error}>{error}</li>)}</ul></div>}
         <details className="workflow-source" open={!preview}><summary>Advanced YAML source</summary><p>The structured editor and this source stay synchronized. Published revisions remain immutable for pinned tickets.</p><textarea aria-label="Workflow YAML" value={draft} onChange={(event) => setDraft(event.target.value)} /></details>
-        <div className="prompt-actions"><span>{preview?.nodes.length ?? 0} nodes · {preview?.nodes.filter((node) => node.prompt).length ?? 0} prompt reference(s)</span>{creating && <button className="button-secondary" onClick={cancelCreate}>Cancel</button>}<button className="button-primary" disabled={busy || !draft.trim() || errors.length > 0 || (!creating && draft === selected?.content)} onClick={() => void save()}>{creating ? "Create workflow" : "Publish revision"}</button></div>
+        <div className="prompt-actions"><label className="release-label">Release label<input aria-label="Workflow release label" placeholder={creating ? "Initial release" : `Trial v${(selected?.version ?? 0) + 1}`} value={releaseLabel} onChange={(event) => setReleaseLabel(event.target.value)} /></label><span>{preview?.nodes.length ?? 0} nodes · {preview?.nodes.filter((node) => node.prompt).length ?? 0} prompt reference(s)</span>{creating && <button className="button-secondary" onClick={cancelCreate}>Cancel</button>}{!creating && <button className="button-secondary" disabled={busy || !draft.trim() || errors.length > 0 || draft === selected?.content} onClick={() => void save(false)}>Publish as trial</button>}<button className="button-primary" disabled={busy || !draft.trim() || errors.length > 0 || (!creating && draft === selected?.content)} onClick={() => void save(true)}>{creating ? "Create workflow" : "Publish and make default"}</button></div>
       </section>
     </div>
   </main>;
@@ -1272,8 +1497,11 @@ function FiveNumberCard({ title, summary, kind }: { title: string; summary: Numb
   </dl></section>;
 }
 
-function MetricsPage({ onError }: { onError: (message: string | null) => void }) {
+function MetricsPage({ releases, onError }: { releases: WorkflowReleaseCatalog | null; onError: (message: string | null) => void }) {
   const [report, setReport] = useState<MetricsReport | null>(null);
+  const [comparison, setComparison] = useState<WorkflowComparisonReport | null>(null);
+  const [compareLeft, setCompareLeft] = useState("");
+  const [compareRight, setCompareRight] = useState("");
   const [filters, setFilters] = useState({ from: "", to: "", labels: [] as string[], labelMode: "any" as "any" | "all", workflowId: "", workflowRevision: "", productionResult: "" });
   const [loading, setLoading] = useState(false);
   const filterKey = JSON.stringify(filters);
@@ -1289,7 +1517,37 @@ function MetricsPage({ onError }: { onError: (message: string | null) => void })
     }).then((value) => { if (active) { setReport(value); onError(null); } }).catch((error: Error) => { if (active) onError(error.message); }).finally(() => { if (active) setLoading(false); });
     return () => { active = false; };
   }, [filterKey]);
+  const releaseOptions = releases?.releases ?? [];
+  const releaseKey = releaseOptions.map((release) => `${release.workflow_id}@${release.revision}`).join("|");
+  useEffect(() => {
+    if (!releaseOptions.length) return;
+    const defaultRelease = releaseOptions.find((release) => release.is_default) ?? releaseOptions[0]!;
+    const alternative = releaseOptions.find((release) => release.workflow_id === defaultRelease.workflow_id && release.revision !== defaultRelease.revision)
+      ?? releaseOptions.find((release) => release.revision !== defaultRelease.revision);
+    setCompareLeft((current) => current || `${defaultRelease.workflow_id}@${defaultRelease.revision}`);
+    setCompareRight((current) => current || (alternative ? `${alternative.workflow_id}@${alternative.revision}` : ""));
+  }, [releaseKey]);
+  useEffect(() => {
+    if (!compareLeft || !compareRight || compareLeft === compareRight) { setComparison(null); return; }
+    const release = (value: string) => releaseOptions.find((item) => `${item.workflow_id}@${item.revision}` === value);
+    const left = release(compareLeft); const right = release(compareRight);
+    if (!left || !right) { setComparison(null); return; }
+    let active = true;
+    void api.compareWorkflows({ id: left.workflow_id, revision: left.revision }, { id: right.workflow_id, revision: right.revision }, {
+      ...(filters.from ? { from: new Date(`${filters.from}T00:00:00`).toISOString() } : {}),
+      ...(filters.to ? { to: new Date(`${filters.to}T23:59:59.999`).toISOString() } : {}),
+      labels: filters.labels, labelMode: filters.labelMode,
+      ...(filters.productionResult ? { productionResult: filters.productionResult } : {}),
+    }).then((value) => { if (active) setComparison(value); }).catch((error: Error) => { if (active) onError(error.message); });
+    return () => { active = false; };
+  }, [compareLeft, compareRight, filterKey, releaseKey]);
   const toggleLabel = (label: string) => setFilters((current) => ({ ...current, labels: current.labels.includes(label) ? current.labels.filter((item) => item !== label) : [...current.labels, label] }));
+  const releaseName = (value: string) => { const release = releaseOptions.find((item) => `${item.workflow_id}@${item.revision}` === value); return release ? `${release.definition.name} · v${release.version} · ${release.is_default ? "Default" : release.label}` : value; };
+  const delta = (metric: keyof WorkflowComparisonReport["deltas"], kind: "rate" | "duration" | "cost" | "tokens") => {
+    const value = comparison?.deltas[metric]; if (!value || value.absolute === null) return "—";
+    const absolute = kind === "rate" ? `${value.absolute >= 0 ? "+" : ""}${(value.absolute * 100).toFixed(1)} pp` : kind === "duration" ? `${value.absolute >= 0 ? "+" : "−"}${duration(Math.abs(value.absolute))}` : kind === "cost" ? `${value.absolute >= 0 ? "+" : "−"}${usd(Math.abs(value.absolute))}` : `${value.absolute >= 0 ? "+" : "−"}${tokenCount(Math.abs(value.absolute))}`;
+    return `${absolute}${value.percent === null ? "" : ` · ${value.percent >= 0 ? "+" : ""}${(value.percent * 100).toFixed(1)}%`}`;
+  };
   return <main className="metrics-page">
     <div className="health-heading"><div><span>Operational intelligence</span><h1>Factory metrics</h1><p>Execution reliability, branch behavior, production outcomes, cost, tokens, and elapsed time from durable ticket history.</p></div><div className="health-summary"><strong>{loading ? "…" : report?.totals.tickets ?? 0}</strong><span>filtered tickets</span></div></div>
     <section className="metrics-filters">
@@ -1302,23 +1560,40 @@ function MetricsPage({ onError }: { onError: (message: string | null) => void })
       <div className="metrics-label-filter"><span>Labels</span><div>{report?.available.labels.map((label) => <button className={filters.labels.includes(label) ? "active" : ""} key={label} onClick={() => toggleLabel(label)}>{label}</button>)}{!report?.available.labels.length && <small>No labels recorded</small>}</div></div>
       <button className="button-secondary" disabled={!filters.from && !filters.to && !filters.labels.length && !filters.workflowId && !filters.productionResult} onClick={() => setFilters({ from: "", to: "", labels: [], labelMode: "any", workflowId: "", workflowRevision: "", productionResult: "" })}>Clear filters</button>
     </section>
+    {releaseOptions.length > 0 && <section className="workflow-comparison content-card"><div className="section-heading"><div><span>Experiment analysis</span><h2>Compare workflow revisions</h2></div><small>Efficiency uses completed, non-crossover tickets</small></div><div className="comparison-selectors"><label>Baseline<select aria-label="Comparison baseline" value={compareLeft} onChange={(event) => setCompareLeft(event.target.value)}>{releaseOptions.map((release) => { const value = `${release.workflow_id}@${release.revision}`; return <option key={value} value={value}>{releaseName(value)}</option>; })}</select></label><span>versus</span><label>Candidate<select aria-label="Comparison candidate" value={compareRight} onChange={(event) => setCompareRight(event.target.value)}><option value="">Choose a revision</option>{releaseOptions.map((release) => { const value = `${release.workflow_id}@${release.revision}`; return <option key={value} value={value}>{releaseName(value)}</option>; })}</select></label></div>{comparison && <>
+      <div className="comparison-cohorts"><article><strong>{releaseName(compareLeft)}</strong><span>{comparison.left.cohort.completed}/{comparison.left.cohort.assigned} completed</span><small>{comparison.left.cohort.failed} failed · {comparison.left.cohort.cancelled} cancelled · {comparison.left.cohort.in_progress} in progress ({comparison.left.cohort.blocked} blocked) · {comparison.left.cohort.crossover} crossover</small></article><article><strong>{releaseName(compareRight)}</strong><span>{comparison.right.cohort.completed}/{comparison.right.cohort.assigned} completed</span><small>{comparison.right.cohort.failed} failed · {comparison.right.cohort.cancelled} cancelled · {comparison.right.cohort.in_progress} in progress ({comparison.right.cohort.blocked} blocked) · {comparison.right.cohort.crossover} crossover</small></article></div>
+      <table className="comparison-table"><thead><tr><th>Metric</th><th>Baseline</th><th>Candidate</th><th>Difference</th></tr></thead><tbody>
+        <tr><td>Completion rate</td><td>{comparison.left.completion_rate === null ? "—" : `${(comparison.left.completion_rate * 100).toFixed(1)}%`}</td><td>{comparison.right.completion_rate === null ? "—" : `${(comparison.right.completion_rate * 100).toFixed(1)}%`}</td><td>{delta("completion_rate", "rate")}</td></tr>
+        <tr><td>Production success</td><td>{comparison.left.production_success_rate === null ? "—" : `${(comparison.left.production_success_rate * 100).toFixed(1)}%`}</td><td>{comparison.right.production_success_rate === null ? "—" : `${(comparison.right.production_success_rate * 100).toFixed(1)}%`}</td><td>{delta("production_success_rate", "rate")}</td></tr>
+        <tr><td>Median cost</td><td>{formatMetric(comparison.left.summaries.cost_per_ticket_usd.median, "cost")}</td><td>{formatMetric(comparison.right.summaries.cost_per_ticket_usd.median, "cost")}</td><td>{delta("median_cost_usd", "cost")}</td></tr>
+        <tr><td>Median tokens</td><td>{formatMetric(comparison.left.summaries.tokens_per_ticket.median, "tokens")}</td><td>{formatMetric(comparison.right.summaries.tokens_per_ticket.median, "tokens")}</td><td>{delta("median_tokens", "tokens")}</td></tr>
+        <tr><td>Median duration</td><td>{formatMetric(comparison.left.summaries.ticket_duration_ms.median, "duration")}</td><td>{formatMetric(comparison.right.summaries.ticket_duration_ms.median, "duration")}</td><td>{delta("median_duration_ms", "duration")}</td></tr>
+        <tr><td>Median active time</td><td>{formatMetric(comparison.left.summaries.active_time_ms.median, "duration")}</td><td>{formatMetric(comparison.right.summaries.active_time_ms.median, "duration")}</td><td>{delta("median_active_ms", "duration")}</td></tr>
+      </tbody></table><p className="metrics-coverage">Cost coverage: {comparison.left.coverage.cost_tickets}/{comparison.left.coverage.eligible_tickets} baseline and {comparison.right.coverage.cost_tickets}/{comparison.right.coverage.eligible_tickets} candidate tickets. Token coverage: {comparison.left.coverage.token_tickets}/{comparison.left.coverage.eligible_tickets} and {comparison.right.coverage.token_tickets}/{comparison.right.coverage.eligible_tickets}. Manual trial assignment may introduce selection bias.</p>
+      <div className="comparison-nodes"><article><h3>Baseline nodes</h3>{comparison.left.nodes.map((node) => <div key={node.node_id}><span>{node.node_name}{(node.quality ?? []).map((quality) => <small key={`${quality.key}/${quality.type}/${quality.unit}/${quality.direction}`}>{quality.label}: {quality.numeric?.median ?? quality.values[0]?.value ?? "—"}{quality.unit ? ` ${quality.unit}` : ""} · {quality.pass_rate === null ? "unclassified" : `${(quality.pass_rate * 100).toFixed(0)}% pass`}</small>)}</span><strong>{node.success_rate === null ? "—" : `${(node.success_rate * 100).toFixed(0)}%`} · n={node.runs}</strong></div>)}</article><article><h3>Candidate nodes</h3>{comparison.right.nodes.map((node) => <div key={node.node_id}><span>{node.node_name}{(node.quality ?? []).map((quality) => <small key={`${quality.key}/${quality.type}/${quality.unit}/${quality.direction}`}>{quality.label}: {quality.numeric?.median ?? quality.values[0]?.value ?? "—"}{quality.unit ? ` ${quality.unit}` : ""} · {quality.pass_rate === null ? "unclassified" : `${(quality.pass_rate * 100).toFixed(0)}% pass`}</small>)}</span><strong>{node.success_rate === null ? "—" : `${(node.success_rate * 100).toFixed(0)}%`} · n={node.runs}</strong></div>)}</article></div>
+    </>}</section>}
     {report && <>
       <section className="metrics-kpis">
         <div><span>Total tickets</span><strong>{report.totals.tickets}</strong><small>{report.totals.completed} completed · {report.totals.archived} archived</small></div>
         <div><span>Total tokens</span><strong>{report.coverage.token_runs ? tokenCount(report.totals.total_tokens) : "Unavailable"}</strong><small>{report.coverage.token_runs}/{report.coverage.agent_runs} agent runs covered</small></div>
         <div><span>Known cost</span><strong>{report.coverage.cost_runs ? usd(report.totals.known_cost_usd) : "Unavailable"}</strong><small>{report.coverage.cost_runs}/{report.coverage.agent_runs} runs · {report.coverage.estimated_cost_runs} estimated</small></div>
-        <div><span>Active runtime</span><strong>{duration(report.totals.active_ms)}</strong><small>{duration(report.totals.quota_paused_ms)} quota paused</small></div>
+        <div><span>Active runtime</span><strong>{duration(report.totals.active_ms)}</strong><small>{duration(report.totals.quota_paused_ms)} quota paused · {duration(report.totals.external_wait_ms)} external wait</small></div>
         <div><span>Production success</span><strong>{report.totals.production_success_rate === null ? "—" : `${(report.totals.production_success_rate * 100).toFixed(1)}%`}</strong><small>{report.totals.production.succeeded} succeeded · {report.totals.production.failed + report.totals.production.rolled_back} failed/rolled back</small></div>
+        <div><span>Estimated human work</span><strong>{(report.totals.estimated_human_days ?? 0).toLocaleString()} days</strong><small>{usd(report.totals.estimated_human_cost_usd ?? 0)} at {usd(report.totals.human_day_rate_usd ?? 1_000)}/day</small></div>
       </section>
       <p className="metrics-coverage">Cost and token totals include only observed values. Per-ticket summaries require complete coverage for every completed agent run: {report.coverage.complete_cost_tickets} tickets have complete cost and {report.coverage.complete_token_tickets} have complete token coverage. Unknown subscription cost is never treated as zero.</p>
       <section className="five-number-grid">
         <FiveNumberCard title="Ticket duration" summary={report.summaries.ticket_duration_ms} kind="duration" />
         <FiveNumberCard title="Active time / ticket" summary={report.summaries.active_time_ms} kind="duration" />
         <FiveNumberCard title="Human wait / ticket" summary={report.summaries.human_wait_ms} kind="duration" />
+        {report.summaries.external_wait_ms && <FiveNumberCard title="External wait / ticket" summary={report.summaries.external_wait_ms} kind="duration" />}
         <FiveNumberCard title="Quota pause / ticket" summary={report.summaries.quota_pause_ms} kind="duration" />
         <FiveNumberCard title="Tokens / ticket" summary={report.summaries.tokens_per_ticket} kind="tokens" />
         <FiveNumberCard title="Cost / ticket" summary={report.summaries.cost_per_ticket_usd} kind="cost" />
+        <FiveNumberCard title="Estimated human days" summary={report.summaries.estimated_human_days} kind="number" />
+        <FiveNumberCard title="Estimated human cost" summary={report.summaries.estimated_human_cost_usd} kind="cost" />
       </section>
+      <section className="human-comparison content-card"><div className="section-heading"><div><span>Cost comparison</span><h2>Human estimate vs factory</h2></div><small>{report.totals.comparison_tickets} completed ticket{report.totals.comparison_tickets === 1 ? "" : "s"} with human estimates and complete factory cost</small></div><div className="metric-grid"><div><span>Human estimate</span><strong>{usd(report.totals.comparison_human_cost_usd)}</strong></div><div><span>Factory cost</span><strong>{usd(report.totals.comparison_factory_cost_usd)}</strong></div><div><span>Estimated savings</span><strong>{usd(report.totals.comparison_savings_usd)}</strong></div><div><span>Cost reduction</span><strong>{report.totals.comparison_savings_rate === null ? "—" : `${(report.totals.comparison_savings_rate * 100).toFixed(1)}%`}</strong></div></div><p>Human values are planning estimates, not measured labor. Factory comparison includes only completed tickets with complete agent-run cost coverage.</p></section>
       <section className="production-metrics content-card"><div className="section-heading"><div><span>Deployment evidence</span><h2>Production outcomes</h2></div><small>{report.totals.production_assessed}/{report.totals.tickets} assessed</small></div><div>{Object.entries(report.totals.production).map(([result, count]) => <div key={result}><span>{humanize(result)}</span><strong>{count}</strong><progress max={Math.max(1, report.totals.tickets)} value={count} /></div>)}</div></section>
       <section className="workflow-metrics"><div className="section-heading"><div><span>Workflow reliability</span><h2>Nodes and branches</h2></div><small>Grouped by immutable workflow revision</small></div>
         {report.workflows.map((workflow) => <details key={`${workflow.workflow_id}@${workflow.workflow_revision}`} open={report.workflows.length === 1}><summary><strong>{humanize(workflow.workflow_id)}</strong><code>{workflow.workflow_revision.slice(0, 12)}</code><span>{workflow.ticket_count} tickets · {workflow.nodes.reduce((sum, node) => sum + node.runs, 0)} runs</span></summary><div className="node-metrics-grid">{workflow.nodes.map((node) => <article key={node.node_id} className="node-metric-card">
@@ -1326,8 +1601,9 @@ function MetricsPage({ onError }: { onError: (message: string | null) => void })
           <p>{node.classifications.success} success · {node.classifications.failure} failure · {node.classifications.neutral} neutral · {node.classifications.unclassified} unclassified</p>
           <div className="reliability-bar"><i style={{ width: `${node.success_rate === null ? 0 : node.success_rate * 100}%` }} /></div>
           <dl><div><dt>Runs</dt><dd>{node.runs}</dd></div><div><dt>Median</dt><dd>{formatMetric(node.wall_ms.median, "duration")}</dd></div><div><dt>Tokens</dt><dd>{node.telemetry_coverage.token_runs ? tokenCount(node.total_tokens) : "—"}</dd></div><div><dt>Cost</dt><dd>{node.telemetry_coverage.cost_runs ? usd(node.known_cost_usd) : "—"}</dd></div></dl>
-          {(node.interrupted > 0 || node.lease_lost > 0 || node.bypassed > 0) && <small>{node.interrupted} interrupted · {node.lease_lost} lease lost · {node.bypassed} bypassed</small>}
+          {(node.interrupted > 0 || node.lease_lost > 0 || node.delivery_failed > 0 || node.bypassed > 0) && <small>{node.interrupted} interrupted · {node.lease_lost} lease lost · {node.delivery_failed} delivery failed · {node.bypassed} bypassed</small>}
           {node.branches.length > 0 && <div className="branch-metrics"><strong>Branches taken</strong>{node.branches.map((branch) => <div key={branch.outcome}><span><i className={`metric-${branch.metric_class}`} />{branch.label}{branch.target ? ` → ${humanize(branch.target)}` : ""}</span><b>{branch.count} · {(branch.rate * 100).toFixed(0)}%</b></div>)}</div>}
+          {(node.quality ?? []).length > 0 && <div className="quality-metrics"><strong>Quality attributes</strong>{node.quality.map((quality) => <div key={`${quality.key}/${quality.type}/${quality.unit}/${quality.direction}`}><span><i className={quality.statuses.fail ? "metric-failure" : quality.statuses.warn ? "metric-neutral" : "metric-success"} />{quality.label}<small>{quality.numeric?.median !== null && quality.numeric ? `Median ${quality.numeric.median}${quality.unit ? ` ${quality.unit}` : ""}` : quality.values.slice(0, 2).map((item) => `${item.value} (${item.count})`).join(", ")}</small></span><b>{quality.pass_rate === null ? "—" : `${(quality.pass_rate * 100).toFixed(0)}% pass`} · n={quality.ticket_count}</b></div>)}</div>}
         </article>)}</div></details>)}
         {!report.workflows.length && <div className="empty-health"><h2>No workflow runs match these filters</h2></div>}
       </section>
@@ -1349,15 +1625,178 @@ function ProductionAssessment({ ticket, busy, onSave, onArchive }: { ticket: Tic
   </section>;
 }
 
+const QUEUE_STATUS_RANK: Record<string, number> = {
+  blocked: 0, failed: 0, waiting_approval: 0,
+  running: 1, waiting_external: 1, ready: 2, pending: 3, completed: 4, cancelled: 5,
+};
+
+const INTAKE_LIMITS = { max_new_per_run: 3, max_new_per_day: 20, max_open: 20, max_working: 5, max_observed_unarchived: 30 };
+type IntakeEditorState = { kind: "campaign" | "source"; content: string; revision?: string; advanced: boolean };
+type SourcePreset = "script" | "new-relic" | "jira" | "dependabot" | "external";
+
+function newCampaignYaml(preset: "general" | "performance" | "maintenance" = "general"): string {
+  const values = preset === "performance" ? { id: "performance-improvement", name: "Performance improvement", description: "Continuously discover, deliver, and measure application performance improvements." }
+    : preset === "maintenance" ? { id: "dependency-maintenance", name: "Dependency maintenance", description: "Continuously discover and safely deliver dependency and platform maintenance." }
+      : { id: "new-campaign", name: "New campaign", description: "A repeatable improvement objective." };
+  return stringify({ version: 1, ...values, enabled: false, limits: { ...INTAKE_LIMITS, max_new_per_run: 100, max_new_per_day: 100, max_open: 50, max_working: 10, max_observed_unarchived: 100 }, success_policy: {} }, { lineWidth: 0 });
+}
+
+function newSourceYaml(campaignId: string, preset: SourcePreset = "script"): string {
+  const templates: Record<SourcePreset, { id: string; name: string; description: string; runner: IntakeSource["runner"]; labels: string[] }> = {
+    script: { id: "new-source", name: "Scheduled discovery source", description: "Deterministically discovers bounded candidate work.", runner: { type: "supervisor_script", language: "shell", script_path: ".agents/intake/discover.sh", working_directory: ".", timeout_seconds: 300 }, labels: ["automated-intake"] },
+    "new-relic": { id: "new-relic-issues", name: "New Relic issues", description: "Discovers actionable performance and reliability findings from New Relic.", runner: { type: "supervisor_script", language: "python", script_path: ".agents/intake/new_relic.py", working_directory: ".", timeout_seconds: 300 }, labels: ["new-relic", "performance", "automated-intake"] },
+    jira: { id: "jira-ready", name: "Jira ready queue", description: "Imports eligible Jira Cloud issues as bounded workflow tickets.", runner: { type: "supervisor_script", language: "python", script_path: ".agents/intake/jira.py", working_directory: ".", timeout_seconds: 300 }, labels: ["jira", "automated-intake"] },
+    dependabot: { id: "dependabot-pull-requests", name: "Dependabot pull requests", description: "Discovers open Dependabot changes that need delivery workflows.", runner: { type: "supervisor_script", language: "javascript", script_path: ".agents/intake/dependabot.mjs", working_directory: ".", timeout_seconds: 300 }, labels: ["dependabot", "dependencies", "automated-intake"] },
+    external: { id: "follow-on-work", name: "Follow-on work", description: "Accepts candidate work emitted by ticket agents or another external system.", runner: { type: "external" }, labels: ["follow-on"] },
+  };
+  const template = templates[preset];
+  return stringify({
+    version: 1, id: template.id, name: template.name, description: template.description, enabled: false,
+    campaign_id: campaignId || "new-campaign", schedule: { interval_minutes: 60 },
+    runner: template.runner,
+    ticket: { workflow_id: "standard-delivery", repositories: [{ id: "repository-name", primary: true }], labels: template.labels, priority: 0, mark_ready: false, workflow_inputs: {}, stage_enabled: {} },
+    limits: INTAKE_LIMITS,
+  }, { lineWidth: 0 });
+}
+
+function intakeEditorValue<T>(editor: IntakeEditorState): T | null {
+  try { const value = parse(editor.content); return value && typeof value === "object" ? value as T : null; } catch { return null; }
+}
+
+function intakeEditorErrors(editor: IntakeEditorState): string[] {
+  const value = intakeEditorValue<Record<string, any>>(editor);
+  if (!value) return ["Advanced YAML is not valid and cannot be shown in the form."];
+  const errors: string[] = [];
+  if (!/^[a-z][a-z0-9-]{0,63}$/.test(String(value.id ?? ""))) errors.push("ID must begin with a lowercase letter and contain only lowercase letters, numbers, and hyphens.");
+  if (!String(value.name ?? "").trim()) errors.push("Name is required.");
+  if (editor.kind === "source") {
+    if (!String(value.campaign_id ?? "").trim()) errors.push("Choose a campaign.");
+    if (!String(value.ticket?.workflow_id ?? "").trim()) errors.push("Choose a ticket workflow.");
+    const repositories = Array.isArray(value.ticket?.repositories) ? value.ticket.repositories : [];
+    if (!repositories.length) errors.push("Add at least one repository.");
+    if (repositories.filter((item: any) => item?.primary === true).length !== 1) errors.push("Choose exactly one primary repository.");
+    if (value.runner?.type === "supervisor_script" && !String(value.runner.script_path ?? "").trim()) errors.push("A Script source needs a script path.");
+  }
+  return errors;
+}
+
+function IntakeLimitFields({ value, onChange }: { value: IntakeLimits; onChange: (value: IntakeLimits) => void }) {
+  const fields: Array<[keyof IntakeLimits, string, string]> = [
+    ["max_new_per_run", "New per run", "Maximum tickets admitted from one observation run."],
+    ["max_new_per_day", "New per day", "Daily admission rate limit."],
+    ["max_open", "Open tickets", "Maximum unresolved tickets from this scope."],
+    ["max_working", "In flight", "Maximum tickets that have advanced beyond draft."],
+    ["max_observed_unarchived", "Visible unarchived", "Maximum active observation surface, including completed tickets."],
+  ];
+  return <div className="intake-limit-grid">{fields.map(([key, label, help]) => <label key={key}><span>{label}</span><input aria-label={label} type="number" min="1" value={value[key]} onChange={(event) => onChange({ ...value, [key]: Number(event.target.value) })} /><small>{help}</small></label>)}</div>;
+}
+
+function IntakeDefinitionEditor({ editor, campaigns, repositories, workflows, busy, onChange, onClose, onSave }: {
+  editor: IntakeEditorState; campaigns: IntakeOverview["campaigns"]; repositories: RepositoryConfig[]; workflows: WorkflowDocument[]; busy: boolean;
+  onChange: (editor: IntakeEditorState) => void; onClose: () => void; onSave: (preview: boolean) => void;
+}) {
+  const value = intakeEditorValue<Record<string, any>>(editor);
+  const errors = intakeEditorErrors(editor);
+  const update = (mutate: (draft: Record<string, any>) => void) => {
+    const draft = intakeEditorValue<Record<string, any>>(editor);
+    if (!draft) return;
+    mutate(draft); onChange({ ...editor, content: stringify(draft, { lineWidth: 0 }) });
+  };
+  const campaign = editor.kind === "campaign" && value ? value as IntakeCampaign : null;
+  const source = editor.kind === "source" && value ? value as IntakeSource : null;
+  const updateLimits = (limits: IntakeLimits) => update((draft) => { draft.limits = limits; });
+  const updateRepositories = (items: Array<{ id: string; primary: boolean }>) => update((draft) => { draft.ticket.repositories = items; });
+  return <section className="content-card intake-editor">
+    <div className="section-heading"><div><span>{editor.revision ? "Edit versioned definition" : "Create definition"}</span><h2>{editor.kind === "campaign" ? "Campaign" : "Intake source"}</h2></div><button className="button-secondary" onClick={onClose}>Close</button></div>
+    {!value && <div className="intake-validation-errors"><strong>Fix the YAML to return to the form</strong>{errors.map((error) => <p key={error}>{error}</p>)}</div>}
+    {campaign && <div className="intake-form">
+      {!editor.revision && <div className="intake-presets"><span>Start from</span><button onClick={() => onChange({ ...editor, content: newCampaignYaml("general") })}>General</button><button onClick={() => onChange({ ...editor, content: newCampaignYaml("performance") })}>Performance</button><button onClick={() => onChange({ ...editor, content: newCampaignYaml("maintenance") })}>Maintenance</button></div>}
+      <section><header><span>Objective</span><h3>What should this campaign improve?</h3></header><div className="intake-field-grid"><label><span>ID</span><input aria-label="Campaign ID" disabled={Boolean(editor.revision)} value={campaign.id} onChange={(event) => update((draft) => { draft.id = event.target.value; })} /><small>Stable identity used in provenance and metrics.</small></label><label><span>Name</span><input aria-label="Campaign name" value={campaign.name} onChange={(event) => update((draft) => { draft.name = event.target.value; })} /></label><label className="wide"><span>Description</span><textarea aria-label="Campaign description" value={campaign.description} onChange={(event) => update((draft) => { draft.description = event.target.value; })} /></label><label className="toggle wide"><input aria-label="Campaign enabled" type="checkbox" checked={campaign.enabled} onChange={(event) => update((draft) => { draft.enabled = event.target.checked; })} /><span><strong>Enable campaign</strong><small>Enabled campaigns permit scheduled execution and candidate admission.</small></span></label></div></section>
+      <section><header><span>Capacity</span><h3>Bound the portfolio, not agent behavior</h3></header><IntakeLimitFields value={campaign.limits} onChange={updateLimits} /></section>
+    </div>}
+    {source && <div className="intake-form">
+      {!editor.revision && <><div className="intake-presets"><span>Source template</span>{(["script", "new-relic", "jira", "dependabot", "external"] as SourcePreset[]).map((preset) => <button key={preset} onClick={() => onChange({ ...editor, content: newSourceYaml(campaigns[0]?.id ?? "", preset) })}>{humanize(preset)}</button>)}</div><p className="intake-template-note">Integration templates configure a sensible source contract and script location. Add the referenced discovery script to the supervisor project root and provide its credentials on that VM.</p></>}
+      <section><header><span>Identity</span><h3>What facts does this source discover?</h3></header><div className="intake-field-grid"><label><span>ID</span><input aria-label="Source ID" disabled={Boolean(editor.revision)} value={source.id} onChange={(event) => update((draft) => { draft.id = event.target.value; })} /></label><label><span>Name</span><input aria-label="Source name" value={source.name} onChange={(event) => update((draft) => { draft.name = event.target.value; })} /></label><label><span>Campaign</span><select aria-label="Source campaign" value={source.campaign_id} onChange={(event) => update((draft) => { draft.campaign_id = event.target.value; })}><option value="">Choose campaign</option>{campaigns.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label><label className="toggle"><input aria-label="Source enabled" type="checkbox" checked={source.enabled} onChange={(event) => update((draft) => { draft.enabled = event.target.checked; })} /><span><strong>Enable source</strong><small>Scheduling begins only after this is enabled.</small></span></label><label className="wide"><span>Description</span><textarea aria-label="Source description" value={source.description} onChange={(event) => update((draft) => { draft.description = event.target.value; })} /></label></div></section>
+      <section><header><span>Discovery</span><h3>How are candidates collected?</h3></header><div className="intake-field-grid"><label><span>Runner</span><select aria-label="Source runner" value={source.runner.type} onChange={(event) => update((draft) => { draft.runner = event.target.value === "external" ? { type: "external" } : { type: "supervisor_script", language: "shell", script_path: ".agents/intake/discover.sh", working_directory: ".", timeout_seconds: 300 }; })}><option value="supervisor_script">Scheduled supervisor Script</option><option value="external">External push / child tickets</option></select></label>{source.runner.type === "supervisor_script" && <><label><span>Language</span><select aria-label="Source language" value={source.runner.language} onChange={(event) => update((draft) => { draft.runner.language = event.target.value; })}><option value="shell">Shell</option><option value="python">Python</option><option value="javascript">JavaScript</option></select></label><label><span>Interval (minutes)</span><input aria-label="Source interval" type="number" min="1" value={source.schedule.interval_minutes} onChange={(event) => update((draft) => { draft.schedule.interval_minutes = Number(event.target.value); })} /></label><label><span>Timeout (seconds)</span><input aria-label="Source timeout" type="number" min="1" value={source.runner.timeout_seconds} onChange={(event) => update((draft) => { draft.runner.timeout_seconds = Number(event.target.value); })} /></label><label className="wide"><span>Script path</span><input aria-label="Source script path" value={source.runner.script_path} onChange={(event) => update((draft) => { draft.runner.script_path = event.target.value; })} /><small>Relative to the supervisor project root.</small></label><label className="wide"><span>Working directory</span><input aria-label="Source working directory" value={source.runner.working_directory} onChange={(event) => update((draft) => { draft.runner.working_directory = event.target.value; })} /><small>Also relative to the supervisor project root.</small></label></>}</div>{source.runner.type === "external" && <p className="intake-callout">External sources do not run on a schedule. Ticket agents and external integrations submit candidate batches through the tracker API.</p>}</section>
+      <section><header><span>Ticket template</span><h3>Where should admitted work go?</h3></header><div className="intake-field-grid"><label><span>Workflow</span><select aria-label="Source workflow" value={source.ticket.workflow_id} onChange={(event) => update((draft) => { draft.ticket.workflow_id = event.target.value; delete draft.ticket.workflow_revision; })}><option value="">Choose workflow</option>{workflows.filter((item) => item.valid).map((item) => <option key={item.definition.id} value={item.definition.id}>{item.definition.name}</option>)}</select></label><label><span>Priority</span><input aria-label="Source ticket priority" type="number" value={source.ticket.priority} onChange={(event) => update((draft) => { draft.ticket.priority = Number(event.target.value); })} /></label><label className="wide"><span>Labels</span><input aria-label="Source ticket labels" value={source.ticket.labels.join(", ")} onChange={(event) => update((draft) => { draft.ticket.labels = event.target.value.split(",").map((item) => item.trim()).filter(Boolean); })} /><small>Comma-separated labels applied to each admitted ticket.</small></label><label className="toggle wide"><input aria-label="Mark admitted tickets ready" type="checkbox" checked={source.ticket.mark_ready} onChange={(event) => update((draft) => { draft.ticket.mark_ready = event.target.checked; })} /><span><strong>Mark admitted tickets ready</strong><small>Leave off when a human should inspect imported work first.</small></span></label></div><div className="intake-repositories"><div><strong>Repositories</strong><button onClick={() => updateRepositories([...source.ticket.repositories, { id: "", primary: false }])}>＋ Add repository</button></div><datalist id="intake-repository-catalog">{repositories.map((repository) => <option key={repository.id} value={repository.id} />)}</datalist>{source.ticket.repositories.map((repository, index) => <div key={index}><input aria-label={`Source repository ${index + 1}`} list="intake-repository-catalog" placeholder="Repository ID" value={repository.id} onChange={(event) => updateRepositories(source.ticket.repositories.map((item, candidate) => candidate === index ? { ...item, id: event.target.value } : item))} /><label><input type="radio" name="intake-primary-repository" checked={repository.primary} onChange={() => updateRepositories(source.ticket.repositories.map((item, candidate) => ({ ...item, primary: candidate === index })))} /> Primary</label><button aria-label={`Remove source repository ${index + 1}`} disabled={source.ticket.repositories.length === 1} onClick={() => updateRepositories(source.ticket.repositories.filter((_, candidate) => candidate !== index).map((item, candidate) => ({ ...item, primary: candidate === 0 ? true : item.primary })))}>×</button></div>)}</div></section>
+      <section><header><span>Admission limits</span><h3>Control source pressure</h3></header><IntakeLimitFields value={source.limits} onChange={updateLimits} /></section>
+    </div>}
+    {errors.length > 0 && value && <div className="intake-validation-errors"><strong>Definition needs attention</strong>{errors.map((error) => <p key={error}>{error}</p>)}</div>}
+    <details className="intake-advanced" open={editor.advanced} onToggle={(event) => onChange({ ...editor, advanced: (event.currentTarget as HTMLDetailsElement).open })}><summary>Advanced YAML</summary><p>Use this for workflow inputs, stage overrides, success policy, or fields not exposed above. The form and YAML edit the same versioned definition.</p><textarea aria-label="Intake definition YAML" value={editor.content} onChange={(event) => onChange({ ...editor, content: event.target.value })} /></details>
+    <div className="editor-actions"><small>Definitions are versioned YAML under the configured ticket root. New definitions start disabled.</small><div>{source?.runner.type === "supervisor_script" && <button className="button-secondary" disabled={busy || errors.length > 0} onClick={() => onSave(true)}>Save & test discovery</button>}<button className="button-primary" disabled={busy || errors.length > 0} onClick={() => onSave(false)}>Save definition</button></div></div>
+  </section>;
+}
+
+function IntakePage({ repositories, workflows, onOpenTicket, onError }: { repositories: RepositoryConfig[]; workflows: WorkflowDocument[]; onOpenTicket: (id: string) => void; onError: (message: string | null) => void }) {
+  const [overview, setOverview] = useState<IntakeOverview | null>(null);
+  const [editor, setEditor] = useState<IntakeEditorState | null>(null);
+  const [busy, setBusy] = useState(false);
+  const load = useCallback(async () => {
+    try { setOverview(await api.intake()); } catch (error) { onError((error as Error).message); }
+  }, [onError]);
+  useEffect(() => {
+    void load();
+    const timer = window.setInterval(() => void load(), 15_000);
+    return () => window.clearInterval(timer);
+  }, [load]);
+  const save = async (preview = false) => {
+    if (!editor) return;
+    setBusy(true); onError(null);
+    try {
+      const parsed = parse(editor.content) as { id?: unknown };
+      if (!parsed || typeof parsed.id !== "string" || !parsed.id.trim()) throw new Error("The YAML must contain an id.");
+      if (editor.kind === "campaign") await api.saveIntakeCampaign(parsed.id, editor.content, editor.revision);
+      else {
+        await api.saveIntakeSource(parsed.id, editor.content, editor.revision);
+        if (preview) await api.triggerIntakeSource(parsed.id, true);
+      }
+      setEditor(null); await load();
+    } catch (error) { onError((error as Error).message); }
+    finally { setBusy(false); }
+  };
+  const trigger = async (id: string, preview = false) => {
+    setBusy(true); onError(null);
+    try { await api.triggerIntakeSource(id, preview); await load(); } catch (error) { onError((error as Error).message); }
+    finally { setBusy(false); }
+  };
+  if (!overview) return <main className="intake-page"><div className="empty-health"><h2>Loading intake operations…</h2></div></main>;
+  return <main className="intake-page">
+    <div className="health-heading"><div><span>Continuous improvement</span><h1>Campaigns & intake</h1><p>Campaigns bound long-lived objectives. Sources discover candidates; every admitted candidate becomes an independently measured workflow ticket.</p></div><div className="intake-actions"><button className="button-secondary" onClick={() => setEditor({ kind: "campaign", content: newCampaignYaml(), advanced: false })}>＋ Campaign</button><button className="button-primary" disabled={!overview.campaigns.length} onClick={() => setEditor({ kind: "source", content: newSourceYaml(overview.campaigns[0]?.id ?? ""), advanced: false })}>＋ Source</button></div></div>
+    {!overview.campaigns.length && <div className="intake-callout">Create a campaign first. It supplies the objective and aggregate capacity boundary for every source.</div>}
+    <section className="metric-kpis intake-kpis"><div><span>Campaigns</span><strong>{overview.totals.enabled_campaigns}/{overview.totals.campaigns}</strong><small>enabled</small></div><div><span>Sources</span><strong>{overview.totals.enabled_sources}/{overview.totals.sources}</strong><small>enabled</small></div><div><span>Candidates</span><strong>{overview.totals.candidates}</strong><small>{overview.totals.admitted} admitted</small></div><div><span>Deferred</span><strong>{overview.totals.deferred}</strong><small>waiting for capacity</small></div><div><span>Runs</span><strong>{overview.totals.runs}</strong><small>{overview.totals.preview_runs} previews · {overview.totals.running_runs} running</small></div></section>
+    {editor && <IntakeDefinitionEditor editor={editor} campaigns={overview.campaigns} repositories={repositories} workflows={workflows} busy={busy} onChange={setEditor} onClose={() => setEditor(null)} onSave={(preview) => void save(preview)} />}
+    <div className="intake-grid"><section className="content-card"><div className="section-heading"><div><span>Objectives</span><h2>Campaigns</h2></div></div><div className="intake-definition-list">{overview.campaigns.map((campaign) => { const document = overview.campaign_documents.find((item) => item.definition.id === campaign.id); return <article key={campaign.id}><div><StatusPill value={campaign.enabled ? "ready" : "pending"} subtle /><strong>{campaign.name}</strong><small>{campaign.id} · {campaign.sources} sources</small></div><p>{campaign.admitted} admitted · {campaign.working_tickets} working · {campaign.completed_tickets} completed · {campaign.production_successes} prod successes</p><button className="button-secondary" onClick={() => document && setEditor({ kind: "campaign", content: document.content, revision: document.revision, advanced: false })}>Edit</button></article>; })}{!overview.campaigns.length && <p>Create a campaign to group sources, capacity, and outcome metrics.</p>}</div></section>
+    <section className="content-card"><div className="section-heading"><div><span>Discovery</span><h2>Sources</h2></div></div><div className="intake-definition-list">{overview.sources.map((source) => { const document = overview.source_documents.find((item) => item.definition.id === source.id); const runnable = document?.definition.runner.type === "supervisor_script"; return <article key={source.id}><div><StatusPill value={source.enabled ? source.failed_runs ? "blocked" : "ready" : "pending"} subtle /><strong>{source.name}</strong><small>{source.id} · {source.campaign_id}</small></div><p>{source.runs} admission runs · {source.preview_runs} previews · {source.admitted} admitted · {source.deferred} deferred</p><div><button className="button-secondary" onClick={() => document && setEditor({ kind: "source", content: document.content, revision: document.revision, advanced: false })}>Edit</button>{runnable && <button className="button-secondary" disabled={busy || source.running_runs > 0} onClick={() => void trigger(source.id, true)}>Test</button>}{runnable && <button className="button-secondary" disabled={busy || !source.enabled || source.running_runs > 0} onClick={() => void trigger(source.id)}>Run now</button>}</div></article>; })}{!overview.sources.length && <p>Create a source to watch New Relic, Jira, GitHub, or another deterministic feed.</p>}</div></section></div>
+    <section className="queue-table-card"><div className="section-heading intake-table-heading"><div><span>Admission ledger</span><h2>Recent candidates</h2></div></div><table className="queue-table"><thead><tr><th>Candidate</th><th>Source</th><th>Decision</th><th>Observed</th><th>Ticket</th></tr></thead><tbody>{overview.recent_candidates.map((candidate) => <tr key={candidate.id}><td><strong>{candidate.candidate.title}</strong><small>{candidate.external_key}</small>{candidate.reason && <small>{candidate.reason}</small>}</td><td>{candidate.source_id}</td><td><StatusPill value={candidate.decision} subtle /></td><td>{candidate.observation_count}× · {timeAgo(candidate.last_seen_at, Date.now())}</td><td>{candidate.ticket_id ? <button className="link-button" onClick={() => onOpenTicket(candidate.ticket_id!)}>{candidate.ticket_id}</button> : "—"}</td></tr>)}</tbody></table>{!overview.recent_candidates.length && <div className="queue-empty-state"><p>No candidates have been observed.</p></div>}</section>
+    <section className="queue-table-card"><div className="section-heading intake-table-heading"><div><span>Execution ledger</span><h2>Source runs</h2></div></div><table className="queue-table"><thead><tr><th>Source</th><th>Status</th><th>Supervisor</th><th>Candidates</th><th>Scheduled</th><th>Output</th></tr></thead><tbody>{overview.recent_runs.map((run) => <tr key={run.id}><td><strong>{run.source_id}</strong><small>{run.mode === "preview" ? "Safe preview" : "Admission"} · attempt {run.attempt}</small></td><td><StatusPill value={run.status} subtle />{run.error && <small>{run.error}</small>}</td><td>{run.supervisor_id ?? "—"}</td><td>{run.candidates_received}{run.mode === "preview" ? <details className="intake-preview-results"><summary>Preview results</summary>{(run.preview_candidates ?? []).map((candidate, index) => <div key={`${candidate.external_key}:${index}`} className={candidate.valid ? "valid" : "invalid"}><strong>{candidate.title || "Invalid candidate"}</strong><small>{candidate.external_key || "Missing key"}</small>{candidate.errors.map((error) => <small key={error}>{error}</small>)}</div>)}{run.candidates_received > 100 && <small>Only the first 100 candidates are shown.</small>}</details> : <small>{Object.entries(run.decisions).map(([key, value]) => `${key} ${value}`).join(" · ")}</small>}</td><td>{timeAgo(run.scheduled_at, Date.now())}</td><td>{run.output_bytes > 0 ? <a href={api.intakeOutputUrl(run.source_id, run.id)} target="_blank" rel="noreferrer">Open log</a> : "—"}</td></tr>)}</tbody></table>{!overview.recent_runs.length && <div className="queue-empty-state"><p>No source runs have executed.</p></div>}</section>
+  </main>;
+}
+
+function QueuePage({ tickets, includeArchived, setIncludeArchived, now, onOpen }: { tickets: TicketSummary[]; includeArchived: boolean; setIncludeArchived: (value: boolean) => void; now: number; onOpen: (id: string) => void }) {
+  const [query, setQuery] = useState("");
+  const [status, setStatus] = useState("");
+  const normalizedQuery = query.trim().toLowerCase();
+  const filtered = [...tickets].filter((ticket) => (!status || ticket.status === status) && (!normalizedQuery || [ticket.id, ticket.title, ticket.workflow_node_name ?? "", ...(ticket.labels ?? []), ...(ticket.repositories ?? [])].some((value) => value.toLowerCase().includes(normalizedQuery))))
+    .sort((left, right) => (QUEUE_STATUS_RANK[left.status] ?? 9) - (QUEUE_STATUS_RANK[right.status] ?? 9) || right.priority - left.priority || (left.updated_at ?? left.created_at).localeCompare(right.updated_at ?? right.created_at) || left.id.localeCompare(right.id));
+  return <main className="queue-page">
+    <div className="health-heading"><div><span>Work management</span><h1>Ticket queue</h1><p>Attention and active work stay above ready tickets, drafts, and finished work.</p></div><div className="health-summary"><strong>{filtered.length}</strong><span>visible tickets</span></div></div>
+    <section className="queue-toolbar"><label>Search<input aria-label="Search tickets" placeholder="ID, title, label, repository…" value={query} onChange={(event) => setQuery(event.target.value)} /></label><label>Status<select aria-label="Queue status" value={status} onChange={(event) => setStatus(event.target.value)}><option value="">All states</option>{["blocked", "failed", "waiting_approval", "running", "waiting_external", "ready", "pending", "completed", "cancelled"].map((value) => <option key={value} value={value}>{humanize(value)}</option>)}</select></label><label className="toggle queue-archive-toggle"><input type="checkbox" checked={includeArchived} onChange={(event) => setIncludeArchived(event.target.checked)} /><span><strong>Archived</strong><small>Include archived tickets</small></span></label></section>
+    <section className="queue-table-card"><table className="queue-table"><thead><tr><th>Ticket</th><th>State</th><th>Workflow</th><th>Agent</th><th>Repositories</th><th>Priority</th><th>Updated</th></tr></thead><tbody>{filtered.map((ticket) => <tr key={ticket.id} className={!ticket.valid ? "invalid" : ""} onClick={() => onOpen(ticket.id)}><td><button onClick={() => onOpen(ticket.id)}><strong>{ticket.id}</strong><span>{ticket.title}</span></button>{(ticket.claim_blockers ?? []).map((blocker) => <small key={`${blocker.hostname}:${blocker.ticket_id}`}>{blocker.repositories.join(", ")} blocked by {blocker.ticket_id} on {blocker.hostname}</small>)}</td><td><StatusPill value={ticket.valid ? ticket.status : "invalid"} subtle />{ticket.archived_at && <small>Archived</small>}</td><td><strong>{ticket.workflow_stage_name ?? humanize(ticket.phase)}</strong><small>{ticket.workflow_node_name ?? "Workflow unavailable"}</small></td><td><span>{ticket.provider ? humanize(ticket.provider) : "—"}</span><small>{ticket.assigned_supervisor ?? "Unassigned"}</small></td><td>{(ticket.repositories ?? []).join(", ") || "—"}</td><td>P{ticket.priority}</td><td>{timeAgo(ticket.updated_at || ticket.created_at, now)}</td></tr>)}</tbody></table>{!filtered.length && <div className="queue-empty-state"><h2>No tickets match this view</h2><p>Clear filters or include archived tickets.</p></div>}</section>
+  </main>;
+}
+
 export function App() {
   const [theme, setTheme] = useState<Theme>(storedTheme);
   const [tickets, setTickets] = useState<TicketSummary[]>([]);
   const [runtime, setRuntime] = useState<RuntimeAgent[]>([]);
   const [supervisors, setSupervisors] = useState<SupervisorHealth[]>([]);
+  const [operations, setOperations] = useState<OperationalStatus | null>(null);
   const [config, setConfig] = useState<TrackerConfig | null>(null);
+  const [quotaReport, setQuotaReport] = useState<QuotaReport | null>(null);
   const [prompts, setPrompts] = useState<PromptDocument[]>([]);
   const [workflows, setWorkflows] = useState<WorkflowDocument[]>([]);
-  const [view, setView] = useState<"tickets" | "metrics" | "supervisors" | "configuration" | "prompts" | "workflows">("tickets");
+  const [workflowReleases, setWorkflowReleases] = useState<WorkflowReleaseCatalog | null>(null);
+  const [view, setView] = useState<"tickets" | "intake" | "metrics" | "supervisors" | "configuration" | "prompts" | "workflows">("tickets");
   const [selected, setSelected] = useState<TicketDetail | null>(null);
   const [creating, setCreating] = useState(false);
   const [draft, setDraft] = useState<TicketDraft>(emptyDraft);
@@ -1367,10 +1806,9 @@ export function App() {
   const [busy, setBusy] = useState(false);
   const [composer, setComposer] = useState<null | { kind: "comment" | "guidance"; text: string }>(null);
   const [questionAnswers, setQuestionAnswers] = useState<Record<string, string>>({});
-  const [descriptionEdit, setDescriptionEdit] = useState<null | { text: string; targetPhase: "specification" | "implementation" | "review" }>(null);
+  const [descriptionEdit, setDescriptionEdit] = useState<null | { text: string; targetNode: string }>(null);
   const [now, setNow] = useState(Date.now());
   const [includeArchived, setIncludeArchived] = useState(false);
-  const [queueOrder, setQueueOrder] = useState<"priority" | "workflow">("priority");
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
@@ -1378,8 +1816,10 @@ export function App() {
   }, [theme]);
 
   const refresh = useCallback(async () => {
-    const [list, live, health, configured, promptLibrary, workflowLibrary] = await Promise.all([api.list(includeArchived), api.runtime(), api.supervisors(), api.config(), api.prompts(), api.workflows().catch(() => ({ workflows: [] }))]);
-    setTickets(list.tickets); setRuntime(live.agents); setSupervisors(health.supervisors); setConfig(configured.config); setPrompts(promptLibrary.prompts); setWorkflows(workflowLibrary.workflows);
+    const [list, live, health, operational, configured, promptLibrary, workflowLibrary, releases] = await Promise.all([api.list(includeArchived), api.runtime(), api.supervisors(), api.operations().catch(() => null), api.config(), api.prompts(), api.workflows().catch(() => ({ workflows: [] })), api.workflowReleases().catch(() => null)]);
+    setTickets(list.tickets); setRuntime(live.agents); setSupervisors(health.supervisors); setConfig(configured.config); setQuotaReport(configured.quota ?? null); setPrompts(promptLibrary.prompts); setWorkflows(workflowLibrary.workflows);
+    setOperations(operational);
+    setWorkflowReleases(releases ?? fallbackWorkflowReleases(workflowLibrary.workflows));
     if (selected) {
       const next = await api.get(selected.id).catch(() => null);
       if (next) {
@@ -1395,9 +1835,11 @@ export function App() {
     return () => window.clearInterval(timer);
   }, []);
   useEffect(() => {
-    const timer = window.setInterval(() => void Promise.all([api.supervisors(), api.config()]).then(([health, configured]) => {
+    const timer = window.setInterval(() => void Promise.all([api.supervisors(), api.operations().catch(() => null), api.config()]).then(([health, operational, configured]) => {
       setSupervisors(health.supervisors);
+      setOperations(operational);
       setConfig(configured.config);
+      setQuotaReport(configured.quota ?? null);
     }).catch(() => undefined), 30_000);
     return () => window.clearInterval(timer);
   }, []);
@@ -1424,13 +1866,40 @@ export function App() {
   };
 
   const save = async () => {
-    if (creating) {
-      const created = await run(() => api.create(ticketMarkdown(draft), draft.autoId, draft.workflowId, draft.workflowInputs, draft.stageEnabled));
-      if (created) setCreating(false);
-      return;
+    if (!creating && !selected) return;
+    setBusy(true); setError(null);
+    let next: TicketDetail | null = null;
+    let uploadedFiles = 0;
+    try {
+      next = creating
+        ? await api.create(ticketMarkdown(draft), draft.autoId, draft.workflowId, draft.workflowRevision || undefined, draft.workflowInputs, draft.stageEnabled)
+        : await api.edit(selected!, selected!.valid ? ticketMarkdown(draft, selected!) : rawDraft);
+      for (const file of draft.attachmentFiles) { next = await api.uploadAttachment(next, file); uploadedFiles += 1; }
+      setSelected(next); setDraft(draftFromTicket(next)); setRawDraft(next.markdown); setDirty(false); setComposer(null); setCreating(false);
+      await refresh();
+    } catch (caught) {
+      if (next) { setSelected(next); setDraft({ ...draftFromTicket(next), attachmentFiles: draft.attachmentFiles.slice(uploadedFiles) }); setRawDraft(next.markdown); setCreating(false); await refresh(); }
+      setError((caught as Error).message);
+    } finally { setBusy(false); }
+  };
+
+  const uploadAttachments = async (files: File[]) => {
+    if (!selected || files.length === 0) return;
+    if (files.some((file) => file.size > MAX_ATTACHMENT_BYTES)) { setError("Each attachment must be 25 MB or smaller."); return; }
+    setBusy(true); setError(null);
+    let next = selected;
+    try {
+      for (const file of files) next = await api.uploadAttachment(next, file);
+    } catch (caught) { setError((caught as Error).message); }
+    finally {
+      setBusy(false);
+      if (next !== selected) { setSelected(next); setDraft(draftFromTicket(next)); setRawDraft(next.markdown); await refresh().catch((caught: Error) => setError(caught.message)); }
     }
-    if (!selected) return;
-    await run(() => api.edit(selected, selected.valid ? ticketMarkdown(draft, selected) : rawDraft, "keep_phase"));
+  };
+
+  const removeAttachment = async (attachmentId: string) => {
+    if (!selected || !window.confirm("Remove this attachment from the ticket?")) return;
+    await run(() => api.removeAttachment(selected, attachmentId));
   };
 
   const submitComposer = async () => {
@@ -1441,21 +1910,19 @@ export function App() {
   const saveLiveDescription = async (restart = false) => {
     if (!selected?.frontmatter || !descriptionEdit?.text.trim()) return;
     const nextDraft = { ...draftFromTicket(selected), description: descriptionEdit.text.trim() };
-    if (restart && descriptionEdit.targetPhase === "specification") nextDraft.specRequired = true;
-    if (restart && descriptionEdit.targetPhase === "review") nextDraft.reviewRequired = true;
     const saved = await run(async () => {
       if (restart && selected.frontmatter?.workflow && selected.workflow_definition) {
-        const edited = await api.edit(selected, ticketMarkdown(nextDraft, selected), "keep_phase");
-        const target = selected.workflow_definition.nodes.find((node) => node.type === "agent" && node.phase === descriptionEdit.targetPhase);
-        if (!target) throw new Error(`The pinned workflow has no ${descriptionEdit.targetPhase} agent node.`);
+        const edited = await api.edit(selected, ticketMarkdown(nextDraft, selected));
+        const target = selected.workflow_definition.nodes.find((node) => node.id === descriptionEdit.targetNode && node.type !== "terminal");
+        if (!target) throw new Error(`The pinned workflow has no restartable node ${descriptionEdit.targetNode}.`);
         return api.action(edited, "workflow/migrate", { workflow_id: selected.frontmatter.workflow.id, node_id: target.id });
       }
-      return api.edit(selected, ticketMarkdown(nextDraft, selected), restart ? "rewind" : "keep_phase", restart ? descriptionEdit.targetPhase : undefined);
+      return api.edit(selected, ticketMarkdown(nextDraft, selected));
     });
     if (saved) setDescriptionEdit(null);
   };
 
-  const moveToPhase = async (action: "rewind" | "reopen") => {
+  const moveToNode = async (action: "restart" | "reopen") => {
     if (!selected) return;
     if (selected.frontmatter?.workflow && selected.workflow_definition) {
       const choices = selected.workflow_definition.nodes.map((node) => node.id).join(", ");
@@ -1463,8 +1930,7 @@ export function App() {
       if (nodeId) await run(() => api.action(selected, "workflow/migrate", { workflow_id: selected.frontmatter!.workflow!.id, node_id: nodeId }));
       return;
     }
-    const phase = window.prompt(`${action === "reopen" ? "Reopen" : "Rewind"} phase: specification, implementation, or review`, "implementation");
-    if (phase) await run(() => api.action(selected, action, { phase }));
+    throw new Error("Ticket does not have a pinned workflow");
   };
 
   const migrateWorkflow = async () => {
@@ -1480,11 +1946,6 @@ export function App() {
   const fail = async () => {
     if (!selected) return; const text = window.prompt("Why should this ticket be failed?");
     if (text) await run(() => api.action(selected, "fail", { message: text }));
-  };
-
-  const specFeedback = async () => {
-    if (!selected) return; const text = window.prompt("Requested specification changes:");
-    if (text) await run(() => api.action(selected, "request-specification-changes", { message: text }));
   };
 
   const answerQuestion = async (questionId: string) => {
@@ -1507,11 +1968,21 @@ export function App() {
     finally { setBusy(false); }
   };
 
-  const saveConfig = async (update: Pick<TrackerConfig, "providers" | "agent_profiles" | "repositories" | "jira" | "github">) => {
+  const saveConfig = async (update: Pick<TrackerConfig, "providers" | "agent_profiles" | "pricing" | "metrics" | "quality" | "artifacts" | "repositories" | "jira" | "github">) => {
     if (!config) return;
     setBusy(true); setError(null);
-    try { const updated = await api.updateConfig(config, update); setConfig(updated.config); }
+    try { const updated = await api.updateConfig(config, update); setConfig(updated.config); setQuotaReport(updated.quota ?? null); }
     catch (caught) { setError((caught as Error).message); }
+    finally { setBusy(false); }
+  };
+
+  const restoreDefaults = async () => {
+    if (!window.confirm("Restore every built-in prompt and workflow to its shipped default? Custom artifacts and ticket-pinned revisions will be preserved.")) return;
+    setBusy(true); setError(null);
+    try {
+      const restored = await api.restoreDefaults({ prompts: true, workflows: true });
+      setPrompts(restored.prompts); setWorkflows(restored.workflows); await refresh();
+    } catch (caught) { setError((caught as Error).message); }
     finally { setBusy(false); }
   };
 
@@ -1519,7 +1990,13 @@ export function App() {
     setError(null);
     try {
       const next = await api.nextId();
-      setView("tickets"); setCreating(true); setSelected(null); setDraft(emptyDraft(next.id, true, config?.providers?.enabled ?? ALL_WORK_PROVIDERS)); setDirty(false);
+      const initial = emptyDraft(next.id, true);
+      const workflowId = workflowReleases?.catalog.default_workflow_id ?? initial.workflowId;
+      const release = workflowReleases?.releases.find((item) => item.workflow_id === workflowId && item.is_default);
+      setView("tickets"); setCreating(true); setSelected(null); setDraft({ ...initial, workflowId, workflowRevision: release?.revision ?? "",
+        workflowInputs: Object.fromEntries(release?.definition.inputs.map((input) => [input.id, input.default]) ?? []),
+        stageEnabled: Object.fromEntries(release?.definition.stages.map((stage) => [stage.id, stage.skippable ? stage.default_enabled : true]) ?? []),
+      }); setDirty(false);
     } catch (caught) { setError((caught as Error).message); }
   };
 
@@ -1530,56 +2007,42 @@ export function App() {
     try {
       const imported = (await api.jiraImport(key.trim())).draft;
       setView("tickets"); setCreating(true); setSelected(null);
-      setDraft({ ...emptyDraft(imported.id, false, config?.providers?.enabled ?? ALL_WORK_PROVIDERS), id: imported.id, title: imported.title, description: `# Goal\n\n${imported.description}`, labels: imported.labels.join(", "), jira: imported.jira });
+      const initial = emptyDraft(imported.id, false);
+      const workflowId = workflowReleases?.catalog.default_workflow_id ?? initial.workflowId;
+      const release = workflowReleases?.releases.find((item) => item.workflow_id === workflowId && item.is_default);
+      setDraft({ ...initial, workflowId, workflowRevision: release?.revision ?? "", id: imported.id, title: imported.title, description: `# Goal\n\n${imported.description}`, labels: imported.labels.join(", "), jira: imported.jira,
+        workflowInputs: Object.fromEntries(release?.definition.inputs.map((input) => [input.id, input.default]) ?? []),
+        stageEnabled: Object.fromEntries(release?.definition.stages.map((stage) => [stage.id, stage.skippable ? stage.default_enabled : true]) ?? []),
+      });
       setDirty(false);
     } catch (caught) { setError((caught as Error).message); }
     finally { setBusy(false); }
   };
 
-  const grouped = useMemo(() => {
-    const ranked = [...tickets].sort((left, right) => right.priority - left.priority || left.created_at.localeCompare(right.created_at) || left.id.localeCompare(right.id));
-    if (queueOrder === "priority") return new Map([["Priority order", ranked]]);
-    const groups = new Map<string, TicketSummary[]>();
-    for (const ticket of ranked) {
-      const key = `${ticket.workflow_stage_name ?? ticket.phase} / ${ticket.status}`;
-      groups.set(key, [...(groups.get(key) ?? []), ticket]);
-    }
-    return groups;
-  }, [tickets, queueOrder]);
-
   const frontmatter = selected?.frontmatter;
   const selectedWorkflow = selected?.workflow_definition ?? (frontmatter?.workflow ? workflows.find((workflow) => workflow.definition.id === frontmatter.workflow?.id)?.definition : undefined);
   const currentWorkflowNode = frontmatter?.workflow ? selectedWorkflow?.nodes.find((node) => node.id === frontmatter.workflow?.current_node) : undefined;
   const currentWorkflowStage = currentWorkflowNode ? selectedWorkflow?.stages.find((stage) => stage.id === currentWorkflowNode.stage) : undefined;
-  const currentProvider = frontmatter ? frontmatter.execution?.provider ?? resolvedWorkflowProvider(frontmatter, currentWorkflowNode) : null;
+  const currentProvider = frontmatter
+    ? frontmatter.execution?.provider ?? selected?.resolved_agent_profile?.provider ?? resolvedWorkflowProvider(frontmatter, currentWorkflowNode)
+    : null;
+  const assignedRelease = frontmatter?.workflow_assignment ? workflowReleases?.releases.find((release) => release.workflow_id === frontmatter.workflow_assignment?.workflow_id && release.revision === frontmatter.workflow_assignment.revision) : undefined;
   const selectedSummary = selected ? tickets.find((ticket) => ticket.id === selected.id) : null;
   const activeAttempt = frontmatter && currentWorkflowNode && frontmatter.workflow
     ? frontmatter.workflow.node_attempts?.[frontmatter.workflow.active_workflow_id && frontmatter.workflow.active_workflow_id !== frontmatter.workflow.id ? `${frontmatter.workflow.active_workflow_id}/${currentWorkflowNode.id}` : currentWorkflowNode.id] ?? null
-    : frontmatter && frontmatter.phase !== "done" ? frontmatter.attempts[frontmatter.phase] : null;
+    : null;
   return <div className="app-shell">
-    <header className="topbar"><div className="brand"><div className="brand-mark">{theme === "retro" ? ">_" : "A"}</div><div><span>Agentic operations</span><strong>Project Tracker</strong></div></div><nav className="topnav"><button className={view === "tickets" ? "active" : ""} onClick={() => setView("tickets")}>Tickets</button><button className={view === "metrics" ? "active" : ""} onClick={() => setView("metrics")}>Metrics</button><button className={view === "supervisors" ? "active" : ""} onClick={() => setView("supervisors")}>Supervisor health <span>{supervisors.filter((item) => item.status === "online").length}</span></button><button className={view === "workflows" ? "active" : ""} onClick={() => setView("workflows")}>Workflows</button><button className={view === "prompts" ? "active" : ""} onClick={() => setView("prompts")}>Prompts</button><button className={view === "configuration" ? "active" : ""} onClick={() => setView("configuration")}>Configuration</button></nav><ThemeSelector theme={theme} onChange={setTheme} />{config?.jira?.enabled && <button className="button-secondary" disabled={busy} onClick={() => void beginJiraTicket()}>Import Jira</button>}<button className="button-primary" onClick={() => void beginLocalTicket()}>＋ New ticket</button></header>
+    <header className="topbar"><div className="brand"><div className="brand-mark">{theme === "retro" ? ">_" : "A"}</div><div><span>Agentic operations</span><strong>Project Tracker</strong></div></div><nav className="topnav"><button className={view === "tickets" ? "active" : ""} onClick={() => { setView("tickets"); setSelected(null); setCreating(false); }}>Queue</button><button className={view === "intake" ? "active" : ""} onClick={() => setView("intake")}>Intake</button><button className={view === "metrics" ? "active" : ""} onClick={() => setView("metrics")}>Metrics</button><button className={view === "supervisors" ? "active" : ""} onClick={() => setView("supervisors")}>Operations <span>{supervisors.filter((item) => item.status === "online").length}</span></button><button className={view === "workflows" ? "active" : ""} onClick={() => setView("workflows")}>Workflows</button><button className={view === "prompts" ? "active" : ""} onClick={() => setView("prompts")}>Prompts</button><button className={view === "configuration" ? "active" : ""} onClick={() => setView("configuration")}>Configuration</button></nav><ThemeSelector theme={theme} onChange={setTheme} />{config?.jira?.enabled && <button className="button-secondary" disabled={busy} onClick={() => void beginJiraTicket()}>Import Jira</button>}<button className="button-primary" onClick={() => void beginLocalTicket()}>＋ New ticket</button></header>
     {view === "tickets" && <AgentFleet agents={runtime} now={now} onOpen={(id) => void open(id)} />}
     {error && <div className="error" role="alert"><strong>Something needs attention</strong><span>{error}</span><button onClick={() => setError(null)}>×</button></div>}
-    {view === "metrics" ? <MetricsPage onError={setError} /> : view === "workflows" ? <WorkflowEditorPage workflows={workflows} prompts={prompts} agentProfiles={config?.agent_profiles} onChanged={setWorkflows} onError={setError} /> : view === "prompts" ? <PromptEditorPage prompts={prompts} onUpdated={(prompt) => setPrompts((current) => [...current.filter((item) => item.name !== prompt.name), prompt])} onError={setError} /> : view === "configuration" ? <ConfigurationPage config={config} busy={busy} onSave={(update) => void saveConfig(update)} /> : view === "supervisors" ? <SupervisorHealthPage supervisors={supervisors} now={now} onOpenTicket={(id) => void open(id)} /> : <main className="dashboard-layout">
-      <aside className="ticket-queue"><div className="queue-title"><div><span>Work queue</span><strong>{tickets.length} tickets</strong></div><div className="queue-controls"><select aria-label="Queue order" value={queueOrder} onChange={(event) => setQueueOrder(event.target.value as "priority" | "workflow")}><option value="priority">Priority</option><option value="workflow">Workflow</option></select><label><input type="checkbox" checked={includeArchived} onChange={(event) => setIncludeArchived(event.target.checked)} /> Archived</label></div></div>
-        {[...grouped.entries()].map(([group, items]) => <section key={group} className="queue-group">
-          <h2>{humanize(group)}<span>{items.length}</span></h2>
-          {items.map((ticket) => <button key={ticket.id} className={`ticket-card ${selected?.id === ticket.id ? "active" : ""}`} onClick={() => void open(ticket.id)}>
-            <div className="ticket-card-top"><span>{ticket.id}</span><StatusPill value={ticket.status} subtle /></div>
-            <strong>{ticket.title}</strong><small>{ticket.workflow_node_name ? `${ticket.workflow_stage_name ?? "Workflow"} · ${ticket.workflow_node_name} · ${ticket.provider ? `${humanize(ticket.provider)} agent` : "No agent claim"}` : `${humanize(ticket.work_provider)} work · ${ticket.review_required ? `${humanize(ticket.review_provider)} review` : "Review skipped"}`} · P{ticket.priority}</small>
-            {(ticket.claim_blockers ?? []).map((blocker) => <em className="claim-blocker" key={`${blocker.hostname}:${blocker.ticket_id}`}>{blocker.repositories.join(", ")} busy on {blocker.hostname} · {blocker.ticket_id}</em>)}
-            {!ticket.valid && <em>{ticket.errors[0]}</em>}
-          </button>)}
-        </section>)}
-        {tickets.length === 0 && <p className="queue-empty">No tickets yet. Create the first piece of work.</p>}
-      </aside>
+    {view === "intake" ? <IntakePage repositories={config?.repositories ?? []} workflows={workflows} onOpenTicket={(id) => void open(id)} onError={setError} /> : view === "metrics" ? <MetricsPage releases={workflowReleases} onError={setError} /> : view === "workflows" ? <WorkflowEditorPage workflows={workflows} releases={workflowReleases} prompts={prompts} agentProfiles={config?.agent_profiles} onChanged={setWorkflows} onReleasesChanged={setWorkflowReleases} onError={setError} /> : view === "prompts" ? <PromptEditorPage prompts={prompts} onUpdated={(prompt) => setPrompts((current) => [...current.filter((item) => item.name !== prompt.name), prompt])} onError={setError} /> : view === "configuration" ? <ConfigurationPage config={config} quota={quotaReport} busy={busy} onSave={(update) => void saveConfig(update)} onRestoreDefaults={() => void restoreDefaults()} /> : view === "supervisors" ? <SupervisorHealthPage supervisors={supervisors} operations={operations} now={now} onOpenTicket={(id) => void open(id)} /> : !selected && !creating ? <QueuePage tickets={tickets} includeArchived={includeArchived} setIncludeArchived={setIncludeArchived} now={now} onOpen={(id) => void open(id)} /> : <main className="dashboard-layout detail-only">
       <section className="ticket-workspace">
-        {creating ? <TicketEditor draft={draft} setDraft={(value) => { setDirty(true); setDraft(value); }} existing={false} busy={busy} repositories={config?.repositories ?? []} workflows={workflows} enabledWorkProviders={config?.providers?.enabled ?? ALL_WORK_PROVIDERS} onSave={() => void save()} onCancel={() => setCreating(false)} /> : selected ? !selected.valid ? <div className="invalid-editor">
+        {creating ? <TicketEditor draft={draft} setDraft={(value) => { setDirty(true); setDraft(value); }} existing={false} busy={busy} repositories={config?.repositories ?? []} workflows={workflows} {...(workflowReleases ? { workflowReleases } : {})} onSave={() => void save()} onCancel={() => setCreating(false)} /> : selected ? !selected.valid ? <div className="invalid-editor">
           <div className="issue-heading"><div><span className="issue-key">Recovery editor</span><h1>{selected.relative_path}</h1><p>Repair the invalid Markdown before this ticket can be scheduled.</p></div></div>
           <ul className="validation">{selected.errors.map((item) => <li key={item}>{item}</li>)}</ul>
           <textarea aria-label="Raw ticket Markdown" value={rawDraft} onChange={(event) => { setRawDraft(event.target.value); setDirty(true); }} />
           <div className="sticky-actions"><button className="button-primary" disabled={busy} onClick={() => void save()}>Save repaired ticket</button></div>
-        </div> : frontmatter?.status === "pending" ? <TicketEditor draft={draft} setDraft={(value) => { setDirty(true); setDraft(value); }} existing busy={busy} repositories={config?.repositories ?? []} workflows={workflows} enabledWorkProviders={config?.providers?.enabled ?? ALL_WORK_PROVIDERS} onSave={() => void save()} onCancel={() => { setDraft(draftFromTicket(selected)); setDirty(false); }} onCustomizeWorkflow={() => void run(() => api.action(selected, "workflow/clone"))} onMigrateWorkflow={() => void migrateWorkflow()} onReady={() => void run(() => api.action(selected, "ready"))} readyDisabled={dirty} /> : frontmatter ? <div className="issue-page">
+        </div> : frontmatter?.status === "pending" ? <TicketEditor draft={draft} setDraft={(value) => { setDirty(true); setDraft(value); }} existing busy={busy} repositories={config?.repositories ?? []} workflows={workflows} {...(workflowReleases ? { workflowReleases } : {})} existingAttachments={frontmatter.attachments} onRemoveAttachment={(id) => void removeAttachment(id)} onSave={() => void save()} onCancel={() => { setDraft(draftFromTicket(selected)); setDirty(false); }} onCustomizeWorkflow={() => void run(() => api.action(selected, "workflow/clone"))} onMigrateWorkflow={() => void migrateWorkflow()} onReady={() => void run(() => api.action(selected, "ready"))} readyDisabled={dirty} /> : frontmatter ? <div className="issue-page">
           <div className="issue-heading"><div><span className="issue-key">{frontmatter.id} · {selected.relative_path}</span><h1>{frontmatter.title}</h1><div className="issue-chips"><StatusPill value={frontmatter.status} />{frontmatter.labels.map((label) => <span className="label-chip" key={label}>{label}</span>)}</div></div>
             <div className="issue-actions">
               <ActionButton onClick={() => setComposer({ kind: "comment", text: "" })}>Add comment</ActionButton>
@@ -1592,32 +2055,35 @@ export function App() {
           <div className="issue-grid">
             <div className="issue-main">
               <section className="content-card description-card">
-                <div className="section-heading"><div><span>Work ticket</span><h2>Description</h2></div>{!descriptionEdit && <button className="button-secondary button-compact" onClick={() => setDescriptionEdit({ text: descriptionFromBody(selected.body), targetPhase: frontmatter.phase === "done" ? "implementation" : frontmatter.phase as "specification" | "implementation" | "review" })}>Edit description</button>}</div>
+                <div className="section-heading"><div><span>Work ticket</span><h2>Description</h2></div>{!descriptionEdit && <button className="button-secondary button-compact" onClick={() => setDescriptionEdit({ text: descriptionFromBody(selected.body), targetNode: currentWorkflowNode?.id ?? selectedWorkflow?.start ?? "" })}>Edit description</button>}</div>
                 {descriptionEdit ? <div className="live-description-editor">
                   <textarea aria-label="Live ticket description" value={descriptionEdit.text} onChange={(event) => setDescriptionEdit({ ...descriptionEdit, text: event.target.value })} />
                   <div className="restart-choice">
-                    <label>Restart phase<select aria-label="Restart phase" value={descriptionEdit.targetPhase} onChange={(event) => setDescriptionEdit({ ...descriptionEdit, targetPhase: event.target.value as "specification" | "implementation" | "review" })}>
-                      <option value="specification">{frontmatter.spec_required ? "Specification" : "Enable specification"}</option>
-                      <option value="implementation">Implementation</option>
-                      <option value="review">{frontmatter.review_required ? "Review" : "Enable review"}</option>
+                    <label>Restart node<select aria-label="Restart node" value={descriptionEdit.targetNode} onChange={(event) => setDescriptionEdit({ ...descriptionEdit, targetNode: event.target.value })}>
+                      {selectedWorkflow?.nodes.filter((node) => node.type !== "terminal").map((node) => <option key={node.id} value={node.id}>{node.name}</option>)}
                     </select></label>
-                    <p>{frontmatter.execution ? "Restarting first interrupts and fences the active agent." : "Restarting makes the selected phase ready for its next agent."}</p>
+                    <p>{frontmatter.execution ? "Restarting first interrupts and fences the active node." : "Restarting moves the ticket to the selected workflow node."}</p>
                   </div>
                   <div className="live-edit-actions"><button className="button-secondary" onClick={() => setDescriptionEdit(null)}>Cancel</button><button className="button-secondary" disabled={busy || !descriptionEdit.text.trim() || Boolean(frontmatter.execution?.interrupt_request)} onClick={() => void saveLiveDescription(false)}>Save and continue</button><button className="button-primary" disabled={busy || !descriptionEdit.text.trim() || Boolean(frontmatter.execution?.interrupt_request)} onClick={() => void saveLiveDescription(true)}>Save and restart</button></div>
                 </div> : <MarkdownContent markdown={descriptionFromBody(selected.body)} />}
               </section>
+              <TicketEvidence ticket={selected} {...(selectedWorkflow ? { workflow: selectedWorkflow } : {})} busy={busy} now={now} onUpload={(files) => void uploadAttachments(files)} onRemoveAttachment={(id) => void removeAttachment(id)} onCreateCheckpoint={(nodeId) => void run(() => api.checkpointAction(selected, "create", nodeId))} onRestoreCheckpoint={(nodeId, checkpointId) => void run(() => api.checkpointAction(selected, "restore", nodeId, checkpointId))} />
               <Timeline body={selected.body} />
             </div>
             <aside className="issue-sidebar">
               {frontmatter.execution && <RuntimePanel execution={frontmatter.execution} now={now} />}
-              <TicketUsage ticket={frontmatter} now={now} />
+              <TicketUsage ticket={frontmatter} now={now} humanDayRate={config?.metrics?.human_day_rate_usd ?? 1_000} />
+              <TicketQuality ticket={frontmatter} />
               {frontmatter.phase === "done" && frontmatter.status === "completed" && <ProductionAssessment ticket={frontmatter} busy={busy} onSave={(production_result, production_assessment_note) => void run(() => api.action(selected, "production-assessment", { production_result, production_assessment_note }))} onArchive={(production_result, production_assessment_note) => void run(() => api.action(selected, "archive", { production_result, production_assessment_note }))} />}
               <section className="side-card"><div className="section-heading"><div><span>Ticket</span><h2>Details</h2></div></div><dl className="details-list">
-                {currentWorkflowNode ? <><DetailRow label="Workflow node">{currentWorkflowNode.name}</DetailRow><DetailRow label="Stage">{currentWorkflowStage?.name ?? humanize(currentWorkflowNode.stage)}</DetailRow><DetailRow label="Node type">{humanize(currentWorkflowNode.type)}</DetailRow><DetailRow label="Assigned agent">{currentProvider ? humanize(currentProvider) : "Not an agent node"}</DetailRow></> : <><DetailRow label="Phase">{humanize(frontmatter.phase)}</DetailRow><DetailRow label="Work agent">{humanize(frontmatter.work_provider)}</DetailRow><DetailRow label="Review agent">{frontmatter.review_required ? humanize(frontmatter.review_provider) : "Skipped"}</DetailRow></>}
+                {currentWorkflowNode ? <><DetailRow label="Workflow node">{currentWorkflowNode.name}</DetailRow><DetailRow label="Stage">{currentWorkflowStage?.name ?? humanize(currentWorkflowNode.stage)}</DetailRow><DetailRow label="Node type">{humanize(currentWorkflowNode.type)}</DetailRow><DetailRow label="Assigned agent">{currentProvider ? humanize(currentProvider) : "Not an agent node"}</DetailRow></> : <DetailRow label="Workflow">Unavailable</DetailRow>}
+                {frontmatter.workflow_assignment && <DetailRow label="Workflow release">{assignedRelease ? `v${assignedRelease.version} · ${assignedRelease.label}` : `v${frontmatter.workflow_assignment.version}`} · {humanize(frontmatter.workflow_assignment.selection)}</DetailRow>}
                 <DetailRow label="Priority"><PriorityEditor value={frontmatter.priority} busy={busy} onSave={(priority) => void run(() => api.action(selected, "priority", { priority }))} /></DetailRow><DetailRow label="Updated">{timeAgo(frontmatter.updated_at, now)}</DetailRow>
+                <DetailRow label="Estimated human days"><HumanEstimateEditor value={frontmatter.estimated_human_days ?? null} busy={busy} onSave={(estimated_human_days) => void run(() => api.action(selected, "human-estimate", { estimated_human_days }))} /></DetailRow>
                 <DetailRow label="Supervisor">{frontmatter.assigned_supervisor ?? "Unassigned"}</DetailRow>
                 <DetailRow label="Supervisor host">{frontmatter.assigned_supervisor_host ?? "Unassigned"}</DetailRow>
-                {!currentWorkflowNode && <><DetailRow label="Specification">{frontmatter.spec_required ? "Required" : "Skipped"}</DetailRow><DetailRow label="Review">{frontmatter.review_required ? humanize(frontmatter.review_provider) : "Skipped"}</DetailRow></>}
+                {typeof frontmatter.metadata?.["intake.source_id"] === "string" && <DetailRow label="Intake origin">{String(frontmatter.metadata["intake.campaign_id"] ?? "campaign")} · {frontmatter.metadata["intake.source_id"] as string}</DetailRow>}
+                {typeof frontmatter.metadata?.["intake.parent_ticket_id"] === "string" && <DetailRow label="Parent ticket"><button className="link-button" onClick={() => void open(frontmatter.metadata!["intake.parent_ticket_id"] as string)}>{frontmatter.metadata["intake.parent_ticket_id"] as string}</button></DetailRow>}
                 {frontmatter.jira && <DetailRow label="Jira"><a href={frontmatter.jira.url} target="_blank" rel="noreferrer">{frontmatter.jira.key} ↗</a></DetailRow>}
                 {frontmatter.archived_at && <DetailRow label="Archived">{timeAgo(frontmatter.archived_at, now)}</DetailRow>}
                 {activeAttempt && <DetailRow label="Attempts">{activeAttempt.total} total · {activeAttempt.consecutive_lease_losses} lease losses</DetailRow>}
@@ -1627,25 +2093,23 @@ export function App() {
                 return <div className="repo-item" key={repository.id}><div><strong>{repository.id}</strong>{repository.primary && <span>Primary</span>}</div>{prs.length ? <div>{prs.map((pr) => <a key={pr.url} href={pr.url} target="_blank" rel="noreferrer">Open {pr.phase ? humanize(pr.phase) : "draft"} PR ↗</a>)}</div> : <small>No PR reported</small>}</div>;
               })}</section>
               {(frontmatter.questions ?? []).length > 0 && <section className="side-card"><div className="section-heading"><div><span>Conversation</span><h2>Questions & answers</h2></div></div>{(frontmatter.questions ?? []).map((question) => <div className="question-item" key={question.id}><strong>{question.question}</strong>{question.answer ? <p>{question.answer}</p> : <div className="question-answer"><div className="question-options">{(question.options ?? []).map((option, index) => <button className="button-secondary" key={`${index}:${option}`} onClick={() => setQuestionAnswers((current) => ({ ...current, [question.id]: option }))}>{option}</button>)}</div><textarea aria-label={`Answer: ${question.question}`} placeholder="Type any answer…" value={questionAnswers[question.id] ?? ""} onChange={(event) => setQuestionAnswers((current) => ({ ...current, [question.id]: event.target.value }))} /><button className="button-primary" disabled={busy || !questionAnswers[question.id]?.trim()} onClick={() => void answerQuestion(question.id)}>Send answer</button></div>}</div>)}</section>}
-              <AgentSessions ticket={frontmatter} {...(selectedWorkflow ? { workflow: selectedWorkflow } : {})} />
-              {frontmatter.workflow && frontmatter.workflow.node_runs.length > 0 && <section className="side-card"><div className="section-heading"><div><span>Workflow audit</span><h2>Node runs</h2></div></div>{[...frontmatter.workflow.node_runs].reverse().slice(0, 12).map((nodeRun) => <div className="session-item" key={nodeRun.id}><span>{humanize(nodeRun.node_type)} · visit {nodeRun.visit}</span><strong>{selectedWorkflow?.nodes.find((node) => node.id === nodeRun.node_id)?.name ?? humanize(nodeRun.node_id)}</strong><small>{humanize(nodeRun.status)}{nodeRun.outcome ? ` · ${humanize(nodeRun.outcome)}` : ""} · attempt {nodeRun.attempt}</small><NodeTimingDetails run={nodeRun} now={now} />{nodeRun.telemetry && <TelemetryDetails telemetry={nodeRun.telemetry} compact />}{nodeRun.summary && <small className="session-context">{nodeRun.summary}</small>}{nodeRun.handoff && <small className="session-context">Handoff: {nodeRun.handoff}</small>}{nodeRun.script_path && <small className="session-context">Script: {nodeRun.script_path}</small>}{nodeRun.working_directory && <small className="session-context">Working directory: {nodeRun.working_directory}</small>}{nodeRun.output_path && <a href={`/api/tickets/${encodeURIComponent(frontmatter.id)}/runs/${encodeURIComponent(nodeRun.id)}/output`} target="_blank" rel="noreferrer">Full output ({nodeRun.output_bytes ?? 0} bytes) ↗</a>}</div>)}</section>}
+              <AgentSessions ticket={frontmatter} {...(selectedWorkflow ? { workflow: selectedWorkflow } : {})} onReset={(key) => { if (window.confirm(`Reset ${humanize(key)}? The next visit will start a new Herdr conversation.`)) void run(() => api.resetConversation(selected, key)); }} />
               <section className="side-card action-card"><div className="section-heading"><div><span>Controls</span><h2>State actions</h2></div></div><div className="control-buttons">
                 {currentWorkflowNode?.type === "human_gate" && frontmatter.status === "waiting_approval" && currentWorkflowNode.choices.map((choice, index) => <div className="gate-choice" key={choice.id}><ActionButton primary={index === 0} onClick={() => {
                   const note = choice.comment_required ? window.prompt(`${choice.label}\n\n${choice.description}\n\nA comment is required:`) : "";
                   if (choice.comment_required && note === null) return;
                   void run(() => api.action(selected, "decide", { decision: choice.id, ...(note?.trim() ? { message: note.trim() } : {}) }));
                 }}>{choice.label}</ActionButton><small>{choice.description} → {selectedWorkflow?.nodes.find((node) => node.id === choice.target)?.name ?? choice.target}{choice.comment_required ? " · comment required" : ""}</small></div>)}
-                {!frontmatter.workflow && frontmatter.phase === "specification" && frontmatter.status === "waiting_approval" && <><ActionButton primary onClick={() => void run(() => api.action(selected, "approve-specification"))}>Approve specification</ActionButton><ActionButton onClick={() => void specFeedback()}>Request changes</ActionButton></>}
                 {frontmatter.status === "ready" && <ActionButton onClick={() => void run(() => api.action(selected, "draft"))}>Return to draft</ActionButton>}
-                {(frontmatter.status === "failed" || frontmatter.status === "blocked") && <ActionButton primary onClick={() => void run(() => api.action(selected, "retry"))}>Retry phase</ActionButton>}
-                {frontmatter.status === "completed" && <ActionButton onClick={() => void moveToPhase("reopen")}>Reopen ticket</ActionButton>}
+                {(frontmatter.status === "failed" || frontmatter.status === "blocked") && <ActionButton primary onClick={() => void run(() => api.action(selected, "retry"))}>Retry node</ActionButton>}
+                {frontmatter.status === "waiting_external" && <ActionButton primary onClick={() => void run(() => api.action(selected, "wake"))}>Check now</ActionButton>}
+                {frontmatter.status === "completed" && <ActionButton onClick={() => void moveToNode("reopen")}>Reopen ticket</ActionButton>}
                 {currentWorkflowNode?.type === "human_gate" && currentWorkflowNode.github_watch && frontmatter.status === "waiting_approval" && frontmatter.pull_requests.some((pr) => currentWorkflowNode.github_watch?.pull_request_phase === "all" || pr.phase === currentWorkflowNode.github_watch?.pull_request_phase || (currentWorkflowNode.github_watch?.pull_request_phase === "specification" && !pr.phase)) && <ActionButton onClick={() => void checkPullRequests()}>Check GitHub feedback</ActionButton>}
-                {!frontmatter.workflow && frontmatter.phase === "specification" && frontmatter.status === "waiting_approval" && frontmatter.pull_requests.some((pr) => !pr.phase || pr.phase === "specification") && <ActionButton onClick={() => void checkPullRequests()}>Check specification PRs</ActionButton>}
                 {frontmatter.status === "completed" && !frontmatter.archived_at && frontmatter.pull_requests.length > 0 && (!frontmatter.workflow || currentWorkflowNode?.github_watch?.feedback_target) && <ActionButton onClick={() => void checkPullRequests()}>Check GitHub PRs</ActionButton>}
                 {frontmatter.archived_at && <ActionButton onClick={() => void run(() => api.action(selected, "unarchive"))}>Unarchive ticket</ActionButton>}
                 {config?.jira?.enabled && !frontmatter.jira && <ActionButton onClick={() => void run(() => api.action(selected, "jira/export"))}>Send to Jira</ActionButton>}
                 {config?.jira?.enabled && frontmatter.jira && isInitialDraft(frontmatter) && <ActionButton onClick={() => void run(() => api.action(selected, "jira/resync"))}>Refresh from Jira</ActionButton>}
-                {frontmatter.status !== "completed" && <ActionButton onClick={() => void moveToPhase("rewind")}>Rewind phase</ActionButton>}
+                {frontmatter.status !== "completed" && <ActionButton onClick={() => void moveToNode("restart")}>Restart at node</ActionButton>}
                 {!frontmatter.execution && frontmatter.workflow && <ActionButton onClick={() => void migrateWorkflow()}>Migrate workflow</ActionButton>}
                 {frontmatter.status !== "completed" && frontmatter.status !== "failed" && <ActionButton danger onClick={() => void fail()}>Fail ticket</ActionButton>}
                 {frontmatter.assigned_supervisor && !frontmatter.execution && frontmatter.status !== "completed" && frontmatter.status !== "cancelled" && <ActionButton onClick={() => { if (window.confirm("Release this supervisor? The next eligible supervisor will start new agent conversations for this ticket.")) void run(() => api.action(selected, "release-supervisor")); }}>Release supervisor</ActionButton>}

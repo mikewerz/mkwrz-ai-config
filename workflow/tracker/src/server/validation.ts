@@ -1,14 +1,17 @@
-import { PHASES, PRODUCTION_RESULTS, PROVIDERS, STATUSES, defaultReviewProvider, type AgentRef, type AttemptCounter, type Execution, type HarnessTelemetryRecord, type HarnessTelemetrySnapshot, type HerdrObservation, type JsonValue, type NodeRunTiming, type Phase, type PullRequestRef, type ResolvedAgentProfile, type TicketFrontmatter, type TicketQuestion, type TokenUsage, type WorkflowRuntime, type WorkflowTransitionContext } from "./domain.js";
+import { PHASES, PRODUCTION_RESULTS, PROVIDERS, STATUSES, type AgentRef, type AttemptCounter, type Execution, type HarnessTelemetryRecord, type HarnessTelemetrySnapshot, type HerdrObservation, type JsonValue, type NodeRunTiming, type Phase, type PullRequestRef, type ResolvedAgentProfile, type TicketFrontmatter, type TicketQuestion, type TokenUsage, type WorkflowRuntime, type WorkflowTransitionContext } from "./domain.js";
+import { qualityReportMetadata } from "./quality.js";
 
 const phaseStatuses: Record<Phase, Set<string>> = {
-  specification: new Set(["pending", "ready", "running", "blocked", "waiting_approval", "failed", "cancelled"]),
-  implementation: new Set(["pending", "ready", "running", "blocked", "waiting_approval", "failed", "cancelled"]),
-  review: new Set(["pending", "ready", "running", "blocked", "waiting_approval", "failed", "cancelled"]),
+  specification: new Set(["pending", "ready", "running", "blocked", "waiting_approval", "waiting_external", "failed", "cancelled"]),
+  implementation: new Set(["pending", "ready", "running", "blocked", "waiting_approval", "waiting_external", "failed", "cancelled"]),
+  review: new Set(["pending", "ready", "running", "blocked", "waiting_approval", "waiting_external", "failed", "cancelled"]),
   done: new Set(["completed", "failed", "cancelled"]),
 };
 
-const emptyAgent = (): AgentRef => ({ provider: null, herdr_pane_id: null, session_ref: null });
+const emptyAgent = (): AgentRef => ({ provider: null, herdr_pane_id: null, session_ref: null, generation: 1, visits_in_generation: 0, last_visit_key: null, reset_reason: null });
 const emptyAttempt = (): AttemptCounter => ({ total: 0, consecutive_lease_losses: 0 });
+const NODE_RUN_TYPES = ["agent", "script", "checkpoint", "restore_checkpoint", "human_gate", "wait", "read", "write", "workflow", "fan_out", "fan_in", "terminal"] as const;
+type NodeRunType = (typeof NODE_RUN_TYPES)[number];
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
@@ -38,6 +41,12 @@ function asString(value: unknown, field: string, errors: string[]): string {
   return value.trim();
 }
 
+function nodeRunType(value: unknown, field: string, errors: string[]): NodeRunType {
+  if (NODE_RUN_TYPES.includes(value as NodeRunType)) return value as NodeRunType;
+  errors.push(`${field} must be a supported workflow node type`);
+  return "agent";
+}
+
 function agent(value: unknown): AgentRef {
   if (!isRecord(value)) return emptyAgent();
   const provider = PROVIDERS.includes(value.provider as never) ? value.provider as AgentRef["provider"] : null;
@@ -45,6 +54,10 @@ function agent(value: unknown): AgentRef {
     provider,
     herdr_pane_id: typeof value.herdr_pane_id === "string" ? value.herdr_pane_id : null,
     session_ref: typeof value.session_ref === "string" ? value.session_ref : null,
+    generation: Number.isInteger(value.generation) && Number(value.generation) > 0 ? Number(value.generation) : 1,
+    visits_in_generation: Number.isInteger(value.visits_in_generation) && Number(value.visits_in_generation) >= 0 ? Number(value.visits_in_generation) : 0,
+    last_visit_key: typeof value.last_visit_key === "string" ? value.last_visit_key : null,
+    reset_reason: typeof value.reset_reason === "string" ? value.reset_reason : null,
   };
 }
 
@@ -76,7 +89,7 @@ function optionalNumber(value: unknown, field: string, errors: string[]): number
 }
 
 function nodeTiming(value: unknown, run: Record<string, unknown>, index: number, errors: string[]): NodeRunTiming {
-  const stateDefault = run.node_type === "human_gate" ? "human_wait" : "active";
+  const stateDefault = run.node_type === "human_gate" ? "human_wait" : run.node_type === "wait" ? "external_wait" : "active";
   if (!isRecord(value)) {
     const started = Date.parse(String(run.started_at ?? ""));
     const completed = run.completed_at ? Date.parse(String(run.completed_at)) : Number.NaN;
@@ -85,6 +98,7 @@ function nodeTiming(value: unknown, run: Record<string, unknown>, index: number,
       active_ms: stateDefault === "active" ? elapsed : 0,
       quota_paused_ms: 0,
       human_wait_ms: stateDefault === "human_wait" ? elapsed : 0,
+      external_wait_ms: stateDefault === "external_wait" ? elapsed : 0,
       state: stateDefault,
       last_accounted_at: run.completed_at ? null : typeof run.started_at === "string" ? run.started_at : null,
       pause_limit_id: null,
@@ -92,12 +106,13 @@ function nodeTiming(value: unknown, run: Record<string, unknown>, index: number,
     };
   }
   const field = `workflow.node_runs[${index}].timing`;
-  const state = ["active", "quota_paused", "human_wait"].includes(String(value.state))
+  const state = ["active", "quota_paused", "human_wait", "external_wait"].includes(String(value.state))
     ? value.state as NodeRunTiming["state"] : (errors.push(`${field}.state is invalid`), stateDefault);
   return {
     active_ms: optionalNumber(value.active_ms, `${field}.active_ms`, errors) ?? 0,
     quota_paused_ms: optionalNumber(value.quota_paused_ms, `${field}.quota_paused_ms`, errors) ?? 0,
     human_wait_ms: optionalNumber(value.human_wait_ms, `${field}.human_wait_ms`, errors) ?? 0,
+    external_wait_ms: optionalNumber(value.external_wait_ms, `${field}.external_wait_ms`, errors) ?? 0,
     state,
     last_accounted_at: value.last_accounted_at === null || value.last_accounted_at === undefined ? null : timestamp(value.last_accounted_at, `${field}.last_accounted_at`, errors),
     pause_limit_id: optionalString(value.pause_limit_id, `${field}.pause_limit_id`, errors),
@@ -159,7 +174,12 @@ export function telemetrySnapshot(value: unknown, field: string, errors: string[
     model: { id: optionalString(model.id, `${field}.model.id`, errors), provider: optionalString(model.provider, `${field}.model.provider`, errors), observed_ids: observedIds },
     reasoning: { effort: optionalString(reasoning.effort, `${field}.reasoning.effort`, errors), enabled, source: optionalString(reasoning.source, `${field}.reasoning.source`, errors) },
     usage: tokenUsage(value.usage, `${field}.usage`, errors),
-    cost: { total_usd: totalUsd, kind: costKind },
+    cost: {
+      total_usd: totalUsd, kind: costKind,
+      source: optionalString(cost.source, `${field}.cost.source`, errors),
+      pricing_id: optionalString(cost.pricing_id, `${field}.cost.pricing_id`, errors),
+      effective_at: cost.effective_at === null || cost.effective_at === undefined ? null : timestamp(cost.effective_at, `${field}.cost.effective_at`, errors),
+    },
     context: {
       used_tokens: optionalNumber(context.used_tokens, `${field}.context.used_tokens`, errors),
       window_tokens: optionalNumber(context.window_tokens, `${field}.context.window_tokens`, errors),
@@ -265,6 +285,10 @@ function execution(value: unknown, errors: string[]): Execution | null {
     claimed_at: timestamp(value.claimed_at, "execution.claimed_at", errors),
     last_heartbeat_at: timestamp(value.last_heartbeat_at, "execution.last_heartbeat_at", errors),
     lease_expires_at: timestamp(value.lease_expires_at, "execution.lease_expires_at", errors),
+    delivery_status: value.delivery_status === "starting" || value.delivery_status === "delivered"
+      ? value.delivery_status : "delivered",
+    delivery_confirmed_at: value.delivery_confirmed_at === null || value.delivery_confirmed_at === undefined
+      ? null : timestamp(value.delivery_confirmed_at, "execution.delivery_confirmed_at", errors),
     observed_herdr_state: value.observed_herdr_state === null || value.observed_herdr_state === undefined
       ? null : asString(value.observed_herdr_state, "execution.observed_herdr_state", errors),
     herdr_observation: herdrObservation(value.herdr_observation, errors),
@@ -273,7 +297,7 @@ function execution(value: unknown, errors: string[]): Execution | null {
     interrupt_request: interruptRequest,
     ...(typeof value.node_run_id === "string" ? { node_run_id: value.node_run_id } : {}),
     ...(typeof value.node_id === "string" ? { node_id: value.node_id } : {}),
-    ...(value.node_type === "agent" || value.node_type === "script" ? { node_type: value.node_type } : {}),
+    ...(["agent", "script", "checkpoint", "restore_checkpoint"].includes(String(value.node_type)) ? { node_type: value.node_type as NonNullable<Execution["node_type"]> } : {}),
     ...(typeof value.conversation_key === "string" ? { conversation_key: value.conversation_key } : {}),
   };
 }
@@ -299,12 +323,28 @@ function workflowRuntime(value: unknown, errors: string[], now: string): Workflo
       else errors.push(`workflow.prompt_revisions.${key} must be a string`);
     }
   }
-  const nodeRuns = Array.isArray(value.node_runs) ? value.node_runs.filter(isRecord).map((run, index) => ({
+  const nodeRuns = Array.isArray(value.node_runs) ? value.node_runs.filter(isRecord).map((run, index) => {
+    const metadataWrites: Record<string, JsonValue> = {};
+    if (isRecord(run.metadata_writes)) {
+      for (const [key, item] of Object.entries(run.metadata_writes)) {
+        const parsed = jsonValue(item, `workflow.node_runs[${index}].metadata_writes.${key}`, errors);
+        if (parsed !== undefined) metadataWrites[key] = parsed;
+      }
+    } else if (run.metadata_writes !== undefined) errors.push(`workflow.node_runs[${index}].metadata_writes must be an object`);
+    const externalReferences = Array.isArray(run.external_references) ? run.external_references.flatMap((item, referenceIndex) => {
+      if (!isRecord(item)) { errors.push(`workflow.node_runs[${index}].external_references[${referenceIndex}] must be an object`); return []; }
+      return [{
+        type: asString(item.type, `workflow.node_runs[${index}].external_references[${referenceIndex}].type`, errors),
+        id: asString(item.id, `workflow.node_runs[${index}].external_references[${referenceIndex}].id`, errors),
+        url: optionalString(item.url, `workflow.node_runs[${index}].external_references[${referenceIndex}].url`, errors),
+      }];
+    }) : [];
+    return ({
     id: asString(run.id, `workflow.node_runs[${index}].id`, errors),
     ...(typeof run.workflow_id === "string" ? { workflow_id: run.workflow_id } : {}),
     workflow_revision: asString(run.workflow_revision, `workflow.node_runs[${index}].workflow_revision`, errors),
     node_id: asString(run.node_id, `workflow.node_runs[${index}].node_id`, errors),
-    node_type: (["agent", "script", "verification", "human_gate", "read", "write", "workflow", "fan_out", "fan_in", "terminal"].includes(String(run.node_type)) ? run.node_type : "agent") as NonNullable<TicketFrontmatter["workflow"]>["node_runs"][number]["node_type"],
+    node_type: nodeRunType(run.node_type, `workflow.node_runs[${index}].node_type`, errors),
     visit: Number.isInteger(run.visit) ? Number(run.visit) : 1,
     attempt: Number.isInteger(run.attempt) ? Number(run.attempt) : 1,
     status: (["running", "completed", "failed", "interrupted"].includes(String(run.status)) ? run.status : "failed") as "running" | "completed" | "failed" | "interrupted",
@@ -324,10 +364,22 @@ function workflowRuntime(value: unknown, errors: string[], now: string): Workflo
         : (errors.push(`workflow.node_runs[${index}].output_bytes must be a non-negative integer or null`), null),
     script_path: optionalString(run.script_path, `workflow.node_runs[${index}].script_path`, errors),
     working_directory: optionalString(run.working_directory, `workflow.node_runs[${index}].working_directory`, errors),
+    conversation_generation: run.conversation_generation === null || run.conversation_generation === undefined ? null
+      : Number.isInteger(run.conversation_generation) && Number(run.conversation_generation) > 0 ? Number(run.conversation_generation)
+        : (errors.push(`workflow.node_runs[${index}].conversation_generation must be a positive integer or null`), null),
+    manifest_artifact_id: optionalString(run.manifest_artifact_id, `workflow.node_runs[${index}].manifest_artifact_id`, errors),
+    wait: isRecord(run.wait) ? {
+      wake_at: timestamp(run.wait.wake_at, `workflow.node_runs[${index}].wait.wake_at`, errors),
+      deadline_at: timestamp(run.wait.deadline_at, `workflow.node_runs[${index}].wait.deadline_at`, errors),
+      delay_seconds: typeof run.wait.delay_seconds === "number" && Number.isFinite(run.wait.delay_seconds) && run.wait.delay_seconds >= 0
+        ? run.wait.delay_seconds : (errors.push(`workflow.node_runs[${index}].wait.delay_seconds is invalid`), 0),
+    } : null,
+    metadata_writes: metadataWrites,
+    external_references: externalReferences,
     input_revision: Number.isInteger(run.input_revision) ? Number(run.input_revision) : 0,
     telemetry: telemetryRecord(run.telemetry, `workflow.node_runs[${index}].telemetry`, errors),
     timing: nodeTiming(run.timing, run, index, errors),
-  })) : [];
+  }); }) : [];
   const inputs: Record<string, boolean | string> = {};
   if (isRecord(value.inputs)) {
     for (const [key, input] of Object.entries(value.inputs)) {
@@ -363,7 +415,7 @@ function workflowRuntime(value: unknown, errors: string[], now: string): Workflo
   if (isRecord(value.resolved_agent_profiles)) for (const [key, item] of Object.entries(value.resolved_agent_profiles)) {
     if (!isRecord(item) || !PROVIDERS.includes(item.provider as never)) { errors.push(`workflow.resolved_agent_profiles.${key} is invalid`); continue; }
     resolvedProfiles[key] = {
-      alias: typeof item.alias === "string" ? item.alias : "legacy",
+      alias: asString(item.alias, `workflow.resolved_agent_profiles.${key}.alias`, errors),
       provider: item.provider as ResolvedAgentProfile["provider"],
       model: typeof item.model === "string" ? item.model : null,
       reasoning: typeof item.reasoning === "string" ? item.reasoning : null,
@@ -393,6 +445,29 @@ function workflowRuntime(value: unknown, errors: string[], now: string): Workflo
       actor: typeof frame.source.actor === "string" ? frame.source.actor : "workflow", created_at: typeof frame.source.created_at === "string" ? frame.source.created_at : now,
     } : null,
   })) : [];
+  const waitStates: NonNullable<WorkflowRuntime["wait_states"]> = {};
+  if (isRecord(value.wait_states)) for (const [key, item] of Object.entries(value.wait_states)) {
+    if (!isRecord(item)) { errors.push(`workflow.wait_states.${key} must be an object`); continue; }
+    waitStates[key] = {
+      workflow_id: asString(item.workflow_id, `workflow.wait_states.${key}.workflow_id`, errors),
+      workflow_revision: asString(item.workflow_revision, `workflow.wait_states.${key}.workflow_revision`, errors),
+      node_id: asString(item.node_id, `workflow.wait_states.${key}.node_id`, errors),
+      started_at: timestamp(item.started_at, `workflow.wait_states.${key}.started_at`, errors),
+      wake_at: timestamp(item.wake_at, `workflow.wait_states.${key}.wake_at`, errors),
+      deadline_at: timestamp(item.deadline_at, `workflow.wait_states.${key}.deadline_at`, errors),
+      attempt: Number.isInteger(item.attempt) && Number(item.attempt) > 0 ? Number(item.attempt) : (errors.push(`workflow.wait_states.${key}.attempt must be positive`), 1),
+      node_run_id: asString(item.node_run_id, `workflow.wait_states.${key}.node_run_id`, errors),
+    };
+  }
+  const runLedger = isRecord(value.run_ledger) ? {
+    version: value.run_ledger.version === 1 ? 1 as const : (errors.push("workflow.run_ledger.version must be 1"), 1 as const),
+    ticket_revision: Number.isInteger(value.run_ledger.ticket_revision) && Number(value.run_ledger.ticket_revision) >= 1
+      ? Number(value.run_ledger.ticket_revision) : (errors.push("workflow.run_ledger.ticket_revision must be positive"), 1),
+    run_count: Number.isInteger(value.run_ledger.run_count) && Number(value.run_ledger.run_count) >= 0
+      ? Number(value.run_ledger.run_count) : (errors.push("workflow.run_ledger.run_count must be non-negative"), 0),
+    sha256: typeof value.run_ledger.sha256 === "string" && /^[a-f0-9]{64}$/.test(value.run_ledger.sha256)
+      ? value.run_ledger.sha256 : (errors.push("workflow.run_ledger.sha256 must be a SHA-256 digest"), ""),
+  } : undefined;
   return {
     id: asString(value.id, "workflow.id", errors), revision: asString(value.revision, "workflow.revision", errors),
     current_node: asString(value.current_node, "workflow.current_node", errors),
@@ -400,11 +475,11 @@ function workflowRuntime(value: unknown, errors: string[], now: string): Workflo
     completed_at: value.completed_at === null || value.completed_at === undefined ? null : timestamp(value.completed_at, "workflow.completed_at", errors),
     current_node_entered_at: typeof value.current_node_entered_at === "string" ? timestamp(value.current_node_entered_at, "workflow.current_node_entered_at", errors) : incoming?.created_at ?? nodeRuns.at(-1)?.completed_at ?? nodeRuns.at(-1)?.started_at ?? now,
     transition_count: Number.isInteger(value.transition_count) && Number(value.transition_count) >= 0 ? Number(value.transition_count) : (errors.push("workflow.transition_count must be a non-negative integer"), 0),
-    node_visits: visits, node_attempts: nodeAttempts, node_runs: nodeRuns, prompt_revisions: promptRevisions, inputs, stage_enabled: stageEnabled, incoming,
+    node_visits: visits, node_attempts: nodeAttempts, node_runs: nodeRuns, ...(runLedger ? { run_ledger: runLedger } : {}), prompt_revisions: promptRevisions, inputs, stage_enabled: stageEnabled, incoming,
     active_workflow_id: typeof value.active_workflow_id === "string" ? value.active_workflow_id : asString(value.id, "workflow.id", errors),
     active_workflow_revision: typeof value.active_workflow_revision === "string" ? value.active_workflow_revision : asString(value.revision, "workflow.revision", errors),
     workflow_revisions: Object.keys(workflowRevisions).length ? workflowRevisions : { [String(value.id ?? "")]: String(value.revision ?? "") },
-    workflow_stack: workflowStack, fan_out_stack: fanOutStack, resolved_agent_profiles: resolvedProfiles,
+    workflow_stack: workflowStack, fan_out_stack: fanOutStack, wait_states: waitStates, resolved_agent_profiles: resolvedProfiles,
   };
 }
 
@@ -412,26 +487,6 @@ export function normalizeTicket(raw: Record<string, unknown>, now = new Date().t
   const errors: string[] = [];
   const id = asString(raw.id, "id", errors);
   const title = asString(raw.title, "title", errors);
-  const specRequired = typeof raw.spec_required === "boolean" ? raw.spec_required : (errors.push("spec_required must be a boolean"), false);
-  const reviewRequired = typeof raw.review_required === "boolean" ? raw.review_required : (errors.push("review_required must be a boolean"), false);
-  const rawAgents = isRecord(raw.agents) ? raw.agents : {};
-  const existingSpecification = agent(rawAgents.specification);
-  const existingImplementation = agent(rawAgents.implementation);
-  const existingReview = agent(rawAgents.review);
-  const existingWorkProvider = existingImplementation.provider ?? existingSpecification.provider;
-  const workProvider = raw.work_provider === undefined || raw.work_provider === null
-    ? existingWorkProvider ?? "claude"
-    : PROVIDERS.includes(raw.work_provider as never) ? raw.work_provider as TicketFrontmatter["work_provider"]
-      : (errors.push("work_provider must be claude or codex"), existingWorkProvider ?? "claude");
-  const defaultReviewer = defaultReviewProvider(workProvider);
-  const reviewProvider = raw.review_provider === undefined || raw.review_provider === null
-    ? existingReview.provider === "claude" || existingReview.provider === "codex"
-      ? existingReview.provider === defaultReviewer ? existingReview.provider : defaultReviewer
-      : defaultReviewer
-    : raw.review_provider === "claude" || raw.review_provider === "codex" ? raw.review_provider
-      : (errors.push("review_provider must be claude or codex"), defaultReviewer);
-  if (workProvider === "claude" && reviewProvider !== "codex") errors.push("Claude work must be reviewed by Codex");
-  if (workProvider === "codex" && reviewProvider !== "claude") errors.push("Codex work must be reviewed by Claude");
   const repositories = Array.isArray(raw.repositories) ? raw.repositories.map((item, index) => {
     if (!isRecord(item)) { errors.push(`repositories[${index}] must be an object`); return { id: "", primary: false }; }
     return { id: asString(item.id, `repositories[${index}].id`, errors), primary: item.primary === true };
@@ -440,17 +495,120 @@ export function normalizeTicket(raw: Record<string, unknown>, now = new Date().t
   if (repositories.filter((item) => item.primary).length !== 1) errors.push("repositories must contain exactly one primary entry");
   if (new Set(repositories.map((item) => item.id)).size !== repositories.length) errors.push("repository ids must be unique");
 
-  const defaultPhase: Phase = specRequired ? "specification" : "implementation";
+  const attachments: TicketFrontmatter["attachments"] = [];
+  if (raw.attachments !== undefined && !Array.isArray(raw.attachments)) errors.push("attachments must be an array");
+  else if (Array.isArray(raw.attachments)) raw.attachments.forEach((item, index) => {
+    if (!isRecord(item)) { errors.push(`attachments[${index}] must be an object`); return; }
+    const id = asString(item.id, `attachments[${index}].id`, errors);
+    const filename = asString(item.filename, `attachments[${index}].filename`, errors);
+    const contentType = asString(item.content_type, `attachments[${index}].content_type`, errors);
+    const size = Number.isInteger(item.size_bytes) && Number(item.size_bytes) >= 0
+      ? Number(item.size_bytes) : (errors.push(`attachments[${index}].size_bytes must be a non-negative integer`), 0);
+    const sha256 = asString(item.sha256, `attachments[${index}].sha256`, errors);
+    if (!/^[A-Za-z0-9-]{1,64}$/.test(id)) errors.push(`attachments[${index}].id is invalid`);
+    if (filename.length > 255 || filename.includes("/") || filename.includes("\\") || /[\x00-\x1f\x7f]/.test(filename)) errors.push(`attachments[${index}].filename must be a basename of at most 255 printable characters`);
+    if (!/^[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]*\/[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]*$/.test(contentType)) errors.push(`attachments[${index}].content_type must be a MIME type without parameters`);
+    if (!/^[a-f0-9]{64}$/.test(sha256)) errors.push(`attachments[${index}].sha256 must be a SHA-256 digest`);
+    attachments.push({ id, filename, content_type: contentType, size_bytes: size, sha256, created_at: timestamp(item.created_at, `attachments[${index}].created_at`, errors) });
+  });
+  if (new Set(attachments.map((attachment) => attachment.id)).size !== attachments.length) errors.push("attachment ids must be unique");
+  if (attachments.length > 100) errors.push("attachments must not contain more than 100 entries");
+
+  const artifacts: TicketFrontmatter["artifacts"] = [];
+  if (raw.artifacts !== undefined && !Array.isArray(raw.artifacts)) errors.push("artifacts must be an array");
+  else if (Array.isArray(raw.artifacts)) raw.artifacts.forEach((item, index) => {
+    if (!isRecord(item)) { errors.push(`artifacts[${index}] must be an object`); return; }
+    const kind = ["attachment", "script_output", "script_artifact", "quality_report", "checkpoint_bundle", "checkpoint_manifest", "execution_manifest"].includes(String(item.kind))
+      ? item.kind as TicketFrontmatter["artifacts"][number]["kind"]
+      : (errors.push(`artifacts[${index}].kind is invalid`), "script_artifact" as const);
+    const metadata = isRecord(item.metadata) ? jsonValue(item.metadata, `artifacts[${index}].metadata`, errors) : {};
+    artifacts.push({
+      id: asString(item.id, `artifacts[${index}].id`, errors), kind,
+      ticket_id: asString(item.ticket_id, `artifacts[${index}].ticket_id`, errors),
+      node_run_id: optionalString(item.node_run_id, `artifacts[${index}].node_run_id`, errors),
+      filename: asString(item.filename, `artifacts[${index}].filename`, errors),
+      content_type: asString(item.content_type, `artifacts[${index}].content_type`, errors),
+      size_bytes: Number.isInteger(item.size_bytes) && Number(item.size_bytes) >= 0 ? Number(item.size_bytes) : (errors.push(`artifacts[${index}].size_bytes is invalid`), 0),
+      sha256: asString(item.sha256, `artifacts[${index}].sha256`, errors),
+      created_at: timestamp(item.created_at, `artifacts[${index}].created_at`, errors),
+      metadata: isRecord(metadata) ? metadata : {},
+    });
+  });
+  if (new Set(artifacts.map((artifact) => artifact.id)).size !== artifacts.length) errors.push("artifact ids must be unique");
+  if (artifacts.length > 1_000) errors.push("artifacts must not contain more than 1000 entries");
+  for (const artifact of artifacts) {
+    if (artifact.ticket_id !== id) errors.push(`artifact ${artifact.id} belongs to another ticket`);
+    if (!/^[a-f0-9]{64}$/.test(artifact.sha256)) errors.push(`artifact ${artifact.id} has an invalid SHA-256 digest`);
+    if (artifact.kind === "quality_report" && !qualityReportMetadata(artifact)) errors.push(`quality report artifact ${artifact.id} has invalid normalized metadata`);
+  }
+
+  const checkpoints: TicketFrontmatter["checkpoints"] = [];
+  if (raw.checkpoints !== undefined && !Array.isArray(raw.checkpoints)) errors.push("checkpoints must be an array");
+  else if (Array.isArray(raw.checkpoints)) raw.checkpoints.forEach((item, index) => {
+    if (!isRecord(item)) { errors.push(`checkpoints[${index}] must be an object`); return; }
+    const checkpointRepositories: TicketFrontmatter["checkpoints"][number]["repositories"] = [];
+    if (!Array.isArray(item.repositories)) errors.push(`checkpoints[${index}].repositories must be an array`);
+    else item.repositories.forEach((repository, repositoryIndex) => {
+      if (!isRecord(repository)) { errors.push(`checkpoints[${index}].repositories[${repositoryIndex}] must be an object`); return; }
+      checkpointRepositories.push({
+        repository: asString(repository.repository, `checkpoints[${index}].repositories[${repositoryIndex}].repository`, errors),
+        head_sha: asString(repository.head_sha, `checkpoints[${index}].repositories[${repositoryIndex}].head_sha`, errors),
+        snapshot_sha: asString(repository.snapshot_sha, `checkpoints[${index}].repositories[${repositoryIndex}].snapshot_sha`, errors),
+        branch: optionalString(repository.branch, `checkpoints[${index}].repositories[${repositoryIndex}].branch`, errors),
+        remote_url: optionalString(repository.remote_url, `checkpoints[${index}].repositories[${repositoryIndex}].remote_url`, errors),
+        dirty: repository.dirty === true,
+        bundle_artifact_id: asString(repository.bundle_artifact_id, `checkpoints[${index}].repositories[${repositoryIndex}].bundle_artifact_id`, errors),
+      });
+    });
+    checkpoints.push({
+      id: asString(item.id, `checkpoints[${index}].id`, errors),
+      label: asString(item.label, `checkpoints[${index}].label`, errors),
+      kind: ["workflow", "manual", "pre_restore"].includes(String(item.kind)) ? item.kind as "workflow" | "manual" | "pre_restore" : (errors.push(`checkpoints[${index}].kind is invalid`), "workflow"),
+      node_id: asString(item.node_id, `checkpoints[${index}].node_id`, errors),
+      node_run_id: optionalString(item.node_run_id, `checkpoints[${index}].node_run_id`, errors),
+      created_at: timestamp(item.created_at, `checkpoints[${index}].created_at`, errors),
+      repositories: checkpointRepositories,
+      manifest_artifact_id: asString(item.manifest_artifact_id, `checkpoints[${index}].manifest_artifact_id`, errors),
+    });
+  });
+  if (new Set(checkpoints.map((checkpoint) => checkpoint.id)).size !== checkpoints.length) errors.push("checkpoint ids must be unique");
+  if (checkpoints.length > 200) errors.push("checkpoints must not contain more than 200 entries");
+
+  const defaultPhase: Phase = "implementation";
   const phase = raw.phase === undefined ? defaultPhase : PHASES.includes(raw.phase as never)
     ? raw.phase as Phase : (errors.push("phase must be specification, implementation, review, or done"), defaultPhase);
   const status = raw.status === undefined ? "pending" : STATUSES.includes(raw.status as never)
     ? raw.status as TicketFrontmatter["status"] : (errors.push("status is not recognized"), "pending");
   if (!phaseStatuses[phase].has(status)) errors.push(`${phase}/${status} is not a valid phase/status combination`);
 
-  const rawAttempts = isRecord(raw.attempts) ? raw.attempts : {};
   const currentExecution = execution(raw.execution, errors);
   const workflow = workflowRuntime(raw.workflow, errors, now);
   if (workflow && !/^[a-f0-9]{64}$/.test(workflow.revision)) errors.push("workflow.revision must be a SHA-256 digest");
+  let workflowAssignment: TicketFrontmatter["workflow_assignment"] = null;
+  if (raw.workflow_assignment !== null && raw.workflow_assignment !== undefined) {
+    if (!isRecord(raw.workflow_assignment)) errors.push("workflow_assignment must be an object or null");
+    else {
+      const selection = ["default", "manual_trial", "experiment"].includes(String(raw.workflow_assignment.selection))
+        ? raw.workflow_assignment.selection as NonNullable<TicketFrontmatter["workflow_assignment"]>["selection"]
+        : (errors.push("workflow_assignment.selection is invalid"), "default" as const);
+      workflowAssignment = {
+        workflow_id: asString(raw.workflow_assignment.workflow_id, "workflow_assignment.workflow_id", errors),
+        revision: asString(raw.workflow_assignment.revision, "workflow_assignment.revision", errors),
+        version: Number.isInteger(raw.workflow_assignment.version) && Number(raw.workflow_assignment.version) > 0
+          ? Number(raw.workflow_assignment.version) : (errors.push("workflow_assignment.version must be a positive integer"), 1),
+        selection,
+        assigned_at: timestamp(raw.workflow_assignment.assigned_at, "workflow_assignment.assigned_at", errors),
+        experiment_id: optionalString(raw.workflow_assignment.experiment_id, "workflow_assignment.experiment_id", errors),
+      };
+      if (!/^[a-f0-9]{64}$/.test(workflowAssignment.revision)) errors.push("workflow_assignment.revision must be a SHA-256 digest");
+      if (selection === "experiment" && !workflowAssignment.experiment_id) errors.push("experiment workflow assignments require experiment_id");
+    }
+  } else if (workflow) {
+    workflowAssignment = {
+      workflow_id: workflow.id, revision: workflow.revision, version: 1, selection: "default",
+      assigned_at: workflow.started_at, experiment_id: null,
+    };
+  }
   if (status === "running" && !currentExecution) errors.push("running tickets require execution");
   if (currentExecution && currentExecution.phase !== phase) errors.push("execution does not match ticket phase/provider");
 
@@ -508,6 +666,9 @@ export function normalizeTicket(raw: Record<string, unknown>, now = new Date().t
   const productionAssessmentNote = optionalString(raw.production_assessment_note, "production_assessment_note", errors);
   if (productionResult === "unassessed" && productionAssessedAt) errors.push("unassessed production_result cannot have production_assessed_at");
   if (productionResult !== "unassessed" && !productionAssessedAt) errors.push("assessed production_result requires production_assessed_at");
+  const estimatedHumanDays = raw.estimated_human_days === null || raw.estimated_human_days === undefined ? null
+    : typeof raw.estimated_human_days === "number" && Number.isFinite(raw.estimated_human_days) && raw.estimated_human_days >= 0
+      ? raw.estimated_human_days : (errors.push("estimated_human_days must be a non-negative number or null"), null);
 
   const metadata: Record<string, JsonValue> = {};
   if (raw.metadata !== undefined && !isRecord(raw.metadata)) errors.push("metadata must be an object");
@@ -520,27 +681,19 @@ export function normalizeTicket(raw: Record<string, unknown>, now = new Date().t
 
   const admitted = raw.phase === undefined || raw.status === undefined || raw.revision === undefined;
   const ticket: TicketFrontmatter = {
-    id, title, phase, status, spec_required: specRequired, review_required: reviewRequired,
-    work_provider: workProvider, review_provider: reviewProvider,
+    id, title, phase, status,
     priority: raw.priority === undefined ? 0 : Number.isInteger(raw.priority) ? Number(raw.priority) : (errors.push("priority must be an integer"), 0),
     labels,
     repositories,
+    attachments,
+    artifacts,
+    checkpoints,
     assigned_supervisor: raw.assigned_supervisor === undefined
       ? currentExecution?.supervisor_id ?? null
       : raw.assigned_supervisor === null ? null : asString(raw.assigned_supervisor, "assigned_supervisor", errors),
     assigned_supervisor_host: raw.assigned_supervisor_host === null || raw.assigned_supervisor_host === undefined
       ? null : asString(raw.assigned_supervisor_host, "assigned_supervisor_host", errors),
-    agents: {
-      specification: existingSpecification,
-      implementation: existingImplementation,
-      review: existingReview,
-    },
     execution: currentExecution,
-    attempts: {
-      specification: attempt(rawAttempts.specification),
-      implementation: attempt(rawAttempts.implementation),
-      review: attempt(rawAttempts.review),
-    },
     pull_requests: pullRequests,
     questions,
     metadata,
@@ -548,6 +701,7 @@ export function normalizeTicket(raw: Record<string, unknown>, now = new Date().t
     production_result: productionResult,
     production_assessed_at: productionAssessedAt,
     production_assessment_note: productionAssessmentNote,
+    estimated_human_days: estimatedHumanDays,
     archived_at: archivedAt,
     revision: Number.isInteger(raw.revision) && Number(raw.revision) > 0 ? Number(raw.revision) : 1,
     event_sequence: Number.isInteger(raw.event_sequence) && Number(raw.event_sequence) >= 0 ? Number(raw.event_sequence) : 0,
@@ -555,6 +709,7 @@ export function normalizeTicket(raw: Record<string, unknown>, now = new Date().t
     updated_at: typeof raw.updated_at === "string" ? raw.updated_at : now,
     last_callback: isRecord(raw.last_callback) ? raw.last_callback as unknown as TicketFrontmatter["last_callback"] : null,
     workflow,
+    workflow_assignment: workflowAssignment,
     conversations: isRecord(raw.conversations)
       ? Object.fromEntries(Object.entries(raw.conversations).map(([key, value]) => [key, agent(value)]))
       : {},
@@ -564,23 +719,6 @@ export function normalizeTicket(raw: Record<string, unknown>, now = new Date().t
 
 export function validateSessionInvariant(ticket: TicketFrontmatter): string[] {
   const errors: string[] = [];
-  if (ticket.workflow) {
-    if (ticket.execution && ticket.assigned_supervisor !== ticket.execution.supervisor_id) {
-      errors.push("execution supervisor must match assigned_supervisor");
-    }
-    return errors;
-  }
-  const specification = ticket.agents.specification;
-  const implementation = ticket.agents.implementation;
-  if (specification.session_ref && implementation.session_ref && specification.session_ref !== implementation.session_ref) {
-    errors.push("specification and implementation must share the same session_ref");
-  }
-  if (specification.provider && implementation.provider && specification.provider !== implementation.provider) {
-    errors.push("specification and implementation must share the same provider");
-  }
-  if (specification.provider && specification.provider !== ticket.work_provider) errors.push("specification provider must match work_provider");
-  if (implementation.provider && implementation.provider !== ticket.work_provider) errors.push("implementation provider must match work_provider");
-  if (ticket.agents.review.provider && ticket.agents.review.provider !== ticket.review_provider) errors.push("review agent provider must match review_provider");
   if (ticket.execution && ticket.assigned_supervisor !== ticket.execution.supervisor_id) {
     errors.push("execution supervisor must match assigned_supervisor");
   }

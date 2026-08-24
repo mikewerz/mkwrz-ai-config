@@ -2,6 +2,8 @@ import { HttpError, type PullRequestObservation, type PullRequestRef } from "./d
 import type { TrackerConfigStore } from "./config-store.js";
 import type { TicketStore } from "./ticket-store.js";
 import { activeWorkflowIdentity, advanceWorkflow, transitionTo, workflowNode, workflowRoute, type WorkflowLibrary } from "./workflow-library.js";
+import { log } from "./logger.js";
+import { fetchWithDeadline, requestTimeoutMs } from "./network.js";
 
 interface GithubUser { login?: string; type?: string }
 interface GithubComment { id: number; body?: string; user?: GithubUser }
@@ -18,15 +20,15 @@ function coordinates(url: string): { owner: string; repo: string; number: number
 
 export class GithubObserver {
   private workflows: WorkflowLibrary | null;
-  constructor(private readonly store: TicketStore, private readonly configs: TrackerConfigStore, private readonly request: typeof fetch = fetch, workflows?: WorkflowLibrary) { this.workflows = workflows ?? null; }
+  constructor(private readonly store: TicketStore, private readonly configs: TrackerConfigStore, private readonly request: typeof fetch = fetch, workflows?: WorkflowLibrary, private readonly timeoutMs = requestTimeoutMs()) { this.workflows = workflows ?? null; }
   setWorkflowLibrary(workflows: WorkflowLibrary): void { this.workflows = workflows; }
 
   private async get<T>(path: string): Promise<T> {
     const token = process.env.GITHUB_TOKEN?.trim();
     if (!token) throw new HttpError(503, "GitHub observation requires GITHUB_TOKEN");
-    const response = await this.request(`https://api.github.com${path}`, { headers: {
+    const response = await fetchWithDeadline(this.request, `https://api.github.com${path}`, { headers: {
       Authorization: `Bearer ${token}`, Accept: "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28",
-    } });
+    } }, this.timeoutMs);
     if (!response.ok) throw new HttpError(response.status === 404 ? 404 : 502, `GitHub request failed (${response.status})`, (await response.text()).slice(0, 1000));
     return response.json() as Promise<T>;
   }
@@ -84,18 +86,16 @@ export class GithubObserver {
       ? { node: currentNode, watch: currentNode.github_watch } : null;
     const watchedTerminal = ticket.status === "completed" && currentNode?.type === "terminal" && currentNode.terminal_status === "completed"
       && currentNode.github_watch?.feedback_target ? { node: currentNode, watch: currentNode.github_watch } : null;
-    const legacySpecificationApproval = !ticket.workflow && ticket.phase === "specification" && ticket.status === "waiting_approval";
-    const completedWork = !ticket.workflow && ticket.phase === "done" && ticket.status === "completed";
-    if (!completedWork && !watchedGate && !watchedTerminal && !legacySpecificationApproval) {
-      throw new HttpError(409, "Only completed tickets or workflow gates configured to watch GitHub can be checked for PR follow-up");
+    if (!watchedGate && !watchedTerminal) {
+      throw new HttpError(409, "Only workflow gates or terminals configured to watch GitHub can be checked for PR follow-up");
     }
-    const watchedPhase = watchedGate?.watch.pull_request_phase ?? watchedTerminal?.watch.pull_request_phase ?? (legacySpecificationApproval ? "specification" : "all");
+    const watchedPhase = watchedGate?.watch.pull_request_phase ?? watchedTerminal!.watch.pull_request_phase;
     const pullRequests = watchedPhase === "all"
       ? ticket.pull_requests
       : ticket.pull_requests.filter((pr) => pr.phase === watchedPhase || (watchedPhase === "specification" && pr.phase === undefined));
     if (pullRequests.length === 0) return { checked: 0, reopened: false };
     const ignored = new Set(config.github.ignored_logins.map((item) => item.toLowerCase()));
-    const observingGate = Boolean(watchedGate || legacySpecificationApproval);
+    const observingGate = Boolean(watchedGate);
     const results = await Promise.all(pullRequests.map(async (pr) => ({ pr, result: await this.observe(pr, ignored, observingGate) })));
     const actionable = results.flatMap(({ pr, result }) => result.actionable.map((item) => `${pr.url}: ${item}`));
     await this.store.command(id, {
@@ -123,10 +123,7 @@ export class GithubObserver {
           } else {
             throw new HttpError(409, "Completed workflow does not declare a GitHub feedback target");
           }
-        } else {
-          next.phase = legacySpecificationApproval ? "specification" : "implementation";
-          next.status = "ready";
-        }
+        } else throw new HttpError(409, "Ticket does not have a pinned workflow");
         next.archived_at = null;
       }
       return { ticket: next };
@@ -140,7 +137,7 @@ export class GithubObserver {
     const tickets = await this.store.summaries(false);
     for (const ticket of tickets.filter((item) => item.valid && ((item.phase === "done" && item.status === "completed") || item.status === "waiting_approval"))) {
       try { await this.checkTicket(ticket.id); }
-      catch (error) { if (!(error instanceof HttpError && error.status === 409)) console.error(`[github] observation failed for ${ticket.id}`, error); }
+      catch (error) { if (!(error instanceof HttpError && error.status === 409)) log("error", "github.observation_failed", { ticket_id: ticket.id }, error); }
     }
   }
 }

@@ -1,22 +1,27 @@
 import { createHash, randomUUID } from "node:crypto";
 import { constants } from "node:fs";
-import { access, mkdir, open, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
+import { access, mkdir, open, readFile, readdir, rename, rm, stat, statfs, writeFile } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { EventEmitter } from "node:events";
 import { watch, type FSWatcher } from "chokidar";
 import {
-  HttpError, type ActivityCapability, type HarnessTelemetryRecord, type HarnessTelemetrySnapshot, type HerdrObservation, type LoadedTicket, type Phase, type Provider, type PullRequestRef, type RepositoryClaimBlocker, type TicketFrontmatter, type TokenUsage,
-  type TicketSummary, canProviderClaim, canSupervisorOwn, requiredProvider, supervisorReservationActive,
+  HttpError, type ActivityCapability, type ArtifactKind, type ArtifactRecord, type HarnessTelemetryRecord, type HarnessTelemetrySnapshot, type HerdrObservation, type JsonValue, type LoadedTicket, type Phase, type Provider, type PullRequestRef, type RepositoryClaimBlocker, type TicketAttachment, type TicketCheckpoint, type TicketFrontmatter, type TokenUsage,
+  type TicketSummary, supervisorReservationActive,
 } from "./domain.js";
 import { appendEvent, ensureInteractionLog, parseDocument, serializeDocument } from "./markdown.js";
 import { normalizeTicket, validateSessionInvariant } from "./validation.js";
-import { accountNodeRunTiming, activeWorkflowIdentity, beginNodeRun, enterCurrentNode, nodeAttemptCounter, requiredActivityCapability, resolveNodeProvider, runtimeNodeKey, transitionTo, workflowNode, workflowNodeEnabled, type WorkflowLibrary, type WorkflowNode } from "./workflow-library.js";
+import { accountNodeRunTiming, activeWorkflowIdentity, beginNodeRun, enterCurrentNode, finishNodeRun, nodeAttemptCounter, requiredActivityCapability, resolveNodeProvider, runtimeNodeKey, transitionTo, workflowNode, workflowNodeEnabled, type WorkflowLibrary, type WorkflowNode } from "./workflow-library.js";
+import { ArtifactStore } from "./artifact-store.js";
+import { RunLedger } from "./run-ledger.js";
+import { DEFAULT_ARTIFACT_POLICY, type ArtifactPolicyConfig } from "./config-store.js";
+import type { ArtifactCollectionResult, ArtifactDiagnostics } from "./artifact-store.js";
 
 interface StoreOptions {
   leaseTtlMs?: number;
   now?: () => Date;
   watch?: boolean;
   workflowLibrary?: WorkflowLibrary;
+  artifactPolicy?: () => Promise<ArtifactPolicyConfig>;
 }
 
 interface MutateOptions {
@@ -28,7 +33,12 @@ interface MutateOptions {
 
 type Mutator = (ticket: TicketFrontmatter, body: string) => { ticket: TicketFrontmatter; body?: string };
 
-function digest(content: string): string {
+export const MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024;
+export const MAX_ATTACHMENTS_PER_TICKET = 100;
+export const MAX_ARTIFACT_BYTES = 512 * 1024 * 1024;
+export const MAX_ARTIFACTS_PER_TICKET = 1_000;
+
+function digest(content: string | Buffer): string {
   return createHash("sha256").update(content).digest("hex");
 }
 
@@ -75,6 +85,14 @@ function timingState(snapshot: HarnessTelemetrySnapshot, now: Date): { state: "a
     : { state: "active" };
 }
 
+function waitDelaySeconds(ticketId: string, nodeId: string, attempt: number, schedule: NonNullable<WorkflowNode["wait_schedule"]>): number {
+  const base = Math.min(schedule.maximum_seconds, schedule.initial_seconds * schedule.multiplier ** Math.max(0, attempt - 1));
+  if (schedule.jitter_percent === 0) return Math.max(1, Math.round(base));
+  const value = createHash("sha256").update(`${ticketId}:${nodeId}:${attempt}`).digest().readUInt32BE(0) / 0xffffffff;
+  const factor = 1 + ((value * 2) - 1) * (schedule.jitter_percent / 100);
+  return Math.max(1, Math.round(base * factor));
+}
+
 async function markdownFiles(root: string): Promise<string[]> {
   const output: string[] = [];
   async function visit(directory: string): Promise<void> {
@@ -100,7 +118,13 @@ export class TicketStore extends EventEmitter {
   private queue: Promise<unknown> = Promise.resolve();
   private knownDigests = new Map<string, string>();
   private knownTickets = new Map<string, TicketFrontmatter>();
+  private ticketIndex = new Map<string, LoadedTicket>();
+  private indexGeneration = 0;
+  private indexRebuiltAt: string | null = null;
   private workflowLibrary: WorkflowLibrary | null;
+  private readonly artifactStore: ArtifactStore;
+  private readonly runLedger: RunLedger;
+  private readonly artifactPolicy: () => Promise<ArtifactPolicyConfig>;
 
   constructor(root: string, options: StoreOptions = {}) {
     super();
@@ -110,9 +134,61 @@ export class TicketStore extends EventEmitter {
     this.enableWatch = options.watch ?? true;
     this.lockPath = join(this.root, ".agentic-project-tracker.lock");
     this.workflowLibrary = options.workflowLibrary ?? null;
+    this.artifactStore = new ArtifactStore(this.root, this.clock);
+    this.runLedger = new RunLedger(this.root, this.clock);
+    this.artifactPolicy = options.artifactPolicy ?? (() => Promise.resolve(structuredClone(DEFAULT_ARTIFACT_POLICY)));
   }
 
   setWorkflowLibrary(library: WorkflowLibrary): void { this.workflowLibrary = library; }
+
+  private indexedTickets(): LoadedTicket[] { return [...this.ticketIndex.values()].map((ticket) => structuredClone(ticket)); }
+
+  private replaceIndex(tickets: LoadedTicket[]): void {
+    this.ticketIndex = new Map(tickets.map((ticket) => [ticket.path, structuredClone(ticket)]));
+    this.indexGeneration += 1;
+    this.indexRebuiltAt = this.clock().toISOString();
+  }
+
+  private cacheLoaded(ticket: LoadedTicket): LoadedTicket {
+    this.ticketIndex.set(ticket.path, structuredClone(ticket));
+    return structuredClone(ticket);
+  }
+
+  private async rebuildIndexInternal(initial: boolean): Promise<LoadedTicket[]> {
+    const tickets = await this.scanInternal(initial);
+    this.replaceIndex(tickets);
+    return this.indexedTickets();
+  }
+
+  async rebuildIndex(): Promise<LoadedTicket[]> { return this.serial(() => this.rebuildIndexInternal(false)); }
+
+  async operationalStatus(): Promise<{
+    root: string; writable: boolean; ticket_count: number; valid_tickets: number; invalid_tickets: number;
+    index_generation: number; index_rebuilt_at: string | null; watcher_enabled: boolean;
+    disk: { total_bytes: number; free_bytes: number; available_bytes: number } | null;
+  }> {
+    return this.serial(async () => {
+      let writable = true;
+      try { await access(this.root, constants.W_OK); } catch { writable = false; }
+      let disk: { total_bytes: number; free_bytes: number; available_bytes: number } | null = null;
+      try {
+        const details = await statfs(this.root, { bigint: true });
+        disk = {
+          total_bytes: Number(details.blocks * details.bsize),
+          free_bytes: Number(details.bfree * details.bsize),
+          available_bytes: Number(details.bavail * details.bsize),
+        };
+      } catch { /* statfs is not available on every supported filesystem. */ }
+      const tickets = this.indexedTickets();
+      return {
+        root: this.root, writable, ticket_count: tickets.length,
+        valid_tickets: tickets.filter((ticket) => ticket.valid).length,
+        invalid_tickets: tickets.filter((ticket) => !ticket.valid).length,
+        index_generation: this.indexGeneration, index_rebuilt_at: this.indexRebuiltAt,
+        watcher_enabled: this.enableWatch, disk,
+      };
+    });
+  }
 
   private async settleAutomaticLoaded(current: LoadedTicket & { frontmatter: TicketFrontmatter }): Promise<LoadedTicket & { frontmatter: TicketFrontmatter }> {
     if (!this.workflowLibrary || !current.frontmatter.workflow || current.frontmatter.execution) return current;
@@ -122,6 +198,38 @@ export class TicketStore extends EventEmitter {
       const identity = activeWorkflowIdentity(ticket);
       const definition = (await this.workflowLibrary.get(identity.id, identity.revision)).definition;
       const node = workflowNode(definition, ticket.workflow!.current_node);
+      if (node.type === "wait") {
+        const now = this.clock();
+        const nowIso = now.toISOString();
+        const key = runtimeNodeKey(ticket, node.id);
+        ticket.workflow!.wait_states ??= {};
+        let state = ticket.workflow!.wait_states[key];
+        const running = state ? ticket.workflow!.node_runs.find((run) => run.id === state!.node_run_id && run.status === "running") : undefined;
+        if (running) {
+          const timedOut = now.getTime() >= Date.parse(state!.deadline_at);
+          if (!timedOut && now.getTime() < Date.parse(state!.wake_at)) break;
+          const outcome = timedOut ? "timed_out" : "elapsed";
+          finishNodeRun(ticket, running.id, outcome, timedOut ? "External wait deadline expired." : "External wait interval elapsed.", null, nowIso);
+          if (timedOut) delete ticket.workflow!.wait_states[key];
+          transitionTo(ticket, definition, timedOut ? node.timeout_to! : node.next!, {
+            outcome, summary: timedOut ? "External wait deadline expired." : "External wait interval elapsed.", actor: "workflow", source_node: node.id,
+          });
+          changed = true; continue;
+        }
+        const schedule = node.wait_schedule!;
+        const attempt = (state?.attempt ?? 0) + 1;
+        const startedAt = state?.started_at ?? nowIso;
+        const deadlineAt = state?.deadline_at ?? new Date(Date.parse(startedAt) + schedule.deadline_seconds * 1000).toISOString();
+        const delaySeconds = waitDelaySeconds(ticket.id, node.id, attempt, schedule);
+        const wakeAt = new Date(Math.min(Date.parse(deadlineAt), now.getTime() + delaySeconds * 1000)).toISOString();
+        const run = beginNodeRun(ticket, node, identity.revision, attempt, nowIso, "tracker", null, null);
+        run.supervisor_id = null;
+        run.wait = { wake_at: wakeAt, deadline_at: deadlineAt, delay_seconds: delaySeconds };
+        state = { workflow_id: identity.id, workflow_revision: identity.revision, node_id: node.id, started_at: startedAt, wake_at: wakeAt, deadline_at: deadlineAt, attempt, node_run_id: run.id };
+        ticket.workflow!.wait_states[key] = state;
+        ticket.status = "waiting_external";
+        changed = true; break;
+      }
       if (node.type === "read") {
         const value = ticket.metadata?.[node.metadata_key ?? ""];
         const route = node.metadata_cases?.find((candidate) => !candidate.default && JSON.stringify(candidate.equals) === JSON.stringify(value))
@@ -270,10 +378,276 @@ export class TicketStore extends EventEmitter {
     }
   }
 
+  async addAttachment(ticketId: string, filename: string, contentType: string, content: Buffer, expectedRevision?: number): Promise<LoadedTicket> {
+    return this.serial(async () => {
+      const current = await this.findValid(ticketId);
+      if (expectedRevision !== undefined && current.frontmatter.revision !== expectedRevision) throw new HttpError(409, "Ticket revision changed", current);
+      const safeName = basename(filename.trim());
+      if (!safeName || safeName !== filename.trim() || safeName.length > 255 || /[\x00-\x1f\x7f]/.test(safeName)) throw new HttpError(422, "Attachment filename must be a basename of at most 255 printable characters");
+      if (!/^[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]*\/[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]*$/.test(contentType.trim())) throw new HttpError(422, "Attachment content type must be a MIME type without parameters");
+      if (content.byteLength > MAX_ATTACHMENT_BYTES) throw new HttpError(413, `Attachment exceeds the ${MAX_ATTACHMENT_BYTES} byte limit`);
+      if (current.frontmatter.attachments.length >= MAX_ATTACHMENTS_PER_TICKET) throw new HttpError(422, `Ticket cannot contain more than ${MAX_ATTACHMENTS_PER_TICKET} attachments`);
+      const artifact = await this.artifactStore.put({ ticket_id: current.frontmatter.id, kind: "attachment", filename: safeName, content_type: contentType.trim(), content, policy: await this.artifactPolicy() });
+      const attachment: TicketAttachment = {
+        id: artifact.id, filename: artifact.filename, content_type: artifact.content_type,
+        size_bytes: artifact.size_bytes, sha256: artifact.sha256, created_at: artifact.created_at,
+      };
+      try {
+        const ticket = structuredClone(current.frontmatter);
+        ticket.attachments.push(attachment);
+        ticket.artifacts.push(artifact);
+        if (ticket.execution) ticket.execution.guidance.push({
+          id: `guidance-${randomUUID()}`, sequence: ticket.event_sequence + 1,
+          message: `Attachment ${safeName} was added. Reread the assignment attachment manifest before continuing.`,
+          created_at: this.clock().toISOString(), delivered_at: null,
+        });
+        return await this.mutateLoaded(current, ticket, current.body, {
+          event: "ticket.attachment_added",
+          message: `Attachment ${safeName} added${ticket.execution ? "; active agent asked to refresh its assignment" : ""}.`,
+        });
+      } catch (error) {
+        await this.artifactStore.deleteRecord(artifact.id);
+        throw error;
+      }
+    });
+  }
+
+  private legacyAttachmentPath(ticketId: string, attachmentId: string): string {
+    return join(this.root, ".attachments", digest(ticketId), attachmentId);
+  }
+
+  async removeAttachment(ticketId: string, attachmentId: string, expectedRevision?: number): Promise<LoadedTicket> {
+    return this.serial(async () => {
+      const current = await this.findValid(ticketId);
+      if (expectedRevision !== undefined && current.frontmatter.revision !== expectedRevision) throw new HttpError(409, "Ticket revision changed", current);
+      const attachment = current.frontmatter.attachments.find((candidate) => candidate.id === attachmentId);
+      if (!attachment) throw new HttpError(404, `Attachment ${attachmentId} was not found`);
+      const ticket = structuredClone(current.frontmatter);
+      ticket.attachments = ticket.attachments.filter((candidate) => candidate.id !== attachmentId);
+      ticket.artifacts = ticket.artifacts.filter((candidate) => candidate.id !== attachmentId);
+      if (ticket.execution) ticket.execution.guidance.push({
+        id: `guidance-${randomUUID()}`, sequence: ticket.event_sequence + 1,
+        message: `Attachment ${attachment.filename} was removed. Reread the assignment attachment manifest before continuing.`,
+        created_at: this.clock().toISOString(), delivered_at: null,
+      });
+      const updated = await this.mutateLoaded(current, ticket, current.body, {
+        event: "ticket.attachment_removed",
+        message: `Attachment ${attachment.filename} removed${ticket.execution ? "; active agent asked to refresh its assignment" : ""}.`,
+      });
+      await this.artifactStore.deleteRecord(attachment.id);
+      await rm(this.legacyAttachmentPath(current.frontmatter.id, attachment.id), { force: true });
+      return updated;
+    });
+  }
+
+  async attachment(ticketId: string, attachmentId: string): Promise<{ attachment: TicketAttachment; content: Buffer }> {
+    const loaded = await this.get(ticketId);
+    if (!loaded.valid || !loaded.frontmatter) throw new HttpError(422, "Ticket is invalid", loaded.errors);
+    const attachment = loaded.frontmatter.attachments.find((candidate) => candidate.id === attachmentId);
+    if (!attachment) throw new HttpError(404, `Attachment ${attachmentId} was not found`);
+    try {
+      let content: Buffer;
+      try {
+        const stored = await this.artifactStore.get(attachment.id);
+        if (stored.record.ticket_id !== loaded.frontmatter.id || stored.record.kind !== "attachment") throw new HttpError(409, `Attachment ${attachment.filename} has an invalid artifact record`);
+        content = stored.content;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+        content = await readFile(this.legacyAttachmentPath(loaded.frontmatter.id, attachment.id));
+      }
+      if (content.byteLength !== attachment.size_bytes || digest(content) !== attachment.sha256) throw new HttpError(409, `Attachment ${attachment.filename} failed its integrity check`);
+      return { attachment, content };
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") throw new HttpError(404, `Attachment content for ${attachment.filename} was not found`);
+      throw error;
+    }
+  }
+
+  async addArtifactForLease(leaseId: string, input: { kind: ArtifactKind; filename: string; contentType: string; content: Buffer; metadata?: Record<string, import("./domain.js").JsonValue> }): Promise<ArtifactRecord> {
+    if (input.content.byteLength > MAX_ARTIFACT_BYTES) throw new HttpError(413, `Artifact exceeds the ${MAX_ARTIFACT_BYTES} byte limit`);
+    const leased = await this.byLease(leaseId);
+    if (leased.frontmatter.artifacts.length >= MAX_ARTIFACTS_PER_TICKET) throw new HttpError(422, `Ticket cannot contain more than ${MAX_ARTIFACTS_PER_TICKET} artifact references`);
+    const safeName = basename(input.filename.trim());
+    if (!safeName || safeName !== input.filename.trim() || safeName.length > 255) throw new HttpError(422, "Artifact filename must be a basename of at most 255 characters");
+    if (!/^[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]*\/[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]*$/.test(input.contentType)) throw new HttpError(422, "Artifact content type must be a MIME type without parameters");
+    if (input.kind === "attachment") throw new HttpError(422, "Lease uploads cannot create ticket attachments");
+    const artifact = await this.artifactStore.put({
+      ticket_id: leased.frontmatter.id, node_run_id: leased.execution.node_run_id ?? null,
+      kind: input.kind, filename: safeName, content_type: input.contentType, content: input.content,
+      ...(input.metadata ? { metadata: input.metadata } : {}),
+      policy: await this.artifactPolicy(),
+    });
+    try {
+      await this.command(leased.frontmatter.id, { event: "artifact.created", message: `${input.kind} artifact ${safeName} stored.` }, (ticket) => {
+        if (ticket.execution?.lease_id !== leaseId) throw new HttpError(409, "Lease is stale or fenced");
+        ticket.artifacts.push(artifact);
+        return { ticket };
+      });
+      return artifact;
+    } catch (error) { await this.artifactStore.deleteRecord(artifact.id); throw error; }
+  }
+
+  async artifact(ticketId: string, artifactId: string): Promise<{ record: ArtifactRecord; content: Buffer }> {
+    const loaded = await this.get(ticketId);
+    if (!loaded.frontmatter?.artifacts.some((artifact) => artifact.id === artifactId)) throw new HttpError(404, `Artifact ${artifactId} was not found on ticket ${ticketId}`);
+    try {
+      const stored = await this.artifactStore.get(artifactId);
+      if (stored.record.ticket_id !== loaded.frontmatter.id) throw new HttpError(409, "Artifact ownership mismatch");
+      return stored;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") throw new HttpError(404, `Artifact ${artifactId} was not found`);
+      throw error;
+    }
+  }
+
+  private async referencedArtifactIds(): Promise<Set<string>> {
+    const tickets = await this.list();
+    return new Set(tickets.flatMap((loaded) => loaded.frontmatter?.artifacts.map((artifact) => artifact.id) ?? []));
+  }
+
+  async artifactDiagnostics(): Promise<ArtifactDiagnostics> {
+    return this.artifactStore.diagnose(await this.referencedArtifactIds());
+  }
+
+  async maintainArtifacts(requestedPolicy?: ArtifactPolicyConfig): Promise<{
+    recovered_records: string[]; collection: ArtifactCollectionResult; diagnostics: ArtifactDiagnostics;
+  }> {
+    const policy = requestedPolicy ?? await this.artifactPolicy();
+    const initial = await this.artifactDiagnostics();
+    const recovered_records: string[] = [];
+    const recoveryCutoff = this.clock().getTime() - policy.orphan_grace_hours * 60 * 60 * 1000;
+    for (const record of initial.orphan_records.filter((candidate) => Date.parse(candidate.created_at) <= recoveryCutoff)) {
+      try {
+        await this.artifactStore.get(record.id);
+        const loaded = await this.get(record.ticket_id);
+        if (!loaded.valid || !loaded.frontmatter || (record.node_run_id && !loaded.frontmatter.workflow?.node_runs.some((run) => run.id === record.node_run_id))) continue;
+        await this.command(record.ticket_id, { event: "artifact.recovered", message: `Recovered orphaned ${record.kind} artifact ${record.filename}.` }, (ticket) => {
+          if (!ticket.artifacts.some((artifact) => artifact.id === record.id)) ticket.artifacts.push(record);
+          if (record.kind === "attachment" && !ticket.attachments.some((attachment) => attachment.id === record.id)) ticket.attachments.push({
+            id: record.id, filename: record.filename, content_type: record.content_type,
+            size_bytes: record.size_bytes, sha256: record.sha256, created_at: record.created_at,
+          });
+          const run = record.kind === "execution_manifest" && record.node_run_id
+            ? ticket.workflow?.node_runs.find((candidate) => candidate.id === record.node_run_id) : undefined;
+          if (run && !run.manifest_artifact_id) run.manifest_artifact_id = record.id;
+          return { ticket };
+        });
+        recovered_records.push(record.id);
+      } catch { /* Leave unsafe or irrecoverable records for grace-period collection. */ }
+    }
+    const referenced = await this.referencedArtifactIds();
+    const collection = await this.artifactStore.collect(referenced, policy);
+    return { recovered_records, collection, diagnostics: await this.artifactStore.diagnose(await this.referencedArtifactIds()) };
+  }
+
+  async finalizeExecutionManifest(leaseId: string, runtime: JsonValue = {}): Promise<ArtifactRecord> {
+    return this.serial(async () => {
+      if (!this.workflowLibrary) throw new HttpError(409, "Workflow library is unavailable");
+      const current = this.indexedTickets().find((item): item is LoadedTicket & { frontmatter: TicketFrontmatter } => Boolean(
+        item.valid && item.frontmatter?.workflow?.node_runs.some((run) => run.lease_id === leaseId),
+      ));
+      if (!current) throw new HttpError(409, "Execution lease is unknown or no longer retained");
+      const run = current.frontmatter.workflow!.node_runs.find((candidate) => candidate.lease_id === leaseId)!;
+      if (run.status === "running") throw new HttpError(409, "Execution manifest cannot finalize before the node run completes");
+      if (run.manifest_artifact_id) {
+        const existing = current.frontmatter.artifacts.find((artifact) => artifact.id === run.manifest_artifact_id);
+        if (!existing) throw new HttpError(409, "Execution manifest reference is missing");
+        return existing;
+      }
+      if (current.frontmatter.artifacts.length >= MAX_ARTIFACTS_PER_TICKET) throw new HttpError(422, `Ticket cannot contain more than ${MAX_ARTIFACTS_PER_TICKET} artifact references`);
+      const workflowId = run.workflow_id ?? current.frontmatter.workflow!.id;
+      const definition = (await this.workflowLibrary.get(workflowId, run.workflow_revision)).definition;
+      const node = workflowNode(definition, run.node_id);
+      const conversation = node.conversation_key ? current.frontmatter.conversations?.[node.conversation_key] ?? null : null;
+      const profile = current.frontmatter.workflow!.resolved_agent_profiles?.[`${workflowId}/${node.id}`] ?? null;
+      const manifest = {
+        schema_version: 1,
+        generated_at: this.clock().toISOString(),
+        ticket: { id: current.frontmatter.id, title: current.frontmatter.title, revision: current.frontmatter.revision },
+        workflow: {
+          id: workflowId, revision: run.workflow_revision, root_id: current.frontmatter.workflow!.id,
+          root_revision: current.frontmatter.workflow!.revision, node_id: run.node_id, node_name: node.name,
+          node_type: run.node_type, node_run_id: run.id, visit: run.visit, attempt: run.attempt,
+          prompt: node.prompt ? { id: node.prompt, revision: current.frontmatter.workflow!.prompt_revisions[node.prompt] ?? null } : null,
+        },
+        execution: {
+          status: run.status, outcome: run.outcome, summary: run.summary, started_at: run.started_at, completed_at: run.completed_at,
+          supervisor_id: run.supervisor_id, lease_id: run.lease_id, timing: run.timing,
+        },
+        agent: run.node_type === "agent" ? {
+          profile, provider: run.provider, conversation_key: node.conversation_key ?? null,
+          conversation_generation: run.conversation_generation ?? conversation?.generation ?? null,
+          session_ref: conversation?.session_ref ?? null, telemetry: run.telemetry,
+        } : null,
+        activity: run.node_type === "script" || run.node_type === "checkpoint" || run.node_type === "restore_checkpoint" ? {
+          script_path: run.script_path ?? null, working_directory: run.working_directory ?? null,
+          output_sha256: run.output_sha256 ?? null, output_bytes: run.output_bytes ?? null,
+          metadata_writes: run.metadata_writes ?? {}, external_references: run.external_references ?? [],
+        } : null,
+        inputs: {
+          ticket_attachments: current.frontmatter.attachments.map((attachment) => ({ id: attachment.id, filename: attachment.filename, sha256: attachment.sha256 })),
+          prior_artifacts: current.frontmatter.artifacts.filter((artifact) => artifact.node_run_id !== run.id && artifact.kind !== "execution_manifest")
+            .map((artifact) => ({ id: artifact.id, kind: artifact.kind, filename: artifact.filename, sha256: artifact.sha256, node_run_id: artifact.node_run_id })),
+          incoming: current.frontmatter.workflow!.incoming,
+        },
+        outputs: current.frontmatter.artifacts.filter((artifact) => artifact.node_run_id === run.id && artifact.kind !== "execution_manifest")
+          .map((artifact) => ({ id: artifact.id, kind: artifact.kind, filename: artifact.filename, sha256: artifact.sha256, size_bytes: artifact.size_bytes })),
+        pull_requests: current.frontmatter.pull_requests,
+        runtime,
+      };
+      const content = Buffer.from(`${JSON.stringify(manifest, null, 2)}\n`);
+      const artifact = await this.artifactStore.put({
+        ticket_id: current.frontmatter.id, node_run_id: run.id, kind: "execution_manifest",
+        filename: `${run.id}.execution-manifest.json`, content_type: "application/json", content,
+        metadata: { schema_version: 1, workflow_id: workflowId, node_id: run.node_id },
+        policy: await this.artifactPolicy(),
+      });
+      try {
+        const ticket = structuredClone(current.frontmatter);
+        const mutableRun = ticket.workflow!.node_runs.find((candidate) => candidate.id === run.id)!;
+        mutableRun.manifest_artifact_id = artifact.id;
+        ticket.artifacts.push(artifact);
+        await this.mutateLoaded(current, ticket, current.body, { event: "execution.manifest_created", message: `Execution manifest stored for ${node.name}.` });
+        return artifact;
+      } catch (error) { await this.artifactStore.deleteRecord(artifact.id); throw error; }
+    });
+  }
+
+  async recordCheckpoint(leaseId: string, checkpoint: Omit<TicketCheckpoint, "manifest_artifact_id">): Promise<TicketCheckpoint> {
+    const leased = await this.byLease(leaseId);
+    const existing = leased.frontmatter.checkpoints.find((candidate) => candidate.id === checkpoint.id);
+    if (existing) return existing;
+    if (leased.frontmatter.checkpoints.length >= 200) throw new HttpError(422, "Ticket cannot contain more than 200 checkpoints");
+    if (checkpoint.node_run_id !== (leased.execution.node_run_id ?? null)) throw new HttpError(409, "Checkpoint node run does not match the active lease");
+    if (!/^[A-Za-z0-9-]{1,128}$/.test(checkpoint.id)) throw new HttpError(422, "Checkpoint id is invalid");
+    const declaredRepositories = leased.frontmatter.repositories.map((repository) => repository.id).sort();
+    const checkpointRepositories = checkpoint.repositories.map((repository) => repository.repository).sort();
+    if (new Set(checkpointRepositories).size !== checkpointRepositories.length || JSON.stringify(checkpointRepositories) !== JSON.stringify(declaredRepositories)) {
+      throw new HttpError(422, "Checkpoint must contain every ticket repository exactly once");
+    }
+    for (const repository of checkpoint.repositories) {
+      const artifact = leased.frontmatter.artifacts.find((candidate) => candidate.id === repository.bundle_artifact_id);
+      if (!artifact || artifact.kind !== "checkpoint_bundle" || artifact.node_run_id !== leased.execution.node_run_id) throw new HttpError(422, `Checkpoint bundle ${repository.bundle_artifact_id} is not available for this node run`);
+      if (!/^[a-f0-9]{40,64}$/.test(repository.head_sha) || !/^[a-f0-9]{40,64}$/.test(repository.snapshot_sha)) throw new HttpError(422, `Checkpoint repository ${repository.repository} has an invalid Git object id`);
+    }
+    const manifestContent = Buffer.from(`${JSON.stringify(checkpoint, null, 2)}\n`);
+    const manifest = await this.addArtifactForLease(leaseId, {
+      kind: "checkpoint_manifest", filename: `${checkpoint.id}.json`, contentType: "application/json", content: manifestContent,
+      metadata: { checkpoint_id: checkpoint.id, checkpoint_kind: checkpoint.kind },
+    });
+    const complete: TicketCheckpoint = { ...checkpoint, manifest_artifact_id: manifest.id };
+    await this.command(leased.frontmatter.id, { event: "checkpoint.created", message: `Checkpoint ${checkpoint.label} recorded.` }, (ticket) => {
+      if (ticket.execution?.lease_id !== leaseId) throw new HttpError(409, "Lease is stale or fenced");
+      ticket.checkpoints.push(complete);
+      return { ticket };
+    });
+    return complete;
+  }
+
   async start(): Promise<void> {
     await mkdir(this.root, { recursive: true });
     await this.acquireLock();
-    await this.serial(() => this.scanInternal(true));
+    await this.serial(() => this.rebuildIndexInternal(true));
     if (this.enableWatch) {
       this.watcher = watch(join(this.root, "**/*.md"), {
         ignored: join(this.root, "prompts/**"),
@@ -328,22 +702,22 @@ export class TicketStore extends EventEmitter {
 
   private async reconcileExternal(): Promise<void> {
     await this.serial(async () => {
-      await this.scanInternal(false);
+      await this.rebuildIndexInternal(false);
       this.emit("changed", { type: "tickets.changed" });
     });
   }
 
   async list(): Promise<LoadedTicket[]> {
-    return this.serial(() => this.scanInternal(false));
+    return this.serial(async () => this.indexedTickets());
   }
 
   async summaries(includeArchived = false): Promise<TicketSummary[]> {
     const loadedTickets = await this.list();
     const reserved = loadedTickets.flatMap((loaded) => loaded.valid && loaded.frontmatter
       && loaded.frontmatter.assigned_supervisor_host && supervisorReservationActive(loaded.frontmatter) ? [loaded.frontmatter] : []);
-    const summaries = await Promise.all(loadedTickets.filter((loaded) => includeArchived || !loaded.frontmatter?.archived_at).map(async (loaded) => {
+    const summaries = await Promise.all(loadedTickets.filter((loaded) => (!loaded.valid || loaded.frontmatter?.workflow) && (includeArchived || !loaded.frontmatter?.archived_at)).map(async (loaded) => {
       const ticket = loaded.frontmatter;
-      let provider = ticket ? requiredProvider(ticket) : null;
+      let provider: Provider | null = null;
       let workflowNodeId: string | null = null;
       let workflowNodeName: string | null = null;
       let workflowStageName: string | null = null;
@@ -373,10 +747,9 @@ export class TicketStore extends EventEmitter {
       return {
         id: ticket?.id || loaded.relativePath, title: ticket?.title || basename(loaded.path),
         phase: ticket?.phase ?? "implementation", status: ticket?.status ?? "pending",
-        work_provider: ticket?.work_provider ?? "claude", review_provider: ticket?.review_provider ?? "codex",
-        review_required: ticket?.review_required ?? false,
         priority: ticket?.priority ?? 0, provider, revision: ticket?.revision ?? 0,
         created_at: ticket?.created_at ?? "",
+        updated_at: ticket?.updated_at ?? "",
         valid: loaded.valid, errors: loaded.errors, path: loaded.relativePath, claim_blockers: claimBlockers,
         archived_at: ticket?.archived_at ?? null,
         production_result: ticket?.production_result ?? "unassessed",
@@ -384,6 +757,10 @@ export class TicketStore extends EventEmitter {
         workflow_node_id: workflowNodeId,
         workflow_node_name: workflowNodeName,
         workflow_stage_name: workflowStageName,
+        labels: ticket?.labels ?? [],
+        repositories: ticket?.repositories.map((repository) => repository.id) ?? [],
+        assigned_supervisor: ticket?.assigned_supervisor ?? null,
+        estimated_human_days: ticket?.estimated_human_days ?? null,
       };
     }));
     return summaries.sort((a, b) => b.priority - a.priority || a.created_at.localeCompare(b.created_at) || a.id.localeCompare(b.id));
@@ -404,6 +781,15 @@ export class TicketStore extends EventEmitter {
       try {
         const document = parseDocument(markdown);
         let normalized = normalizeTicket(document.frontmatter, this.clock().toISOString());
+        if (normalized.errors.length === 0) await this.runLedger.hydrate(normalized.ticket);
+        const priorTicket = this.knownTickets.get(path);
+        const prior = this.knownDigests.get(path);
+        const admittedOnScan = normalized.admitted;
+        const externalChange = !initial && !admittedOnScan && Boolean(prior && prior !== digest(markdown));
+        if (normalized.errors.length === 0 && normalized.ticket.workflow && !normalized.ticket.workflow.run_ledger && priorTicket?.workflow
+          && priorTicket.workflow.id === normalized.ticket.workflow.id && priorTicket.workflow.revision === normalized.ticket.workflow.revision) {
+          normalized.ticket.workflow.node_runs = structuredClone(priorTicket.workflow.node_runs);
+        }
         let body = ensureInteractionLog(document.body);
         let content = markdown;
         if (normalized.errors.length === 0 && normalized.admitted) {
@@ -411,18 +797,20 @@ export class TicketStore extends EventEmitter {
           ticket.event_sequence += 1;
           ticket.updated_at = this.clock().toISOString();
           body = appendEvent(body, ticket.event_sequence, ticket.updated_at, "ticket.admitted", "Ticket admitted by the tracker.");
-          content = serializeDocument(ticket, body);
+          const persisted = await this.runLedger.externalize(ticket);
+          content = serializeDocument(persisted, body);
           await this.atomicReplace(path, markdown, content);
+          await this.runLedger.prune(persisted);
+          if (ticket.workflow && persisted.workflow?.run_ledger) ticket.workflow.run_ledger = persisted.workflow.run_ledger;
+        }
+        if (normalized.errors.length === 0 && normalized.ticket.workflow && !normalized.ticket.workflow.run_ledger) {
+          const persisted = await this.runLedger.externalize(normalized.ticket);
+          content = serializeDocument(persisted, body);
+          await this.atomicReplace(path, await readFile(path, "utf8"), content);
+          await this.runLedger.prune(persisted);
         }
         const currentDigest = digest(content);
-        const prior = this.knownDigests.get(path);
-        const priorTicket = this.knownTickets.get(path);
-        const externalChange = !initial && Boolean(prior && prior !== currentDigest && content === markdown);
         let fenced = false;
-        if (externalChange && priorTicket && normalized.ticket.workflow) {
-          if (normalized.ticket.spec_required !== priorTicket.spec_required && "specification" in normalized.ticket.workflow.stage_enabled) normalized.ticket.workflow.stage_enabled.specification = normalized.ticket.spec_required;
-          if (normalized.ticket.review_required !== priorTicket.review_required && "review" in normalized.ticket.workflow.stage_enabled) normalized.ticket.workflow.stage_enabled.review = normalized.ticket.review_required;
-        }
         if (externalChange && priorTicket?.execution) {
           const execution = normalized.ticket.execution;
           const incompatible = normalized.ticket.phase !== priorTicket.phase
@@ -431,7 +819,6 @@ export class TicketStore extends EventEmitter {
             || !execution
             || execution.lease_id !== priorTicket.execution.lease_id
             || execution.phase !== normalized.ticket.phase
-            || (!normalized.ticket.workflow && execution.provider !== requiredProvider(normalized.ticket))
             || (normalized.ticket.status !== "running" && normalized.ticket.status !== "blocked");
           if (incompatible) {
             const run = normalized.ticket.workflow?.node_runs.find((candidate) => candidate.id === priorTicket.execution?.node_run_id);
@@ -475,7 +862,7 @@ export class TicketStore extends EventEmitter {
     ticket.revision += 1;
     ticket.event_sequence += 1;
     ticket.updated_at = now;
-    let message = "External file edit accepted; current phase retained.";
+    let message = "External file edit accepted; current workflow node retained.";
     if (fenced) message = "External state edit accepted; incompatible active lease fenced.";
     if (ticket.execution && (ticket.status === "running" || ticket.status === "blocked")) {
       const sequence = ticket.event_sequence;
@@ -483,8 +870,10 @@ export class TicketStore extends EventEmitter {
       message += " Active agent queued to reread the ticket.";
     }
     const nextBody = appendEvent(body, ticket.event_sequence, now, "ticket.external_edited", message);
-    const next = serializeDocument(ticket, nextBody);
+    const persisted = await this.runLedger.externalize(ticket);
+    const next = serializeDocument(persisted, nextBody);
     await this.atomicReplace(path, await readFile(path, "utf8"), next);
+    await this.runLedger.prune(persisted);
     this.knownDigests.set(path, digest(next));
     this.knownTickets.set(path, structuredClone(ticket));
   }
@@ -493,6 +882,7 @@ export class TicketStore extends EventEmitter {
     const markdown = await readFile(path, "utf8");
     const doc = parseDocument(markdown);
     const normalized = normalizeTicket(doc.frontmatter);
+    if (normalized.errors.length === 0) await this.runLedger.hydrate(normalized.ticket);
     const errors = [...normalized.errors, ...validateSessionInvariant(normalized.ticket)];
     return { path, relativePath: relative(this.root, path), markdown, body: doc.body, frontmatter: normalized.ticket, valid: errors.length === 0, errors };
   }
@@ -502,7 +892,7 @@ export class TicketStore extends EventEmitter {
       const doc = parseDocument(markdown);
       const normalized = normalizeTicket(doc.frontmatter, this.clock().toISOString());
       if (normalized.errors.length) throw new HttpError(422, "Ticket is invalid", normalized.errors);
-      const tickets = await this.scanInternal(false);
+      const tickets = this.indexedTickets();
       const duplicate = tickets.find((item) => item.frontmatter && item.frontmatter.id === normalized.ticket.id);
       if (duplicate) {
         throw new HttpError(409, "Ticket id already exists", [`id '${normalized.ticket.id}' conflicts with ${duplicate.relativePath}`]);
@@ -516,24 +906,27 @@ export class TicketStore extends EventEmitter {
       const ticket = normalized.ticket;
       ticket.event_sequence = 1; ticket.revision = 1; ticket.created_at = now; ticket.updated_at = now;
       const body = appendEvent(doc.body, 1, now, "ticket.created", "Ticket created by the operator.");
-      const content = serializeDocument(ticket, body);
+      const persisted = await this.runLedger.externalize(ticket);
+      const content = serializeDocument(persisted, body);
       await writeFile(path, content, { encoding: "utf8", flag: "wx", mode: 0o600 });
+      await this.runLedger.prune(persisted);
       this.knownDigests.set(path, digest(content));
       this.knownTickets.set(path, structuredClone(ticket));
       this.emit("changed", { type: "ticket.changed", id: ticket.id, revision: ticket.revision });
-      return this.loadPath(path);
+      return this.cacheLoaded(await this.loadPath(path));
     });
   }
 
-  async edit(id: string, markdown: string, expectedRevision: number, mode: "keep_phase" | "rewind", rewindPhase?: Phase): Promise<LoadedTicket> {
+  async edit(id: string, markdown: string, expectedRevision: number): Promise<LoadedTicket> {
     return this.serial(async () => {
-      const tickets = await this.scanInternal(false);
+      const tickets = this.indexedTickets();
       const current = tickets.find((item) => item.frontmatter?.id === id || item.relativePath === id);
       if (!current) throw new HttpError(404, `Ticket ${id} not found`);
       const currentRevision = current.frontmatter?.revision ?? 0;
       if (currentRevision !== expectedRevision) throw new HttpError(409, "Ticket revision changed", current);
       const supplied = parseDocument(markdown);
       const normalized = normalizeTicket(supplied.frontmatter, this.clock().toISOString());
+      if (normalized.errors.length === 0) await this.runLedger.hydrate(normalized.ticket);
       const suppliedErrors = [...normalized.errors, ...validateSessionInvariant(normalized.ticket)];
       if (suppliedErrors.length) throw new HttpError(422, "Edited ticket is invalid", suppliedErrors);
       const duplicate = tickets.find((item) => item.path !== current.path && item.frontmatter?.id === normalized.ticket.id);
@@ -546,75 +939,47 @@ export class TicketStore extends EventEmitter {
         ticket.created_at = current.frontmatter?.created_at ?? now;
         ticket.updated_at = now;
         const body = appendEvent(supplied.body, ticket.event_sequence, now, "ticket.corrected", "Invalid ticket corrected through the operator editor.");
-        const next = serializeDocument(ticket, body);
+        const persisted = await this.runLedger.externalize(ticket);
+        const next = serializeDocument(persisted, body);
         await this.atomicReplace(current.path, current.markdown, next);
+        await this.runLedger.prune(persisted);
         this.knownDigests.set(current.path, digest(next));
         this.knownTickets.set(current.path, structuredClone(ticket));
         this.emit("changed", { type: "ticket.changed", id: ticket.id, revision: ticket.revision });
-        return this.loadPath(current.path);
+        return this.cacheLoaded(await this.loadPath(current.path));
       }
       const validCurrent = current as LoadedTicket & { frontmatter: TicketFrontmatter };
       let next = normalized.ticket;
+      if (next.workflow && validCurrent.frontmatter.workflow
+        && next.workflow.id === validCurrent.frontmatter.workflow.id && next.workflow.revision === validCurrent.frontmatter.workflow.revision
+        && !next.workflow.run_ledger && next.workflow.node_runs.length === 0) {
+        next.workflow.node_runs = structuredClone(validCurrent.frontmatter.workflow.node_runs);
+      }
       next.created_at = validCurrent.frontmatter.created_at;
-      next.agents = validCurrent.frontmatter.agents;
-      next.attempts = validCurrent.frontmatter.attempts;
       next.pull_requests = validCurrent.frontmatter.pull_requests;
       next.questions = validCurrent.frontmatter.questions;
+      next.attachments = validCurrent.frontmatter.attachments;
+      next.artifacts = validCurrent.frontmatter.artifacts;
+      next.checkpoints = validCurrent.frontmatter.checkpoints;
       next.jira = validCurrent.frontmatter.jira;
       next.archived_at = validCurrent.frontmatter.archived_at;
       next.execution = structuredClone(validCurrent.frontmatter.execution);
-      if (next.workflow) {
-        if (next.spec_required !== validCurrent.frontmatter.spec_required && "specification" in next.workflow.stage_enabled) next.workflow.stage_enabled.specification = next.spec_required;
-        if (next.review_required !== validCurrent.frontmatter.review_required && "review" in next.workflow.stage_enabled) next.workflow.stage_enabled.review = next.review_required;
-      }
-      let event = "ticket.edited";
-      let eventMessage = "Ticket edited; current phase retained.";
-      if (mode === "keep_phase") {
-        next.phase = validCurrent.frontmatter.phase;
-        next.status = validCurrent.frontmatter.status;
-        if (next.execution) {
-          if (next.execution.interrupt_request) throw new HttpError(409, "Ticket is already waiting for agent interruption");
-          const sequence = validCurrent.frontmatter.event_sequence + 1;
-          next.execution.guidance.push({
-            id: `guidance-${randomUUID()}`,
-            sequence,
-            message: `Ticket description changed at revision ${validCurrent.frontmatter.revision + 1}. Reread the authoritative ticket before continuing ${next.phase}.`,
-            created_at: this.clock().toISOString(),
-            delivered_at: null,
-          });
-          if (next.status === "blocked" && !next.questions.some((item) => item.answer === null)) next.status = "running";
-          eventMessage = "Ticket edited; current phase retained and active agent asked to reread it.";
-        }
-      }
-      else {
-        if (!rewindPhase || rewindPhase === "done") throw new HttpError(422, "An applicable rewind phase is required");
-        if (rewindPhase === "specification" && !next.spec_required) throw new HttpError(422, "Specification is not enabled");
-        if (rewindPhase === "review" && !next.review_required) throw new HttpError(422, "Review is not enabled");
-        let workflowTarget: WorkflowNode | null = null;
-        if (next.workflow && this.workflowLibrary) {
-          const identity = activeWorkflowIdentity(next);
-          const definition = (await this.workflowLibrary.get(identity.id, identity.revision)).definition;
-          workflowTarget = definition.nodes.find((node) => node.type === "agent" && node.phase === rewindPhase) ?? null;
-          if (!workflowTarget) throw new HttpError(422, `Pinned workflow has no ${rewindPhase} agent node`);
-        }
-        event = next.execution ? "ticket.rewind_requested" : "ticket.rewound";
-        if (next.execution) {
-          if (next.execution.interrupt_request) throw new HttpError(409, "Ticket is already waiting for agent interruption");
-          next.execution.interrupt_request = {
-            target_phase: rewindPhase, requested_at: this.clock().toISOString(),
-            ...(workflowTarget && next.workflow ? { target_node: workflowTarget.id, target_workflow_id: activeWorkflowIdentity(next).id, target_workflow_revision: activeWorkflowIdentity(next).revision } : {}),
-          };
-          next.phase = validCurrent.frontmatter.phase;
-          next.status = validCurrent.frontmatter.status;
-          eventMessage = `Ticket edited; interrupt requested before restarting at ${rewindPhase}.`;
-        } else {
-          if (workflowTarget && next.workflow && this.workflowLibrary) {
-            const identity = activeWorkflowIdentity(next);
-            const definition = (await this.workflowLibrary.get(identity.id, identity.revision)).definition;
-            transitionTo(next, definition, workflowTarget.id, { outcome: "operator_rewind", summary: `Operator restarted work at ${workflowTarget.name}.`, actor: "operator" });
-          } else { next.phase = rewindPhase; next.status = "ready"; }
-          eventMessage = `Ticket edited and rewound to ${rewindPhase}.`;
-        }
+      const event = "ticket.edited";
+      let eventMessage = "Ticket edited; current workflow node retained.";
+      next.phase = validCurrent.frontmatter.phase;
+      next.status = validCurrent.frontmatter.status;
+      if (next.execution) {
+        if (next.execution.interrupt_request) throw new HttpError(409, "Ticket is already waiting for agent interruption");
+        const sequence = validCurrent.frontmatter.event_sequence + 1;
+        next.execution.guidance.push({
+          id: `guidance-${randomUUID()}`,
+          sequence,
+          message: `Ticket description changed at revision ${validCurrent.frontmatter.revision + 1}. Reread the authoritative ticket before continuing ${next.phase}.`,
+          created_at: this.clock().toISOString(),
+          delivered_at: null,
+        });
+        if (next.status === "blocked" && !next.questions.some((item) => item.answer === null)) next.status = "running";
+        eventMessage = "Ticket edited; current workflow node retained and active agent asked to reread it.";
       }
       return this.mutateLoaded(validCurrent, next, supplied.body, {
         event,
@@ -642,16 +1007,18 @@ export class TicketStore extends EventEmitter {
     const errors = [...normalizeTicket(ticket as unknown as Record<string, unknown>, now).errors, ...validateSessionInvariant(ticket)];
     if (errors.length) throw new HttpError(422, "Ticket mutation is invalid", errors);
     const nextBody = options.silent ? body : appendEvent(body, ticket.event_sequence, now, options.event, options.message);
-    const next = serializeDocument(ticket, nextBody);
+    const persisted = await this.runLedger.externalize(ticket);
+    const next = serializeDocument(persisted, nextBody);
     await this.atomicReplace(current.path, current.markdown, next);
+    await this.runLedger.prune(persisted);
     this.knownDigests.set(current.path, digest(next));
     this.knownTickets.set(current.path, structuredClone(ticket));
     this.emit("changed", { type: "ticket.changed", id: ticket.id, revision: ticket.revision });
-    return this.loadPath(current.path);
+    return this.cacheLoaded(await this.loadPath(current.path));
   }
 
   private async findValid(id: string): Promise<LoadedTicket & { frontmatter: TicketFrontmatter }> {
-    const tickets = await this.scanInternal(false);
+    const tickets = this.indexedTickets();
     const current = tickets.find((item) => item.frontmatter?.id === id || item.relativePath === id);
     if (!current) throw new HttpError(404, `Ticket ${id} not found`);
     if (!current.valid || !current.frontmatter) throw new HttpError(422, "Ticket is invalid", current.errors);
@@ -683,35 +1050,34 @@ export class TicketStore extends EventEmitter {
     provider: Provider,
     availableProviders: Provider[] = ["claude", "codex"],
     supervisorHost = supervisorId,
-    activityCapabilities: ActivityCapability[] = ["repository_action", "inline_shell", "inline_javascript", "inline_python"],
+    activityCapabilities: ActivityCapability[] = ["repository_action", "inline_shell", "inline_javascript", "inline_python", "git_checkpoint", "git_restore"],
   ): Promise<LoadedTicket | null> {
     return this.serial(async () => {
       await this.expireLeasesInternal();
-      let tickets = (await this.scanInternal(false)).filter((item): item is LoadedTicket & { frontmatter: TicketFrontmatter } => Boolean(item.valid && item.frontmatter));
+      let tickets = this.indexedTickets().filter((item): item is LoadedTicket & { frontmatter: TicketFrontmatter } => Boolean(item.valid && item.frontmatter));
       tickets = await Promise.all(tickets.map((ticket) => this.settleAutomaticLoaded(ticket)));
       const reservation = tickets.find((item) => item.frontmatter.assigned_supervisor === supervisorId && supervisorReservationActive(item.frontmatter));
       const candidates = tickets.filter((item) => item.frontmatter.status === "ready"
         && (!reservation || item.frontmatter.id === reservation.frontmatter.id)
         && (item.frontmatter.assigned_supervisor === null || item.frontmatter.assigned_supervisor === supervisorId)
         && (item.frontmatter.assigned_supervisor_host === null || item.frontmatter.assigned_supervisor_host === supervisorHost)
-        && (item.frontmatter.assigned_supervisor !== null || item.frontmatter.workflow !== null && item.frontmatter.workflow !== undefined || canSupervisorOwn(item.frontmatter, availableProviders))
+        && Boolean(item.frontmatter.workflow)
         && !tickets.some((active) => active.frontmatter.id !== item.frontmatter.id
           && supervisorReservationActive(active.frontmatter)
           && active.frontmatter.assigned_supervisor_host === supervisorHost
           && active.frontmatter.repositories.some((repository) => item.frontmatter.repositories.some((candidate) => candidate.id === repository.id)))
-        && (item.frontmatter.workflow ? true : canProviderClaim(item.frontmatter, provider)))
+        )
         .sort((a, b) => b.frontmatter.priority - a.frontmatter.priority || a.frontmatter.created_at.localeCompare(b.frontmatter.created_at) || a.frontmatter.id.localeCompare(b.frontmatter.id));
       let match: (LoadedTicket & { frontmatter: TicketFrontmatter }) | undefined;
       let workflowNodeForClaim: WorkflowNode | null = null;
       for (const candidate of candidates) {
-        if (!candidate.frontmatter.workflow) { match = candidate; break; }
         if (!this.workflowLibrary) continue;
         const identity = activeWorkflowIdentity(candidate.frontmatter);
         const definition = (await this.workflowLibrary.get(identity.id, identity.revision)).definition;
         const requirements = await this.workflowRequirements(candidate.frontmatter);
         if (candidate.frontmatter.assigned_supervisor === null && requirements.providers.some((requiredProvider) => !availableProviders.includes(requiredProvider))) continue;
         if (candidate.frontmatter.assigned_supervisor === null && requirements.activities.some((capability) => !activityCapabilities.includes(capability))) continue;
-        const node = workflowNode(definition, candidate.frontmatter.workflow.current_node);
+        const node = workflowNode(definition, candidate.frontmatter.workflow!.current_node);
         if (node.type === "agent" && resolveNodeProvider(candidate.frontmatter, node) === provider) {
           match = candidate; workflowNodeForClaim = node; break;
         }
@@ -724,35 +1090,55 @@ export class TicketStore extends EventEmitter {
       ticket.assigned_supervisor = supervisorId;
       ticket.assigned_supervisor_host = supervisorHost;
       ticket.status = "running";
-      ticket.attempts[key].total += 1;
       const attemptCounter = nodeAttemptCounter(ticket, workflowNodeForClaim?.id);
-      if (attemptCounter !== ticket.attempts[key]) attemptCounter.total += 1;
+      attemptCounter.total += 1;
       const attemptNumber = attemptCounter.total;
       ticket.execution = {
         lease_id: lease, supervisor_id: supervisorId, provider, phase: ticket.phase, attempt: attemptNumber,
         claimed_at: now.toISOString(), last_heartbeat_at: now.toISOString(), lease_expires_at: new Date(now.getTime() + this.leaseTtlMs).toISOString(),
+        delivery_status: "starting", delivery_confirmed_at: null,
         observed_herdr_state: null, herdr_observation: null, telemetry: null, guidance: [],
         interrupt_request: null,
       };
+      let conversationGeneration: number | null = null;
+      if (workflowNodeForClaim?.conversation_key && ticket.workflow) {
+        ticket.conversations ??= {};
+        const conversationKey = workflowNodeForClaim.conversation_key;
+        const existing = ticket.conversations[conversationKey];
+        const nodeVisit = ticket.workflow.node_visits[runtimeNodeKey(ticket, workflowNodeForClaim.id)] ?? 1;
+        const visitKey = `${activeWorkflowIdentity(ticket).id}/${workflowNodeForClaim.id}:${nodeVisit}`;
+        const providerChanged = Boolean(existing && existing.provider !== provider);
+        const isNewVisit = existing?.last_visit_key !== visitKey;
+        const policy = workflowNodeForClaim.conversation_policy ?? "resume";
+        const thresholdReached = policy === "reset_after_visits" && isNewVisit
+          && (existing?.visits_in_generation ?? 0) >= (workflowNodeForClaim.maximum_visits_per_session ?? 1);
+        const freshVisit = policy === "fresh_each_visit" && isNewVisit && Boolean(existing?.last_visit_key);
+        const resetReason = providerChanged ? "provider_changed" : freshVisit ? "fresh_each_visit" : thresholdReached ? "visit_threshold" : null;
+        const reset = Boolean(resetReason);
+        const next = existing ? { ...existing } : {
+          provider, herdr_pane_id: null, session_ref: null, generation: 1,
+          visits_in_generation: 0, last_visit_key: null, reset_reason: null,
+        };
+        if (reset) {
+          next.herdr_pane_id = null;
+          next.session_ref = null;
+          next.generation = Math.max(1, next.generation) + 1;
+          next.visits_in_generation = 0;
+        }
+        next.provider = provider;
+        if (isNewVisit) next.visits_in_generation += 1;
+        next.last_visit_key = visitKey;
+        next.reset_reason = resetReason;
+        ticket.conversations[conversationKey] = next;
+        conversationGeneration = next.generation;
+      }
       if (workflowNodeForClaim && ticket.workflow) {
         const run = beginNodeRun(ticket, workflowNodeForClaim, activeWorkflowIdentity(ticket).revision, attemptNumber, now.toISOString(), supervisorId, provider, lease);
+        run.conversation_generation = conversationGeneration;
         ticket.execution.node_run_id = run.id;
         ticket.execution.node_id = workflowNodeForClaim.id;
         ticket.execution.node_type = "agent";
         ticket.execution.conversation_key = workflowNodeForClaim.conversation_key;
-      }
-      if (ticket.agents[key].provider !== provider) ticket.agents[key] = { provider, herdr_pane_id: null, session_ref: null };
-      else ticket.agents[key].provider = provider;
-      if (!ticket.workflow && (key === "specification" || key === "implementation")) {
-        ticket.agents.specification.provider = provider;
-        ticket.agents.implementation.provider = provider;
-      }
-      if (workflowNodeForClaim?.conversation_key) {
-        ticket.conversations ??= {};
-        const existing = ticket.conversations[workflowNodeForClaim.conversation_key];
-        ticket.conversations[workflowNodeForClaim.conversation_key] = existing?.provider === provider
-          ? { ...existing, provider }
-          : { provider, herdr_pane_id: null, session_ref: null };
       }
       return this.mutateLoaded(match, ticket, match.body, { event: "work.claimed", message: `${provider} claimed ${key} as lease ${lease}.` });
     });
@@ -762,12 +1148,12 @@ export class TicketStore extends EventEmitter {
     supervisorId: string,
     availableProviders: Provider[] = ["claude", "codex"],
     supervisorHost = supervisorId,
-    activityCapabilities: ActivityCapability[] = ["repository_action", "inline_shell", "inline_javascript", "inline_python"],
+    activityCapabilities: ActivityCapability[] = ["repository_action", "inline_shell", "inline_javascript", "inline_python", "git_checkpoint", "git_restore"],
   ): Promise<LoadedTicket | null> {
     return this.serial(async () => {
       if (!this.workflowLibrary) return null;
       await this.expireLeasesInternal();
-      let tickets = (await this.scanInternal(false)).filter((item): item is LoadedTicket & { frontmatter: TicketFrontmatter } => Boolean(item.valid && item.frontmatter));
+      let tickets = this.indexedTickets().filter((item): item is LoadedTicket & { frontmatter: TicketFrontmatter } => Boolean(item.valid && item.frontmatter));
       tickets = await Promise.all(tickets.map((ticket) => this.settleAutomaticLoaded(ticket)));
       const reservation = tickets.find((item) => item.frontmatter.assigned_supervisor === supervisorId && supervisorReservationActive(item.frontmatter));
       for (const current of tickets.filter((item) => item.frontmatter.status === "ready" && item.frontmatter.workflow)
@@ -782,7 +1168,7 @@ export class TicketStore extends EventEmitter {
         if (ticket.assigned_supervisor === null && requirements.providers.some((provider) => !availableProviders.includes(provider))) continue;
         if (ticket.assigned_supervisor === null && requirements.activities.some((capability) => !activityCapabilities.includes(capability))) continue;
         const node = workflowNode(definition, ticket.workflow!.current_node);
-        if (node.type !== "script") continue;
+        if (!["script", "checkpoint", "restore_checkpoint"].includes(node.type)) continue;
         const capability = requiredActivityCapability(node);
         if (!capability || !activityCapabilities.includes(capability)) continue;
         const conflict = tickets.some((active) => active.frontmatter.id !== ticket.id && supervisorReservationActive(active.frontmatter)
@@ -791,9 +1177,7 @@ export class TicketStore extends EventEmitter {
         if (conflict) continue;
         const now = this.clock();
         const next = structuredClone(ticket);
-        const key = phaseKey(next.phase);
         next.assigned_supervisor = supervisorId; next.assigned_supervisor_host = supervisorHost; next.status = "running";
-        next.attempts[key].total += 1;
         const attemptCounter = nodeAttemptCounter(next, node.id);
         attemptCounter.total += 1;
         const lease = randomUUID();
@@ -801,8 +1185,9 @@ export class TicketStore extends EventEmitter {
         next.execution = {
           lease_id: lease, supervisor_id: supervisorId, provider: null, phase: next.phase, attempt: attemptCounter.total,
           claimed_at: now.toISOString(), last_heartbeat_at: now.toISOString(), lease_expires_at: new Date(now.getTime() + this.leaseTtlMs).toISOString(),
+          delivery_status: "delivered", delivery_confirmed_at: now.toISOString(),
           observed_herdr_state: null, herdr_observation: null, telemetry: null, guidance: [], interrupt_request: null,
-          node_run_id: run.id, node_id: node.id, node_type: node.type,
+          node_run_id: run.id, node_id: node.id, node_type: node.type as "script" | "checkpoint" | "restore_checkpoint",
         };
         return this.mutateLoaded(current, next, current.body, { event: "activity.claimed", message: `${supervisorId} claimed ${node.type} node ${node.id}.` });
       }
@@ -863,28 +1248,66 @@ export class TicketStore extends EventEmitter {
           tokens: observation.herdr?.tokens ?? previous?.tokens ?? {},
         };
       }
-      const key = phaseKey(ticket.phase);
-      if (ticket.execution.provider && ticket.execution.node_type !== "script") {
-        ticket.agents[key].provider = ticket.execution.provider;
-        if (observation.paneId !== undefined) ticket.agents[key].herdr_pane_id = observation.paneId;
-        if (observation.sessionRef !== undefined) ticket.agents[key].session_ref = observation.sessionRef;
-        if (!ticket.workflow && (key === "specification" || key === "implementation")) {
-          ticket.agents.specification = { ...ticket.agents[key] };
-          ticket.agents.implementation = { ...ticket.agents[key] };
-        }
-      }
       if (ticket.execution.provider && ticket.execution.conversation_key) {
         ticket.conversations ??= {};
-        const conversation = ticket.conversations[ticket.execution.conversation_key] ?? { provider: ticket.execution.provider, herdr_pane_id: null, session_ref: null };
+        const conversation = ticket.conversations[ticket.execution.conversation_key] ?? {
+          provider: ticket.execution.provider, herdr_pane_id: null, session_ref: null,
+          generation: 1, visits_in_generation: 1, last_visit_key: null, reset_reason: null,
+        };
         conversation.provider = ticket.execution.provider;
         if (observation.paneId !== undefined) conversation.herdr_pane_id = observation.paneId;
         if (observation.sessionRef !== undefined) conversation.session_ref = observation.sessionRef;
         ticket.conversations[ticket.execution.conversation_key] = conversation;
-        ticket.agents[key] = { ...conversation };
       }
       if (observation.guidanceCursor !== undefined) {
         for (const item of ticket.execution.guidance) if (item.sequence <= observation.guidanceCursor && !item.delivered_at) item.delivered_at = now.toISOString();
       }
+      return { ticket };
+    });
+  }
+
+  async confirmAssignmentDelivery(leaseId: string): Promise<LoadedTicket> {
+    const leased = await this.byLease(leaseId);
+    return this.command(leased.frontmatter.id, {
+      event: "work.assignment_delivered", message: "Assignment prompt delivered; agent execution is running.",
+    }, (ticket) => {
+      if (ticket.execution?.lease_id !== leaseId) throw new HttpError(409, "Lease is stale or fenced", undefined, "LEASE_STALE");
+      if (ticket.execution.node_type !== "agent") throw new HttpError(409, "Lease is not an agent assignment", undefined, "ASSIGNMENT_DELIVERY_INVALID");
+      if (ticket.execution.delivery_status === "delivered") return { ticket };
+      ticket.execution.delivery_status = "delivered";
+      ticket.execution.delivery_confirmed_at = this.clock().toISOString();
+      return { ticket };
+    });
+  }
+
+  async rejectAssignmentDelivery(leaseId: string, reason: string): Promise<LoadedTicket> {
+    const leased = await this.byLease(leaseId);
+    const summary = reason.trim().slice(0, 2_000) || "Herdr did not confirm assignment delivery.";
+    const priorFailures = leased.execution.node_id
+      ? leased.frontmatter.workflow?.node_attempts[runtimeNodeKey(leased.frontmatter, leased.execution.node_id)]?.consecutive_lease_losses ?? 0
+      : 0;
+    const disposition = priorFailures + 1 >= 3
+      ? "Third consecutive operational loss; operator attention required."
+      : "The same workflow node was returned to ready for an automatic retry.";
+    return this.command(leased.frontmatter.id, {
+      event: "work.assignment_delivery_failed", message: `${summary} ${disposition}`,
+    }, (ticket) => {
+      if (ticket.execution?.lease_id !== leaseId) throw new HttpError(409, "Lease is stale or fenced", undefined, "LEASE_STALE");
+      if (ticket.execution.node_type !== "agent") throw new HttpError(409, "Lease is not an agent assignment", undefined, "ASSIGNMENT_DELIVERY_INVALID");
+      if (ticket.execution.delivery_status !== "starting") throw new HttpError(409, "Assignment delivery was already confirmed", undefined, "ASSIGNMENT_ALREADY_DELIVERED");
+      const run = ticket.workflow?.node_runs.find((candidate) => candidate.id === ticket.execution?.node_run_id);
+      if (run?.status === "running") {
+        const now = this.clock().toISOString();
+        accountNodeRunTiming(run, now);
+        run.status = "failed";
+        run.completed_at = now;
+        run.outcome = "delivery_failed";
+        run.summary = summary;
+      }
+      const attemptCounter = nodeAttemptCounter(ticket, ticket.execution.node_id);
+      attemptCounter.consecutive_lease_losses += 1;
+      ticket.execution = null;
+      ticket.status = attemptCounter.consecutive_lease_losses >= 3 ? "blocked" : "ready";
       return { ticket };
     });
   }
@@ -913,7 +1336,7 @@ export class TicketStore extends EventEmitter {
   async expireLeases(): Promise<number> { return this.serial(() => this.expireLeasesInternal()); }
 
   private async expireLeasesInternal(): Promise<number> {
-    const tickets = (await this.scanInternal(false)).filter((item): item is LoadedTicket & { frontmatter: TicketFrontmatter } => Boolean(item.valid && item.frontmatter?.execution));
+    const tickets = this.indexedTickets().filter((item): item is LoadedTicket & { frontmatter: TicketFrontmatter } => Boolean(item.valid && item.frontmatter?.execution));
     let count = 0;
     for (const current of tickets) {
       const execution = current.frontmatter.execution;
@@ -940,12 +1363,10 @@ export class TicketStore extends EventEmitter {
         count += 1;
         continue;
       }
-      const key = phaseKey(ticket.phase);
       const run = ticket.workflow?.node_runs.find((candidate) => candidate.id === execution.node_run_id);
       if (run?.status === "running") { const now = this.clock().toISOString(); accountNodeRunTiming(run, now); run.status = "failed"; run.completed_at = now; run.outcome = "lease_lost"; run.summary = "Lease expired without a callback."; }
       const attemptCounter = nodeAttemptCounter(ticket, execution.node_id);
       attemptCounter.consecutive_lease_losses += 1;
-      ticket.attempts[key].consecutive_lease_losses = attemptCounter.consecutive_lease_losses;
       ticket.execution = null;
       ticket.status = attemptCounter.consecutive_lease_losses >= 3 ? "blocked" : "ready";
       await this.mutateLoaded(current, ticket, current.body, {

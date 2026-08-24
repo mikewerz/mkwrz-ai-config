@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { readFile, rm } from "node:fs/promises";
+import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -15,18 +15,22 @@ function ticket(phase: "specification" | "implementation" | "review"): ClaimedTi
   return {
     id: "APT-1", path: "tickets/APT-1.md", markdown: "# Goal\n\nShip it.",
     frontmatter: {
-      id: "APT-1", title: "Ship it", phase, status: "running", work_provider: "claude", review_provider: "codex",
+      id: "APT-1", title: "Ship it", phase, status: "running",
       repositories: [{ id: "demo", primary: true }], pull_requests: [],
-      agents: {
-        specification: { provider: "claude", herdr_pane_id: null, session_ref: null },
-        implementation: { provider: "claude", herdr_pane_id: null, session_ref: null },
-        review: { provider: "codex", herdr_pane_id: null, session_ref: null },
-      },
+      workflow: { id: "delivery", revision: "r1", current_node: phase, inputs: {} },
       execution: {
         lease_id: "lease-1", provider: phase === "review" ? "codex" : "claude", interrupt_request: null,
         node_id: phase, node_type: "agent", node_run_id: "run-1", attempt: 1,
+        delivery_status: "starting", delivery_confirmed_at: null,
       },
     },
+    workflow_node: {
+      id: phase, name: phase, type: "agent", phase, prompt: phase,
+      agent_profile: phase === "review" ? "review" : "default", conversation_key: phase === "review" ? "review" : "work",
+      outcomes: [{ id: "completed", label: "Completed", description: "Finish the node.", target: "done" }], choices: [], exit_codes: [],
+    },
+    node_prompt: { id: phase, revision: "prompt-r1", content: `Complete ${phase} for {{ticket_id}}.` },
+    resolved_agent_profile: { alias: phase === "review" ? "review" : "default", provider: phase === "review" ? "codex" : "claude", model: "test-model", reasoning: "high" },
   };
 }
 
@@ -52,7 +56,7 @@ function bundle(): AssignmentBundle {
   const runDirectory = "/srv/assignments/vm/tickets/APT-1/runs/0001-implementation-run-1";
   return {
     root: "/srv/assignments", ticketDirectory: "/srv/assignments/vm/tickets/APT-1", runDirectory,
-    startHerePath: `${runDirectory}/START_HERE.md`, callbackHelperPath: `${runDirectory}/callback`,
+    startHerePath: `${runDirectory}/START_HERE.md`, callbackHelperPath: `${runDirectory}/callback`, attachmentsDirectory: `${runDirectory}/attachments`,
   };
 }
 
@@ -65,6 +69,7 @@ function temporaryAssignmentRoot(): string {
 
 describe("assignment prompt", () => {
   afterEach(async () => {
+    vi.useRealTimers();
     vi.restoreAllMocks();
     vi.unstubAllGlobals();
     await Promise.all(temporaryRoots.splice(0).map((path) => rm(path, { recursive: true, force: true })));
@@ -83,26 +88,77 @@ describe("assignment prompt", () => {
     expect(prompt).toContain("use /srv/assignments/vm/tickets/APT-1/runs/0001-implementation-run-1/callback");
   });
 
-  it("retries the identical full assignment when Herdr reports a stalled submission", async () => {
+  it("submits a staged assignment with Enter instead of pasting it twice", async () => {
     vi.spyOn(console, "warn").mockImplementation(() => undefined);
-    const promptAndConfirm = vi.fn().mockResolvedValueOnce(false).mockResolvedValueOnce(true);
-    const supervisor = new Supervisor({ projectRoot: "/srv/projects", promptAndConfirm } as unknown as HerdrController, {
+    const promptAndConfirm = vi.fn().mockResolvedValue(false);
+    const observation: AgentObservation = {
+      paneId: "w1:p1", state: "idle", sessionRef: "session-1", workspaceId: "w1", tabId: "w1:t1",
+      terminalId: "term-1", focused: false, cwd: "/srv/projects", foregroundCwd: "/srv/projects",
+      terminalTitle: null, terminalTitleStripped: null, displayName: "Codex", revision: 1,
+      sessionSource: "herdr:codex", sessionKind: "id", tokens: {},
+    };
+    const observe = vi.fn().mockResolvedValue(observation);
+    const readText = vi.fn().mockResolvedValue(`Claude composer\n${bundle().startHerePath}`);
+    const sendKeys = vi.fn().mockResolvedValue(undefined);
+    const supervisor = new Supervisor({ projectRoot: "/srv/projects", promptAndConfirm, observe, readText, sendKeys } as unknown as HerdrController, {
       trackerUrl: "http://tracker.test", supervisorId: "vm", providers: ["codex"],
       heartbeatIntervalMs: 30_000, idlePollMs: 1_000, assignmentRoot: temporaryAssignmentRoot(),
     });
     const internals = supervisor as unknown as {
       prompts: PromptStore;
-      promptAssignment(provider: Provider, value: ClaimedTicket, paneId: string, bundle: AssignmentBundle): Promise<void>;
+      promptAssignment(provider: Provider, value: ClaimedTicket, paneId: string, bundle: AssignmentBundle, initial: AgentObservation): Promise<AgentObservation>;
     };
     internals.prompts.replace(trackerPromptTemplates());
 
-    await internals.promptAssignment("codex", ticket("review"), "w1:p1", bundle());
+    await internals.promptAssignment("codex", ticket("review"), "w1:p1", bundle(), observation);
 
-    expect(promptAndConfirm).toHaveBeenCalledTimes(2);
-    expect(promptAndConfirm.mock.calls[0]).toEqual(promptAndConfirm.mock.calls[1]);
+    expect(promptAndConfirm).toHaveBeenCalledTimes(1);
     expect(promptAndConfirm.mock.calls[0]?.[1]).toContain(bundle().startHerePath);
     expect(promptAndConfirm.mock.calls[0]?.[1]).toContain(bundle().callbackHelperPath);
     expect(promptAndConfirm.mock.calls[0]?.[1]).not.toContain("# Goal\n\nShip it.");
+    expect(readText).toHaveBeenCalledWith("w1:p1");
+    expect(sendKeys).toHaveBeenCalledWith("w1:p1", "enter");
+  });
+
+  it("accepts observed pane activity as delivery confirmation without duplicating the prompt", async () => {
+    const before: AgentObservation = {
+      paneId: "w1:p1", state: "idle", sessionRef: "session-1", workspaceId: "w1", tabId: "w1:t1",
+      terminalId: "term-1", focused: false, cwd: "/srv/projects", foregroundCwd: "/srv/projects",
+      terminalTitle: null, terminalTitleStripped: null, displayName: "Claude", revision: 1,
+      sessionSource: "herdr:claude", sessionKind: "id", tokens: {},
+    };
+    const after = { ...before, state: "working", revision: 2 } satisfies AgentObservation;
+    const promptAndConfirm = vi.fn().mockResolvedValue(false);
+    const supervisor = new Supervisor({ projectRoot: "/srv/projects", promptAndConfirm, observe: vi.fn().mockResolvedValue(after) } as unknown as HerdrController, {
+      trackerUrl: "http://tracker.test", supervisorId: "vm", providers: ["claude"],
+      heartbeatIntervalMs: 30_000, idlePollMs: 1_000, assignmentRoot: temporaryAssignmentRoot(),
+    });
+    const internals = supervisor as unknown as {
+      prompts: PromptStore;
+      promptAssignment(provider: Provider, value: ClaimedTicket, paneId: string, bundle: AssignmentBundle, initial: AgentObservation): Promise<AgentObservation>;
+    };
+    internals.prompts.replace(trackerPromptTemplates());
+
+    await expect(internals.promptAssignment("claude", ticket("implementation"), "w1:p1", bundle(), before)).resolves.toEqual(after);
+
+    expect(promptAndConfirm).toHaveBeenCalledTimes(1);
+  });
+
+  it("renews a starting lease independently of Herdr startup work", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => Response.json({ active: true })));
+    const supervisor = new Supervisor({ projectRoot: "/srv/projects" } as HerdrController, {
+      trackerUrl: "http://tracker.test", supervisorId: "vm", providers: ["claude"],
+      heartbeatIntervalMs: 10, idlePollMs: 1_000, assignmentRoot: temporaryAssignmentRoot(),
+    });
+    const stopRenewal = (supervisor as unknown as {
+      startLeaseRenewal(value: ClaimedTicket, lease: string): () => void;
+    }).startLeaseRenewal(ticket("implementation"), "lease-1");
+
+    await new Promise((resolve) => setTimeout(resolve, 35));
+    stopRenewal();
+
+    expect(fetch).toHaveBeenCalledWith(expect.objectContaining({ href: "http://tracker.test/api/work/lease-1/heartbeat" }), expect.objectContaining({ method: "POST" }));
+    expect(vi.mocked(fetch).mock.calls.length).toBeGreaterThanOrEqual(2);
   });
 
   it("never substitutes a callback reminder when the assignment does not start", async () => {
@@ -117,12 +173,15 @@ describe("assignment prompt", () => {
       projectRoot: "/srv/projects",
       ensureAgent: vi.fn().mockResolvedValue(observation),
       promptAndConfirm: vi.fn().mockResolvedValue(false),
+      observe: vi.fn().mockResolvedValue(observation),
+      readText: vi.fn().mockResolvedValue("Claude welcome screen"),
+      sendKeys: vi.fn().mockResolvedValue(undefined),
       prompt: vi.fn().mockResolvedValue(undefined),
     } as unknown as HerdrController;
     vi.stubGlobal("fetch", vi.fn(async () => Response.json({ active: true })));
     const supervisor = new Supervisor(herdr, {
       trackerUrl: "http://tracker.test", supervisorId: "vm", providers: ["codex"],
-      heartbeatIntervalMs: 30_000, idlePollMs: 1_000, assignmentRoot: temporaryAssignmentRoot(),
+      heartbeatIntervalMs: 30_000, idlePollMs: 1_000, assignmentPromptRecoveryMs: 0, assignmentRoot: temporaryAssignmentRoot(),
     });
     const internals = supervisor as unknown as {
       prompts: PromptStore;
@@ -130,10 +189,12 @@ describe("assignment prompt", () => {
     };
     internals.prompts.replace(trackerPromptTemplates());
 
-    await expect(internals.runAssignment("codex", ticket("review"))).rejects.toThrow("did not start the assignment prompt");
+    await expect(internals.runAssignment("codex", ticket("review"))).resolves.toBeUndefined();
 
-    expect(herdr.promptAndConfirm).toHaveBeenCalledTimes(2);
+    expect(herdr.promptAndConfirm).toHaveBeenCalledTimes(1);
+    expect(herdr.sendKeys).not.toHaveBeenCalled();
     expect(herdr.prompt).not.toHaveBeenCalled();
+    expect(fetch).toHaveBeenCalledWith(expect.objectContaining({ href: "http://tracker.test/api/work/lease-1/delivery-failed" }), expect.objectContaining({ method: "POST" }));
   });
 
   it("sends at most one callback reminder per lease across repeated idle periods", async () => {
@@ -169,7 +230,7 @@ describe("assignment prompt", () => {
     }));
     supervisor = new Supervisor(herdr, {
       trackerUrl: "http://tracker.test", supervisorId: "vm", providers: ["claude"],
-      heartbeatIntervalMs: 30_000, idlePollMs: 1, assignmentRoot: temporaryAssignmentRoot(),
+      heartbeatIntervalMs: 30_000, idlePollMs: 1, callbackReminderGraceMs: 0, assignmentRoot: temporaryAssignmentRoot(),
     });
     const internals = supervisor as unknown as {
       prompts: PromptStore;
@@ -248,6 +309,7 @@ describe("assignment prompt", () => {
     vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request) => {
       const url = input instanceof Request ? input.url : String(input);
       if (url.includes("/heartbeat")) return Response.json({ active: true });
+      if (url.includes("/delivered")) return Response.json({ delivered: true });
       if (url.includes("/control")) return Response.json({ error: "Lease is stale or fenced" }, { status: 409 });
       throw new Error(`Unexpected request: ${url}`);
     }));
@@ -301,6 +363,55 @@ describe("assignment prompt", () => {
     await supervisor.run();
 
     expect(aborted).toBe(true);
+  });
+
+  it("does not complete a Script node when a required artifact upload is rejected", async () => {
+    // Arrange
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const projectRoot = temporaryAssignmentRoot();
+    await mkdir(projectRoot, { recursive: true });
+    const reportPath = join(projectRoot, "quality.yaml");
+    await writeFile(reportPath, "schema: agentic-quality/v1\nattributes: []\n");
+    vi.spyOn(activities, "runRepositoryActivity").mockResolvedValue({
+      success: true, summary: "Verification passed.", output: "", exit_code: 0, script_path: null, working_directory: projectRoot,
+      pending_artifacts: [{ key: "verification-quality", kind: "quality_report", filename: "quality.yaml", content_type: "application/yaml", path: reportPath }],
+    });
+    const claimed = ticket("implementation");
+    claimed.frontmatter.execution.provider = null;
+    claimed.frontmatter.execution.node_type = "script";
+    claimed.frontmatter.execution.node_id = "verify";
+    claimed.workflow_node = {
+      id: "verify", name: "Verify", type: "script", phase: "implementation", repository: "primary",
+      inline: { language: "shell", code: "true" }, outcomes: [], choices: [], exit_codes: [],
+      artifacts: [{ name: "verification-quality", path: "quality.yaml", content_type: "application/yaml", required: true, interpretation: { kind: "quality_report", schema: "agentic-quality/v1", required_attributes: [] } }],
+    };
+    let supervisor!: Supervisor;
+    let claimedOnce = false;
+    const requests: string[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request) => {
+      const url = input instanceof Request ? input.url : String(input);
+      requests.push(url);
+      if (url.endsWith("/api/work/claim-activity") && !claimedOnce) { claimedOnce = true; return Response.json(claimed); }
+      if (url.includes("/api/work/lease-1/control")) return Response.json({ interrupt: null, waiting_for_answer: false });
+      if (url.includes("/api/work/lease-1/artifacts")) {
+        await supervisor.stop();
+        return Response.json({ error: "Quality report is missing required attributes" }, { status: 422 });
+      }
+      if (url.endsWith("/api/work/claim-activity")) return new Response(null, { status: 204 });
+      return Response.json({});
+    }));
+    supervisor = new Supervisor({ projectRoot } as HerdrController, {
+      trackerUrl: "http://tracker.test", supervisorId: "vm", providers: [],
+      heartbeatIntervalMs: 30_000, idlePollMs: 1, assignmentRoot: join(projectRoot, "assignments"),
+    });
+
+    // Act
+    await supervisor.run();
+
+    // Assert
+    expect(requests.filter((url) => url.includes("/artifacts"))).toHaveLength(1);
+    expect(requests.some((url) => url.endsWith("/activity-result"))).toBe(false);
+    expect(requests.some((url) => url.endsWith("/finalize"))).toBe(false);
   });
 
   it("refreshes phase and envelope prompts from the tracker library", async () => {

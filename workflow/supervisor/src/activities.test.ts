@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { chmod, mkdir, mkdtemp, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -12,17 +12,16 @@ const execute = promisify(execFile);
 afterEach(async () => { await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true }))); });
 
 function claim(root: string, activity: {
-  action?: string;
   script_file?: { relative_to: "selected_repository" | "primary_repository" | "project_root"; path?: string; path_input?: string };
   working_directory?: { relative_to: "selected_repository" | "primary_repository" | "project_root"; path?: string; path_input?: string };
   inline?: { language: "shell" | "python" | "javascript"; code: string };
-} = { action: "verify" }): ClaimedTicket {
+} = { script_file: { relative_to: "selected_repository", path: ".agents/actions/verify.sh" } }): ClaimedTicket {
   return {
     id: "AGENT-0001", path: join(root, "ticket.md"), markdown: "# Work",
     frontmatter: {
-      id: "AGENT-0001", title: "Activity", phase: "implementation", status: "running", work_provider: "claude", review_provider: "codex",
+      id: "AGENT-0001", title: "Activity", phase: "implementation", status: "running",
       repositories: [{ id: "demo", primary: true }], pull_requests: [],
-      agents: { specification: { provider: null, herdr_pane_id: null, session_ref: null }, implementation: { provider: null, herdr_pane_id: null, session_ref: null }, review: { provider: null, herdr_pane_id: null, session_ref: null } },
+      workflow: { id: "delivery", revision: "r1", current_node: "verify", inputs: {} },
       execution: { lease_id: "lease", provider: "codex", interrupt_request: null, node_run_id: "run", node_id: "verify", node_type: "script" },
     },
     workflow_node: { id: "verify", name: "Repository verification", type: "script", phase: "implementation", repository: "primary", ...activity, outcomes: [], choices: [], exit_codes: [{ id: "success", label: "Success", description: "", target: "done", codes: [0] }, { id: "failure", label: "Failure", description: "", target: "repair", default: true }] },
@@ -65,6 +64,105 @@ describe("repository activities", () => {
     await expect(runRepositoryActivity(root, claim(root, { inline: { language: "shell", code: "printf failure >&2; exit 7" } }))).resolves.toMatchObject({
       success: false, output: "failure", exit_code: 7,
     });
+  });
+
+  it("captures bounded provider-neutral structured results from the declared result path", async () => {
+    const root = await mkdtemp(join(tmpdir(), "factory-structured-result-")); roots.push(root);
+    await mkdir(join(root, "demo"), { recursive: true });
+    const result = await runRepositoryActivity(root, claim(root, { inline: {
+      language: "shell",
+      code: `printf '%s' '{"metadata":{"deployment.id":"deploy-123","deployment.ready":false},"external_references":[{"type":"deployment","id":"deploy-123","url":"https://deploy.example/123"}]}' > "$AGENTIC_RESULT_PATH"`,
+    } }));
+    expect(result).toMatchObject({
+      success: true,
+      structured_result: {
+        metadata: { "deployment.id": "deploy-123", "deployment.ready": false },
+        external_references: [{ type: "deployment", id: "deploy-123", url: "https://deploy.example/123" }],
+      },
+    });
+  });
+
+  it("stages declared quality YAML as a specialized tracker artifact", async () => {
+    const root = await mkdtemp(join(tmpdir(), "factory-quality-artifact-")); roots.push(root);
+    await mkdir(join(root, "demo"), { recursive: true });
+    const ticket = claim(root, { inline: { language: "shell", code: "printf 'schema: agentic-quality/v1\\nattributes: []\\n' > quality.yaml" } });
+    ticket.workflow_node!.artifacts = [{
+      name: "verification-quality", path: "quality.yaml", content_type: "application/yaml", required: true,
+      interpretation: { kind: "quality_report", schema: "agentic-quality/v1", required_attributes: [] },
+    }];
+    const result = await runRepositoryActivity(root, ticket);
+    expect(result.pending_artifacts).toEqual([expect.objectContaining({ key: "verification-quality", kind: "quality_report", filename: "quality.yaml", content_type: "application/yaml" })]);
+  });
+
+  it("leaves quality interpretation to the tracker and stages the exact produced bytes", async () => {
+    // Arrange
+    const root = await mkdtemp(join(tmpdir(), "factory-quality-artifact-")); roots.push(root);
+    await mkdir(join(root, "demo"), { recursive: true });
+    const ticket = claim(root, { inline: { language: "shell", code: "printf 'not: valid: quality: yaml' > quality.yaml" } });
+    ticket.workflow_node!.artifacts = [{
+      name: "verification-quality", path: "quality.yaml", content_type: "application/yaml", required: true,
+      interpretation: { kind: "quality_report", schema: "agentic-quality/v1", required_attributes: ["tests.pass_rate"] },
+    }];
+
+    // Act
+    const result = await runRepositoryActivity(root, ticket);
+    const staged = result.pending_artifacts![0]!;
+
+    // Assert
+    expect(staged).toMatchObject({ key: "verification-quality", kind: "quality_report" });
+    expect(await readFile(staged.path, "utf8")).toBe("not: valid: quality: yaml");
+  });
+
+  it("fails the activity contract when a required quality artifact is absent", async () => {
+    // Arrange
+    const root = await mkdtemp(join(tmpdir(), "factory-quality-artifact-")); roots.push(root);
+    await mkdir(join(root, "demo"), { recursive: true });
+    const ticket = claim(root, { inline: { language: "shell", code: "true" } });
+    ticket.workflow_node!.artifacts = [{
+      name: "verification-quality", path: "quality.yaml", content_type: "application/yaml", required: true,
+      interpretation: { kind: "quality_report", schema: "agentic-quality/v1", required_attributes: [] },
+    }];
+
+    // Act
+    const action = runRepositoryActivity(root, ticket);
+
+    // Assert
+    await expect(action).rejects.toThrow("Required artifact verification-quality was not produced");
+  });
+
+  it("does not create phantom records for absent optional quality artifacts", async () => {
+    // Arrange
+    const root = await mkdtemp(join(tmpdir(), "factory-quality-artifact-")); roots.push(root);
+    await mkdir(join(root, "demo"), { recursive: true });
+    const ticket = claim(root, { inline: { language: "shell", code: "true" } });
+    ticket.workflow_node!.artifacts = [{
+      name: "verification-quality", path: "quality.yaml", content_type: "application/yaml", required: false,
+      interpretation: { kind: "quality_report", schema: "agentic-quality/v1", required_attributes: [] },
+    }];
+
+    // Act
+    const result = await runRepositoryActivity(root, ticket);
+
+    // Assert
+    expect(result).not.toHaveProperty("pending_artifacts");
+  });
+
+  it("rejects a declared quality artifact that resolves outside the activity directory", async () => {
+    // Arrange
+    const root = await mkdtemp(join(tmpdir(), "factory-quality-artifact-")); roots.push(root);
+    await mkdir(join(root, "demo"), { recursive: true });
+    await writeFile(join(root, "outside.yaml"), "schema: agentic-quality/v1\nattributes: []\n");
+    const ticket = claim(root, { inline: { language: "shell", code: "true" } });
+    ticket.workflow_node!.artifacts = [{
+      name: "verification-quality", path: "../outside.yaml", content_type: "application/yaml", required: true,
+      interpretation: { kind: "quality_report", schema: "agentic-quality/v1", required_attributes: [] },
+    }];
+
+    // Act
+    const action = runRepositoryActivity(root, ticket);
+
+    // Assert
+    await expect(action).rejects.toThrow("escapes the activity working directory");
   });
 
   it("resolves ticket-provided script and working-directory paths against independent bases", async () => {
@@ -160,5 +258,43 @@ describe("repository activities", () => {
     expect(result.output).toContain(`args:--context-json|`);
     expect(result.output).toContain(`|--project-root|${projectRoot}|--repository-id|demo|--repository-path|${join(projectRoot, "demo")}|`);
     expect(result.output).toContain("|--current-branch|feature/demo|--default-branch|main|--head-sha|");
-  });
+  }, 20_000);
+
+  it("captures uncommitted repository state in a portable bundle and restores it deterministically", async () => {
+    const root = await mkdtemp(join(tmpdir(), "factory-checkpoint-")); roots.push(root);
+    const repository = join(root, "demo"); await mkdir(repository, { recursive: true });
+    await execute("git", ["init", "--initial-branch", "main"], { cwd: repository });
+    await writeFile(join(repository, "tracked.txt"), "base\n");
+    await execute("git", ["-c", "user.name=Agent", "-c", "user.email=agent@example.test", "add", "tracked.txt"], { cwd: repository });
+    await execute("git", ["-c", "user.name=Agent", "-c", "user.email=agent@example.test", "commit", "-m", "base"], { cwd: repository });
+    const originalHead = String((await execute("git", ["rev-parse", "HEAD"], { cwd: repository })).stdout).trim();
+    await writeFile(join(repository, "tracked.txt"), "checkpoint\n");
+    await writeFile(join(repository, "untracked.txt"), "also checkpointed\n");
+    const staging = join(root, "staging");
+    const checkpointTicket = claim(root);
+    checkpointTicket.frontmatter.execution.node_type = "checkpoint";
+    checkpointTicket.workflow_node = { id: "save", name: "Save work", type: "checkpoint", phase: "implementation", checkpoint_label: "Before experiment", outcomes: [], choices: [], exit_codes: [] };
+    const captured = await runRepositoryActivity(root, checkpointTicket, undefined, { directory: staging });
+    expect(captured.checkpoints?.[0]).toMatchObject({ label: "Before experiment", repositories: [{ repository: "demo", dirty: true }] });
+    const bundle = captured.pending_artifacts?.[0];
+    expect(bundle?.kind).toBe("checkpoint_bundle");
+
+    await writeFile(join(repository, "tracked.txt"), "later\n");
+    await rm(join(repository, "untracked.txt"));
+    await writeFile(join(repository, "new.txt"), "remove me\n");
+    const manifest = captured.checkpoints![0]!;
+    const restoreTicket = claim(root);
+    restoreTicket.frontmatter.metadata = { "checkpoint.restore_id": manifest.id };
+    restoreTicket.frontmatter.checkpoints = [{
+      id: manifest.id, label: manifest.label, kind: manifest.kind, node_id: "save", node_run_id: "run", created_at: manifest.created_at, manifest_artifact_id: "manifest",
+      repositories: manifest.repositories.map(({ bundle_key, ...item }) => ({ ...item, bundle_artifact_id: "bundle" })),
+    }];
+    restoreTicket.frontmatter.execution.node_type = "restore_checkpoint";
+    restoreTicket.workflow_node = { id: "restore", name: "Restore work", type: "restore_checkpoint", phase: "implementation", checkpoint_source: { mode: "latest" }, outcomes: [], choices: [], exit_codes: [] };
+    await expect(runRepositoryActivity(root, restoreTicket, undefined, { directory: join(root, "restore"), artifact_paths: { bundle: bundle!.path } })).resolves.toMatchObject({ success: true, exit_code: 0 });
+    expect(await readFile(join(repository, "tracked.txt"), "utf8")).toBe("checkpoint\n");
+    expect(await readFile(join(repository, "untracked.txt"), "utf8")).toBe("also checkpointed\n");
+    await expect(readFile(join(repository, "new.txt"), "utf8")).rejects.toThrow();
+    expect(String((await execute("git", ["rev-parse", "HEAD"], { cwd: repository })).stdout).trim()).toBe(originalHead);
+  }, 20_000);
 });

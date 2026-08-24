@@ -1,5 +1,6 @@
 import { HttpError, type JiraRef, type TicketFrontmatter } from "./domain.js";
 import type { JiraConfig } from "./config-store.js";
+import { fetchWithDeadline, requestTimeoutMs } from "./network.js";
 
 interface JiraIssue {
   id: string;
@@ -30,7 +31,7 @@ function toAdf(text: string): Record<string, unknown> {
 }
 
 export class JiraCloudClient {
-  constructor(private readonly request: typeof fetch = fetch) {}
+  constructor(private readonly request: typeof fetch = fetch, private readonly timeoutMs = requestTimeoutMs()) {}
 
   private credentials(): { email: string; token: string } {
     const email = process.env.JIRA_EMAIL?.trim() ?? "";
@@ -42,13 +43,13 @@ export class JiraCloudClient {
   private async call<T>(config: JiraConfig, path: string, init: RequestInit = {}): Promise<T> {
     if (!config.enabled) throw new HttpError(409, "Jira integration is disabled");
     const { email, token } = this.credentials();
-    const response = await this.request(`${config.site_url}/rest/api/3${path}`, {
+    const response = await fetchWithDeadline(this.request, `${config.site_url}/rest/api/3${path}`, {
       ...init,
       headers: {
         Authorization: `Basic ${Buffer.from(`${email}:${token}`).toString("base64")}`,
         Accept: "application/json", "Content-Type": "application/json", ...init.headers,
       },
-    });
+    }, this.timeoutMs);
     if (!response.ok) {
       const detail = await response.text();
       throw new HttpError(response.status === 404 ? 404 : 502, `Jira Cloud request failed (${response.status})`, detail.slice(0, 1000));

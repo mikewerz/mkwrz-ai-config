@@ -1,10 +1,6 @@
 ---
 id: REPLACED-WHEN-USING-AUTO-ID
 title: Describe the desired outcome
-spec_required: true
-review_required: true
-work_provider: claude
-review_provider: codex
 priority: 0
 labels: []
 repositories:

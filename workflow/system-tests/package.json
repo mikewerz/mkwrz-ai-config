@@ -1,0 +1,19 @@
+{
+  "name": "agentic-project-system-tests",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "scripts": {
+    "build:sut": "npm --prefix ../tracker run build && npm --prefix ../supervisor run build",
+    "test:system": "node --test --test-concurrency=1 test/*.test.mjs",
+    "test:browser": "playwright test",
+    "test": "npm run build:sut && npm run test:system && npm run test:browser",
+    "verify": "npm test"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.55.0"
+  }
+}

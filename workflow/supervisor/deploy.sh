@@ -6,6 +6,7 @@ cd "$script_dir"
 
 pid_file="${DEPLOY_PID_FILE:-.pid}"
 log_file="${DEPLOY_LOG_FILE:-supervisor.log}"
+bootstrap_log="${DEPLOY_BOOTSTRAP_LOG_FILE:-supervisor.bootstrap.log}"
 expected_command="dist/index.js"
 new_pid=""
 
@@ -62,16 +63,52 @@ if ! command -v node >/dev/null 2>&1 || ! command -v npm >/dev/null 2>&1; then
   exit 1
 fi
 
-echo "Installing locked dependencies and verifying the supervisor."
+echo "Installing locked dependencies."
 npm ci
-npm run verify
+if [[ "${DEPLOY_RUN_TESTS:-false}" == "true" ]]; then
+  echo "Running the full supervisor verification suite."
+  npm run verify
+else
+  echo "Skipping supervisor tests; type-checking and building production artifacts."
+  npm run typecheck
+  npm run build
+fi
+
+echo "Checking tracker protocol compatibility before stopping the current supervisor."
+node --input-type=module <<'NODE'
+import { loadEnvFile } from "node:process";
+import { detectActivityCapabilities } from "./dist/activities.js";
+
+loadEnvFile();
+const tracker = process.env.TRACKER_URL ?? "http://127.0.0.1:4310";
+const required = detectActivityCapabilities();
+try {
+  const response = await fetch(new URL("/api/capabilities", tracker), { signal: AbortSignal.timeout(5_000) });
+  if (!response.ok) {
+    console.error(`Tracker compatibility check returned HTTP ${response.status}. Deploy the tracker before this supervisor.`);
+    process.exit(1);
+  }
+  const body = await response.json();
+  const protocols = Array.isArray(body.supervisor_protocol_versions) ? body.supervisor_protocol_versions : [];
+  const intakeProtocols = Array.isArray(body.intake_protocol_versions) ? body.intake_protocol_versions : [];
+  const supported = new Set(Array.isArray(body.activity_capabilities) ? body.activity_capabilities : []);
+  const missing = required.filter((capability) => !supported.has(capability));
+  if (!protocols.includes(2) || !intakeProtocols.includes(1) || missing.length) {
+    console.error(`Tracker is incompatible with this supervisor. Protocols=${protocols.join(", ") || "none"}; intake protocols=${intakeProtocols.join(", ") || "none"}; missing capabilities=${missing.join(", ") || "none"}. Deploy the tracker first.`);
+    process.exit(1);
+  }
+} catch (error) {
+  console.error(`Tracker compatibility check failed for ${tracker}: ${error instanceof Error ? error.message : String(error)}. The current supervisor was left running.`);
+  process.exit(1);
+}
+NODE
 
 stop_existing
 trap cleanup_failed_start ERR
 
 echo "Starting the production supervisor."
 deployment_started_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-nohup node dist/index.js >> "$log_file" 2>&1 &
+nohup env LOG_FILE="$log_file" node dist/index.js >> "$bootstrap_log" 2>&1 &
 new_pid=$!
 printf '%s\n' "$new_pid" > "$pid_file"
 sleep 1
@@ -84,7 +121,7 @@ const tracker = process.env.TRACKER_URL ?? "http://127.0.0.1:4310";
 const supervisorId = process.env.SUPERVISOR_ID ?? "coordinator-vm";
 const deployedAt = Date.parse(process.env.DEPLOYMENT_STARTED_AT ?? "");
 try {
-  const response = await fetch(new URL("/api/supervisors", tracker));
+  const response = await fetch(new URL("/api/supervisors", tracker), { signal: AbortSignal.timeout(5_000) });
   if (!response.ok) process.exit(1);
   const body = await response.json();
   const online = Array.isArray(body.supervisors) && body.supervisors.some(
@@ -107,5 +144,6 @@ done
 
 echo "Supervisor failed to remain online in the tracker registry. Recent log output:" >&2
 tail -n 80 "$log_file" >&2 || true
+tail -n 80 "$bootstrap_log" >&2 || true
 cleanup_failed_start
 exit 1

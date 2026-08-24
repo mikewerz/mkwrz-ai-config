@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { mkdir, open, readFile, readdir, rename, rm, stat } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
 import { HttpError } from "./domain.js";
+import { artifactVersion } from "./artifact-versions.js";
 
 export const PROMPT_NAMES = [
   "assignment", "specification", "implementation", "review", "postman-baseline",
@@ -24,200 +25,11 @@ interface PromptDefinition {
 export interface PromptDocument extends PromptDefinition {
   content: string;
   revision: string;
+  version: number;
   tags: TagDefinition[];
   valid: boolean;
   errors: string[];
 }
-
-export const LEGACY_ASSIGNMENT_DEFAULT = `You are assigned ticket {{ticket_id}} for the {{phase}} phase.
-
-The authoritative ticket is at {{ticket_path}}. Its current contents follow:
-
-{{ticket_markdown}}
-
-{{phase_instructions}} Use your normal tools and judgment. The coordinator does not prescribe your process. Never merge a pull request automatically.
-
-The Herdr lifecycle display is not a completion signal. Before finishing, use one of these HTTP callbacks with a JSON body:
-- comment: POST {{callback_base}}comment {"message":"..."}
-- ask: POST {{callback_base}}ask {"question":"..."}
-- complete: POST {{callback_base}}complete with the phase summary, PR references when applicable, and review decision when reviewing
-- fail: POST {{callback_base}}fail {"reason":"..."}
-
-Continue working until you have submitted complete, ask, or fail.`;
-
-export const BATCH_QUESTION_ASSIGNMENT_DEFAULT = `You are assigned ticket {{ticket_id}} for the {{phase}} phase.
-
-The authoritative ticket is at {{ticket_path}}. Its current contents follow:
-
-{{ticket_markdown}}
-
-{{phase_instructions}} Use your normal tools and judgment. The coordinator does not prescribe your process. Never merge a pull request automatically.
-
-The Herdr lifecycle display is observational and never completes a phase. Send callbacks as HTTP POST requests with Content-Type: application/json. Replace every example value below with the real result.
-
-Non-terminal progress note; continue working afterward:
-- POST {{callback_base}}comment
-- Body: {"message":"A concise progress note, decision, or useful context."}
-
-Block for human input while retaining this lease and conversation. Submit either one question or a batch, then stop and wait for answers:
-- POST {{callback_base}}ask
-- One question: {"question":"May the public endpoint response change?"}
-- Multiple questions: {"questions":["Which compatibility target is required?","May I add a dependency?"]}
-
-Complete specification or implementation:
-- POST {{callback_base}}complete
-- Body: {"summary":"What was completed and how it was verified.","pull_requests":[{"repository":"repository-id","url":"https://github.com/owner/repository/pull/123"}]}
-
-Complete review:
-- POST {{callback_base}}complete
-- Approved body: {"summary":"Review result and any non-blocking findings.","decision":"approved"}
-- Changes body: {"summary":"Blocking findings; PR comments were added.","decision":"changes_requested"}
-
-Fail only when the phase cannot be completed or continued:
-- POST {{callback_base}}fail
-- Body: {"reason":"Why the work cannot continue."}
-
-Before becoming idle, call ask if human input is required, complete if the phase is done, or fail if it cannot continue. A comment alone is not a terminal callback.`;
-
-const PROJECT_ROOT_INSTRUCTION = `The supervisor started this conversation in {{project_root}}. Treat that directory as the project root for this ticket. Start repository work under {{project_root}}/<repository-id>; do not search for or switch to another project root unless the ticket or human guidance explicitly requires it.`;
-
-export const PRE_PROMPT_ENGINEERING_ASSIGNMENT_DEFAULT = `You are assigned ticket {{ticket_id}} for the {{phase}} phase.
-
-${PROJECT_ROOT_INSTRUCTION}
-
-The active durable workflow node is {{node_name}} ({{node_id}}).
-
-The transition into this node came from {{incoming_node}} with outcome {{incoming_outcome}}.
-Prior summary: {{incoming_summary}}
-Handoff: {{incoming_handoff}}
-
-Its allowed terminal outcomes are:
-{{allowed_outcomes}}
-Legacy V2 review callbacks using {"decision":"approved"} or {"decision":"changes_requested"} remain accepted, but V3 workflows should send outcome.
-
-The authoritative ticket is at {{ticket_path}}. Its current contents follow:
-
-{{ticket_markdown}}
-
-{{phase_instructions}} Use your normal tools and judgment. The coordinator does not prescribe your process. Never merge a pull request automatically.
-
-The Herdr lifecycle display is observational and never completes a phase. Send callbacks as HTTP POST requests with Content-Type: application/json. Replace every example value below with the real result.
-
-Non-terminal progress note; continue working afterward:
-- POST {{callback_base}}comment
-- Body: {"message":"A concise progress note, decision, or useful context."}
-
-Block for human input while retaining this lease and conversation. Every question may provide any number of suggested answer options, including none. Options are suggestions only; the human can always give a freeform answer. Submit one question or a batch, then stop and wait for answers:
-- POST {{callback_base}}ask
-- One question: {"question":"Which environment should receive the deployment?","options":["Development","Staging","Both"]}
-- Multiple questions: {"questions":[{"question":"Which compatibility target is required?","options":["Current major only","Current and previous major"]},{"question":"May I add a dependency?","options":["Yes","No"]}]}
-- Questions without suggestions may omit options or use "options":[]; a batch may also contain plain question strings.
-
-Complete the active workflow node:
-- POST {{callback_base}}complete
-- Body: {"summary":"What was completed and how it was verified.","handoff":"Useful context for the next workflow node.","outcome":"one allowed outcome","pull_requests":[{"repository":"repository-id","url":"https://github.com/owner/repository/pull/123"}]}
-
-Complete review:
-- POST {{callback_base}}complete
-- Approved body: {"summary":"Review result and any non-blocking findings.","outcome":"approved"}
-- Changes body: {"summary":"Blocking findings; PR comments were added.","outcome":"changes_requested"}
-
-Fail only when the phase cannot be completed or continued:
-- POST {{callback_base}}fail
-- Body: {"reason":"Why the work cannot continue."}
-
-Before becoming idle, call ask if human input is required, complete if the phase is done, or fail if it cannot continue. A comment alone is not a terminal callback.`;
-
-export const PRE_TYPED_OUTCOME_ASSIGNMENT_DEFAULT = PRE_PROMPT_ENGINEERING_ASSIGNMENT_DEFAULT
-  .replace(`The active durable workflow node is {{node_name}} ({{node_id}}).
-
-The transition into this node came from {{incoming_node}} with outcome {{incoming_outcome}}.
-Prior summary: {{incoming_summary}}
-Handoff: {{incoming_handoff}}
-
-Its allowed terminal outcomes are:
-{{allowed_outcomes}}`, "The active durable workflow node is {{node_name}} ({{node_id}}). Its allowed terminal outcomes are: {{allowed_outcomes}}.")
-  .replace(',"handoff":"Useful context for the next workflow node."', "");
-
-export const PRE_V3_ASSIGNMENT_DEFAULT = PRE_TYPED_OUTCOME_ASSIGNMENT_DEFAULT
-  .replace("\n\nThe active durable workflow node is {{node_name}} ({{node_id}}). Its allowed terminal outcomes are: {{allowed_outcomes}}.", "")
-  .replace('\nLegacy V2 review callbacks using {"decision":"approved"} or {"decision":"changes_requested"} remain accepted, but V3 workflows should send outcome.', "")
-  .replace("Complete the active workflow node:", "Complete specification or implementation:")
-  .replace(',"outcome":"one allowed outcome"', "")
-  .replace(',"outcome":"approved"', ',"decision":"approved"')
-  .replace(',"outcome":"changes_requested"', ',"decision":"changes_requested"');
-
-export const PRE_PROJECT_ROOT_ASSIGNMENT_DEFAULT = PRE_PROMPT_ENGINEERING_ASSIGNMENT_DEFAULT.replace(`\n\n${PROJECT_ROOT_INSTRUCTION}`, "");
-
-export const PRE_MERGE_PROMPT_ASSIGNMENT_DEFAULT = `# Work assignment
-
-You own ticket {{ticket_id}} for the {{phase}} phase at workflow node **{{node_name}}** (\`{{node_id}}\`).
-
-${PROJECT_ROOT_INSTRUCTION}
-
-## Incoming transition
-
-- Previous node: {{incoming_node}}
-- Selected outcome: {{incoming_outcome}}
-- Previous result: {{incoming_summary}}
-- Actionable handoff: {{incoming_handoff}}
-- Prior node output (configured tail): {{incoming_output}}
-- Full prior output log: {{incoming_output_log}}
-
-Treat this as context from the preceding durable boundary. Reconcile it with the authoritative ticket and existing repository or PR state; do not blindly repeat already-completed work.
-
-## Current node contract
-
-The authoritative ticket is at {{ticket_path}}:
-
-{{ticket_markdown}}
-
-Node instructions:
-
-{{phase_instructions}}
-
-You retain your normal tools, credentials, judgment, planning, and subagent capabilities. Work autonomously inside this node. The coordinator tracks boundaries; it does not prescribe your implementation process. Never merge a pull request automatically.
-
-This node permits exactly these terminal outcomes:
-
-{{allowed_outcomes}}
-
-Choose an outcome by its exact ID only after its described condition is true. Do not invent an outcome or use a destination node name as the outcome.
-
-## Durable callbacks
-
-Herdr state is observational and never advances the workflow. Send JSON with \`Content-Type: application/json\` to the lease-fenced callback URLs below.
-
-Ticket-scoped workflow metadata:
-- Read all: \`GET {{callback_base}}metadata\`
-- Read one key: \`GET {{callback_base}}metadata/<key>\`
-- Write one JSON value: \`PUT {{callback_base}}metadata/<key>\` with \`{"value":<any JSON value>}\`
-
-Progress note; continue working:
-- \`POST {{callback_base}}comment\`
-- \`{"message":"A concise durable progress note or decision."}\`
-
-Human input required; submit one or more focused questions, then stop and wait:
-- \`POST {{callback_base}}ask\`
-- One: \`{"question":"Which environment should receive the deployment?","options":["Development","Staging","Both"]}\`
-- Many: \`{"questions":[{"question":"Which compatibility target is required?","options":["Current major only","Current and previous major"]},{"question":"May I add a dependency?","options":["Yes","No"]}]}\`
-- Options are optional suggestions; the human can always answer freely.
-
-Current node complete:
-- \`POST {{callback_base}}complete\`
-- \`{"outcome":"<exact allowed outcome ID>","summary":"What changed, important decisions, and how the result was verified.","handoff":"Only the actionable context the next node needs.","pull_requests":[{"repository":"repository-id","url":"https://github.com/owner/repository/pull/123"}]}\`
-- \`summary\` is the durable record of this node. \`handoff\` is injected into the next agent assignment; use it for requested repairs, risks, unresolved non-blockers, or precise next actions. Omit \`handoff\` when there is nothing useful to carry forward.
-
-Unable to continue this node:
-- \`POST {{callback_base}}fail\`
-- \`{"reason":"The concrete blocker or unrecoverable failure."}\`
-
-Before becoming idle, you must have sent \`ask\`, \`complete\`, or \`fail\`. A comment is not a terminal callback.`;
-
-export const PRE_DURABLE_BUNDLE_ASSIGNMENT_DEFAULT = PRE_MERGE_PROMPT_ASSIGNMENT_DEFAULT.replace(
-  "Never merge a pull request automatically.",
-  "Never merge a pull request unless the current node instructions explicitly authorize it and their preconditions are satisfied.",
-);
 
 const ASSIGNMENT_DEFAULT = `# Work assignment
 
@@ -235,80 +47,7 @@ Use your normal tools, credentials, judgment, planning, and subagents. Work auto
 
 Do not rely on this bootstrap message as the complete contract. The generated files contain the ticket, incoming handoff, node instructions, allowed outcomes, and callback schemas.`;
 
-const PRE_WORKFLOW_DATA_ASSIGNMENT_DEFAULT = PRE_MERGE_PROMPT_ASSIGNMENT_DEFAULT
-  .replace("- Prior node output (configured tail): {{incoming_output}}\n- Full prior output log: {{incoming_output_log}}\n", "")
-  .replace("Ticket-scoped workflow metadata:\n- Read all: `GET {{callback_base}}metadata`\n- Read one key: `GET {{callback_base}}metadata/<key>`\n- Write one JSON value: `PUT {{callback_base}}metadata/<key>` with `{\"value\":<any JSON value>}`\n\n", "");
-const PRE_WORKFLOW_DATA_CURRENT_ASSIGNMENT_DEFAULT = PRE_WORKFLOW_DATA_ASSIGNMENT_DEFAULT.replace(
-  "Never merge a pull request automatically.",
-  "Never merge a pull request unless the current node instructions explicitly authorize it and their preconditions are satisfied.",
-);
-
-export const PRE_BRANCH_SPECIFICATION_DEFAULT = "Create or update the task specification in the primary repository. Commit and push it on the task branch you choose, then open or update an evolving draft PR. Complete with a summary and the primary repository PR URL.";
-export const PRE_BRANCH_IMPLEMENTATION_DEFAULT = "Implement the ticket autonomously. You own repository inspection, Git branches, changes, verification, commits, pushes, and draft PRs. Complete with a summary and all known repository PR URLs.";
-export const PRE_CALLBACK_SCHEMA_REMINDER_DEFAULT = "The ticket is still leased because no callback was recorded. Submit complete, ask, or fail before ending this assignment.";
-
 const REPOSITORY_START_GUIDANCE = `Before beginning new work in a repository, inspect its worktree, identify the remote default branch (normally main or master), switch to that branch, and pull or fast-forward it to the latest remote state before creating the task branch. If this is a feedback, repair, or other resumed iteration with an existing task branch or PR, continue that branch instead and integrate the latest default branch safely when appropriate. Preserve unrelated local changes; never reset or overwrite them.`;
-
-export const PRE_PROMPT_ENGINEERING_CALLBACK_REMINDER_DEFAULT = `Ticket {{ticket_id}} is still leased for {{phase}} at workflow node {{node_name}} ({{node_id}}) because no terminal callback was recorded. The earlier callback instructions may have been lost during context compaction. Allowed outcomes:\n{{allowed_outcomes}}\n\nSend an HTTP POST with Content-Type: application/json to one of the lease-fenced endpoints below, replacing example values with the real result.
-
-Non-terminal note; continue working afterward:
-- POST {{callback_base}}comment
-- Body: {"message":"A concise progress note, decision, or useful context."}
-
-Block for human input, then stop and wait. Questions may include any number of suggested options; the UI always permits a freeform answer:
-- POST {{callback_base}}ask
-- One question: {"question":"Which environment should receive the deployment?","options":["Development","Staging","Both"]}
-- Multiple questions: {"questions":[{"question":"Which compatibility target is required?","options":["Current major only","Current and previous major"]},{"question":"May I add a dependency?","options":["Yes","No"]}]}
-- Options may be omitted or empty, and a batch may contain plain question strings.
-
-Complete the active workflow node:
-- POST {{callback_base}}complete
-- Body: {"summary":"What was completed and how it was verified.","handoff":"Useful context for the next workflow node.","outcome":"one allowed outcome","pull_requests":[{"repository":"repository-id","url":"https://github.com/owner/repository/pull/123"}]}
-
-Complete review:
-- POST {{callback_base}}complete
-- Approved: {"summary":"Review result and any non-blocking findings.","outcome":"approved"}
-- Changes requested: {"summary":"Blocking findings; PR comments were added.","outcome":"changes_requested"}
-- Legacy V2 review callbacks accepted: {"summary":"Review result.","decision":"approved"} or {"summary":"Blocking findings.","decision":"changes_requested"}
-
-Fail only when the phase cannot be completed or continued:
-- POST {{callback_base}}fail
-- Body: {"reason":"Why the work cannot continue."}
-
-Before becoming idle, call ask if human input is required, complete if the phase is done, or fail if it cannot continue. A comment alone is not a terminal callback.`;
-
-export const PRE_TYPED_OUTCOME_CALLBACK_REMINDER_DEFAULT = PRE_PROMPT_ENGINEERING_CALLBACK_REMINDER_DEFAULT
-  .replace(" The earlier callback instructions may have been lost during context compaction. Allowed outcomes:\n{{allowed_outcomes}}\n\nSend", " Allowed outcomes: {{allowed_outcomes}}. The earlier callback instructions may have been lost during context compaction. Send")
-  .replace(',"handoff":"Useful context for the next workflow node."', "");
-
-export const PRE_V3_CALLBACK_REMINDER_DEFAULT = PRE_TYPED_OUTCOME_CALLBACK_REMINDER_DEFAULT
-  .replace(" at workflow node {{node_name}} ({{node_id}})", "")
-  .replace(" Allowed outcomes: {{allowed_outcomes}}.", "")
-  .replace("Complete the active workflow node:", "Complete specification or implementation:")
-  .replace(',"outcome":"one allowed outcome"', "")
-  .replace(',"outcome":"approved"', ',"decision":"approved"')
-  .replace(',"outcome":"changes_requested"', ',"decision":"changes_requested"')
-  .replace('\n- Legacy V2 review callbacks accepted: {"summary":"Review result.","decision":"approved"} or {"summary":"Blocking findings.","decision":"changes_requested"}', "");
-
-export const PRE_DURABLE_BUNDLE_CALLBACK_REMINDER_DEFAULT = `# Callback required
-
-Ticket {{ticket_id}} is still leased for {{phase}} at workflow node **{{node_name}}** (\`{{node_id}}\`). Herdr became idle or done, but the tracker received no terminal callback. The earlier contract may have been lost during context compaction.
-
-Allowed outcome IDs:
-
-{{allowed_outcomes}}
-
-Send one JSON request with \`Content-Type: application/json\`:
-
-- Need human input, then stop: \`POST {{callback_base}}ask\`
-  - \`{"question":"Focused question","options":["Optional suggestion"]}\`
-  - or \`{"questions":[{"question":"First question","options":[]},{"question":"Second question","options":["A","B"]}]}\`
-- Node complete: \`POST {{callback_base}}complete\`
-  - \`{"outcome":"<exact allowed outcome ID>","summary":"Work performed, decisions, and verification.","handoff":"Actionable context for the next node.","pull_requests":[{"repository":"repository-id","url":"https://github.com/owner/repository/pull/123"}]}\`
-- Cannot continue: \`POST {{callback_base}}fail\`
-  - \`{"reason":"Concrete blocker or unrecoverable failure."}\`
-
-Use \`summary\` as the durable record. Use \`handoff\` for information the next node must act on; omit it if none. A comment does not release this lease.`;
 
 const CALLBACK_REMINDER_DEFAULT = `# Callback required
 
@@ -323,12 +62,6 @@ Then use the callback helper at this exact path before becoming idle:
 \`{{callback_helper_path}}\`
 
 Run \`{{callback_helper_path}} schema complete\` to recover the completion payload contract and allowed outcome example. The full callback documentation is in \`{{assignment_directory}}/callbacks.md\`.`;
-
-export const PRE_PROMPT_ENGINEERING_SPECIFICATION_DEFAULT = `${REPOSITORY_START_GUIDANCE}\n\nCreate or update the task specification in the primary repository. Commit and push it on the task branch you choose, then open or update an evolving draft PR. Complete with a summary and the primary repository PR URL.`;
-export const PRE_PROMPT_ENGINEERING_IMPLEMENTATION_DEFAULT = `${REPOSITORY_START_GUIDANCE}\n\nImplement the ticket autonomously. You own repository inspection, Git branches, changes, verification, commits, pushes, and draft PRs. Complete with a summary and all known repository PR URLs.`;
-export const PRE_PROMPT_ENGINEERING_REVIEW_DEFAULT = "Perform an independent review and add useful PR comments. Report approved or changes_requested. Do not repair the implementation; repairs return to the implementation conversation.";
-
-export const PRE_DURABLE_BUNDLE_GUIDANCE_DEFAULT = "Human guidance for {{ticket_id}}: {{message}}\nReread the authoritative ticket before continuing.";
 
 const DEFAULTS: Record<PromptName, string> = {
   assignment: ASSIGNMENT_DEFAULT,
@@ -384,7 +117,7 @@ const TAGS: Record<string, TagDefinition> = {
   ticket_id: { name: "ticket_id", description: "Stable tracker or Jira ticket identifier.", example: "AGENT-0042" },
   phase: { name: "phase", description: "The durable work phase being assigned.", example: "implementation" },
   ticket_path: { name: "ticket_path", description: "Absolute path to the authoritative Markdown ticket on the supervisor host.", example: "/srv/tickets/AGENT-0042.md" },
-  ticket_markdown: { name: "ticket_markdown", description: "Complete current Markdown ticket, including frontmatter and interaction history.", example: "---\nid: AGENT-0042\nwork_provider: claude\nreview_provider: codex\n...\n---\n\n# Goal\n\nAdd a health endpoint." },
+  ticket_markdown: { name: "ticket_markdown", description: "Complete current Markdown ticket, including its pinned workflow runtime and interaction history.", example: "---\nid: AGENT-0042\nworkflow:\n  id: standard-delivery\n  current_node: implementation\n...\n---\n\n# Goal\n\nAdd a health endpoint." },
   project_root: { name: "project_root", description: "Resolved supervisor project root used as the Herdr workspace working directory.", example: "/srv/agent-workspaces/supervisor-a" },
   phase_instructions: { name: "phase_instructions", description: "Rendered specification, implementation, or review prompt selected for the current phase.", example: "Implement the ticket autonomously..." },
   callback_base: { name: "callback_base", description: "Lease-fenced REST callback base for this assignment.", example: "http://tracker:4310/api/work/dummy-lease/" },
@@ -457,7 +190,7 @@ const DEFINITIONS: Record<PromptName, PromptDefinition> = {
     name: "guidance", title: "Live guidance", purpose: "A follow-up message injected into an already-running ticket conversation.",
     trigger: "Operator guidance, answered agent questions, and live ticket edits that request a reread.", stages: ["Running", "Question answered", "Live edit"],
     allowed_tags: ["ticket_id", "message", "assignment_directory", "start_here_path", "callback_helper_path", "update_path"],
-    required_tags: ["message", "update_path", "start_here_path", "callback_helper_path"],
+    required_tags: ["update_path", "start_here_path", "callback_helper_path"],
   },
   "callback-reminder": {
     name: "callback-reminder", title: "Callback reminder", purpose: "A one-time reminder that semantic completion requires a callback.",
@@ -528,24 +261,6 @@ export class PromptLibrary {
         } catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
       }
       await mkdir(join(this.directory, ".versions"), { recursive: true });
-      const olderDefaults: Partial<Record<PromptName, string[]>> = {
-        assignment: [LEGACY_ASSIGNMENT_DEFAULT, BATCH_QUESTION_ASSIGNMENT_DEFAULT, PRE_PROJECT_ROOT_ASSIGNMENT_DEFAULT, PRE_V3_ASSIGNMENT_DEFAULT, PRE_TYPED_OUTCOME_ASSIGNMENT_DEFAULT, PRE_PROMPT_ENGINEERING_ASSIGNMENT_DEFAULT, PRE_WORKFLOW_DATA_ASSIGNMENT_DEFAULT, PRE_WORKFLOW_DATA_CURRENT_ASSIGNMENT_DEFAULT, PRE_MERGE_PROMPT_ASSIGNMENT_DEFAULT, PRE_DURABLE_BUNDLE_ASSIGNMENT_DEFAULT],
-        specification: [PRE_BRANCH_SPECIFICATION_DEFAULT, PRE_PROMPT_ENGINEERING_SPECIFICATION_DEFAULT],
-        implementation: [PRE_BRANCH_IMPLEMENTATION_DEFAULT, PRE_PROMPT_ENGINEERING_IMPLEMENTATION_DEFAULT],
-        review: [PRE_PROMPT_ENGINEERING_REVIEW_DEFAULT],
-        guidance: [PRE_DURABLE_BUNDLE_GUIDANCE_DEFAULT],
-        "callback-reminder": [PRE_CALLBACK_SCHEMA_REMINDER_DEFAULT, PRE_V3_CALLBACK_REMINDER_DEFAULT, PRE_TYPED_OUTCOME_CALLBACK_REMINDER_DEFAULT, PRE_PROMPT_ENGINEERING_CALLBACK_REMINDER_DEFAULT, PRE_DURABLE_BUNDLE_CALLBACK_REMINDER_DEFAULT],
-      };
-      for (const [name, older] of Object.entries(olderDefaults) as [PromptName, string[]][]) {
-        const path = join(this.directory, `${name}.md`);
-        const current = await readFile(path, "utf8");
-        if (!older.some((content) => current === `${content.trim()}\n`)) continue;
-        const temporary = join(this.directory, `.${name}.${process.pid}.${randomUUID()}.tmp`);
-        const handle = await open(temporary, "wx", 0o600);
-        try { await handle.writeFile(`${DEFAULTS[name].trim()}\n`); await handle.sync(); } finally { await handle.close(); }
-        try { await rename(temporary, path); }
-        catch (error) { await rm(temporary, { force: true }); throw error; }
-      }
       try { const directory = await open(this.directory, "r"); await directory.sync(); await directory.close(); } catch { /* not supported everywhere */ }
       for (const name of PROMPT_NAMES) {
         const content = await readFile(join(this.directory, `${name}.md`), "utf8");
@@ -587,7 +302,9 @@ export class PromptLibrary {
     let errors: string[] = [];
     try { renderPrompt(definition.name, content, DUMMY_VALUES); }
     catch (error) { errors = error instanceof HttpError && Array.isArray(error.details) ? error.details as string[] : [(error as Error).message]; }
-    return { ...definition, content, revision: digest(content), tags: definition.allowed_tags.map((tag) => TAGS[tag]!), valid: errors.length === 0, errors };
+    const revisionId = digest(content);
+    await this.archive(definition.name, revisionId, content);
+    return { ...definition, content, revision: revisionId, version: await artifactVersion(this.directory, definition.name, revisionId), tags: definition.allowed_tags.map((tag) => TAGS[tag]!), valid: errors.length === 0, errors };
   }
 
   async list(): Promise<PromptDocument[]> {
@@ -641,6 +358,21 @@ export class PromptLibrary {
       await this.archive(name, digest(normalized), normalized);
       return this.get(name);
     });
+  }
+
+  async restore(name: string, expectedRevision: string): Promise<PromptDocument> {
+    if (!PROMPT_NAMES.includes(name as PromptName)) throw new HttpError(409, `Prompt ${name} has no built-in default`);
+    return this.update(name, DEFAULTS[name as PromptName], expectedRevision);
+  }
+
+  async restoreAll(): Promise<PromptDocument[]> {
+    const output: PromptDocument[] = [];
+    for (const name of PROMPT_NAMES) {
+      const current = await this.get(name);
+      const normalizedDefault = `${DEFAULTS[name].trim()}\n`;
+      output.push(current.content === normalizedDefault ? current : await this.update(name, normalizedDefault, current.revision));
+    }
+    return output;
   }
 
   async preview(name: string, content: string, phase: PreviewPhase = "implementation"): Promise<string> {

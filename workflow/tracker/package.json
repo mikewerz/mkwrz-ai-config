@@ -16,7 +16,8 @@
     "start": "node dist/server/index.js",
     "typecheck": "tsc -p tsconfig.server.json --noEmit && tsc -p tsconfig.client.json --noEmit",
     "test": "vitest run",
-    "verify": "npm run typecheck && npm test && npm run build"
+    "verify": "npm run typecheck && npm test && npm run build",
+    "artifacts:diagnose": "npm run build:server && node dist/server/artifact-diagnostics.js"
   },
   "dependencies": {
     "chokidar": "^4.0.3",

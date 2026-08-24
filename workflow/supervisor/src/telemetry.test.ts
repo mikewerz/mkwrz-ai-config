@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { rm } from "node:fs/promises";
-import { TelemetryCollector, type HarnessTelemetryAdapter } from "./telemetry.js";
+import { TelemetryCollector, type HarnessTelemetryAdapter, zeroTelemetryBaseline } from "./telemetry.js";
 
 const roots: string[] = [];
 afterEach(async () => Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true }))));
@@ -20,6 +20,36 @@ async function jsonl(path: string, entries: unknown[]): Promise<void> {
 }
 
 describe("TelemetryCollector", () => {
+  it("uses zero usage for a new session baseline captured before the first token event", () => {
+    const baseline = zeroTelemetryBaseline({
+      schema_version: 1,
+      harness: "codex",
+      session_ref: "new-session",
+      observed_at: "2026-08-20T23:03:26.473Z",
+      source: { kind: "session_log", detail: "/tmp/new-session.jsonl" },
+      model: { id: "gpt-5.6-sol", provider: "openai", observed_ids: ["gpt-5.6-sol"] },
+      reasoning: { effort: "high", enabled: true, source: "session" },
+      usage: null,
+      cost: { total_usd: null, kind: "unavailable" },
+      context: { used_tokens: null, window_tokens: 258_400, used_percent: null },
+      rate_limits: [{ id: "codex:primary", name: null, used_percent: 31, window_minutes: 10_080, resets_at: "2026-08-27T04:25:50.000Z" }],
+      attributes: {},
+    });
+
+    expect(baseline).toMatchObject({
+      usage: {
+        input_tokens: 0,
+        cached_input_tokens: 0,
+        cache_write_input_tokens: 0,
+        output_tokens: 0,
+        reasoning_output_tokens: 0,
+        total_tokens: 0,
+      },
+      context: { used_tokens: 0, window_tokens: 258_400, used_percent: 0 },
+      rate_limits: [{ id: "codex:primary", used_percent: 31, window_minutes: 10_080 }],
+    });
+  });
+
   it("reads cumulative Codex token usage, exact model, effort, context, and rate limits", async () => {
     const home = await root();
     await jsonl(join(home, "codex", "sessions", "2026", "session-codex.jsonl"), [

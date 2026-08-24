@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { accessSync, constants } from "node:fs";
 import { hostname, networkInterfaces } from "node:os";
 import { resolve } from "node:path";
 import { loadEnvFile } from "node:process";
@@ -16,7 +17,21 @@ const trackerUrl = process.env.TRACKER_URL ?? "http://127.0.0.1:4310";
 const projectRoot = resolve(process.env.PROJECT_ROOT ?? process.cwd());
 const assignmentRoot = resolve(process.env.ASSIGNMENT_ROOT ?? resolve(projectRoot, ".agentic-assignments"));
 const herdrSession = process.env.HERDR_SESSION ?? "agentic-projects";
-const herdr = new HerdrController(new HerdrCli(herdrSession), projectRoot);
+const agentExecutionEnabled = process.env.AGENT_EXECUTION_ENABLED !== "false";
+const configuredHerdrExecutable = process.env.HERDR_EXECUTABLE?.trim();
+const herdrTestDouble = process.env.HERDR_TEST_DOUBLE === "true";
+const herdrCommandTimeoutMs = Number(process.env.HERDR_COMMAND_TIMEOUT_MS ?? 45_000);
+if (!Number.isFinite(herdrCommandTimeoutMs) || herdrCommandTimeoutMs < 1_000) throw new Error("HERDR_COMMAND_TIMEOUT_MS must be at least 1000");
+if (configuredHerdrExecutable && !configuredHerdrExecutable.startsWith("/")) throw new Error("HERDR_EXECUTABLE must be an absolute path");
+if (configuredHerdrExecutable) accessSync(configuredHerdrExecutable, constants.X_OK);
+if (herdrTestDouble && process.env.NODE_ENV !== "test") throw new Error("HERDR_TEST_DOUBLE is permitted only when NODE_ENV=test");
+if (process.env.NODE_ENV === "test" && agentExecutionEnabled && (!configuredHerdrExecutable || !herdrTestDouble)) {
+  throw new Error("Test supervisors with agent execution enabled require an explicit HERDR_EXECUTABLE and HERDR_TEST_DOUBLE=true");
+}
+const herdr = new HerdrController(new HerdrCli(herdrSession, configuredHerdrExecutable || "herdr", herdrCommandTimeoutMs), projectRoot, {
+  agentReadyTimeoutMs: Number(process.env.AGENT_START_READY_TIMEOUT_MS ?? 30_000),
+  agentReadySettleMs: Number(process.env.AGENT_START_READY_SETTLE_MS ?? 10_000),
+});
 const detectedIps = Object.values(networkInterfaces()).flatMap((addresses) => addresses ?? [])
   .filter((address) => address.family === "IPv4" && !address.internal).map((address) => address.address);
 const supervisor = new Supervisor(herdr, {
@@ -26,6 +41,12 @@ const supervisor = new Supervisor(herdr, {
   heartbeatIntervalMs: Number(process.env.HEARTBEAT_INTERVAL_MS ?? 30_000),
   idlePollMs: Number(process.env.IDLE_POLL_MS ?? 5_000),
   assignmentRoot,
+  agentExecutionEnabled,
+  trackerRequestTimeoutMs: Number(process.env.TRACKER_REQUEST_TIMEOUT_MS ?? 15_000),
+  trackerClaimTimeoutMs: Number(process.env.TRACKER_CLAIM_TIMEOUT_MS ?? 45_000),
+  trackerArtifactTimeoutMs: Number(process.env.TRACKER_ARTIFACT_TIMEOUT_MS ?? 300_000),
+  callbackReminderGraceMs: Number(process.env.CALLBACK_REMINDER_GRACE_MS ?? 60_000),
+  assignmentPromptRecoveryMs: Number(process.env.ASSIGNMENT_PROMPT_RECOVERY_MS ?? 30_000),
   ...(process.env.CALLBACK_BASE_URL ? { callbackBaseUrl: process.env.CALLBACK_BASE_URL } : {}),
   presence: {
     instanceId: randomUUID(),

@@ -11,6 +11,7 @@ class FakeRunner implements CommandRunner {
       focused: false, cwd: "/srv/projects", foreground_cwd: "/srv/projects/demo",
       terminal_title: "⠋ Running tests", terminal_title_stripped: "Running tests", revision: 12,
       tokens: { model: "opus" }, agent_session: { source: "herdr:claude", kind: "id", value: "session-1" },
+      interactive_ready: true, launch_pending: false,
     } } };
     return { result: {} };
   }
@@ -21,7 +22,7 @@ describe("HerdrController", () => {
 
   it("creates a workspace without creating filesystem worktrees and starts an agent", async () => {
     const runner = new FakeRunner();
-    const controller = new HerdrController(runner, "/srv/projects");
+    const controller = new HerdrController(runner, "/srv/projects", { agentReadySettleMs: 0 });
     const observation = await controller.ensureAgent("APT-42", "claude", "work", null, null);
     expect(observation).toMatchObject({
       paneId: "w1:p1", state: "working", sessionRef: "session-1", workspaceId: "w1", tabId: "w1:t1",
@@ -52,7 +53,7 @@ describe("HerdrController", () => {
           stderr: '{"error":{"code":"agent_pane_busy"}}\n',
         });
       }
-      if (args[0] === "agent" && args[1] === "get") return { result: { agent: { agent_status: "working" } } };
+      if (args[0] === "agent" && args[1] === "get") return { result: { agent: { agent_status: "working", interactive_ready: true, launch_pending: false } } };
       return { result: {} };
     });
     const pending = new HerdrController({ run }, "/srv/projects").ensureAgent("APT-42", "claude", "work", null, null);
@@ -70,7 +71,7 @@ describe("HerdrController", () => {
     const run = vi.fn(async (args: string[]) => {
       if (args[0] === "agent" && args[1] === "get") {
         if (++observations === 1) throw new Error("saved pane has no attached agent");
-        return { result: { agent: { agent_status: "working", agent_session: { value: "session-1" } } } };
+        return { result: { agent: { agent_status: "working", interactive_ready: true, launch_pending: false, agent_session: { value: "session-1" } } } };
       }
       if (args[0] === "agent" && args[1] === "start" && ++starts === 1) {
         throw Object.assign(new Error("pane shell is still starting"), {
@@ -113,6 +114,28 @@ describe("HerdrController", () => {
     expect(failedRun.mock.calls.filter(([args]) => args[0] === "agent" && args[1] === "start")).toHaveLength(1);
   });
 
+  it("waits for interactive readiness to settle before returning a newly started agent", async () => {
+    vi.useFakeTimers();
+    let observations = 0;
+    const run = vi.fn(async (args: string[]) => {
+      if (args[0] === "workspace") return { result: { root_pane: { pane_id: "w1:p1" } } };
+      if (args[0] === "agent" && args[1] === "get") {
+        observations += 1;
+        const ready = observations >= 3;
+        return { result: { agent: { agent_status: "idle", interactive_ready: ready, launch_pending: !ready } } };
+      }
+      return { result: {} };
+    });
+    const pending = new HerdrController({ run }, "/srv/projects", {
+      agentReadyTimeoutMs: 5_000, agentReadySettleMs: 1_000,
+    }).ensureAgent("APT-42", "claude", "work", null, null);
+
+    await vi.runAllTimersAsync();
+
+    await expect(pending).resolves.toMatchObject({ interactiveReady: true, launchPending: false });
+    expect(observations).toBeGreaterThanOrEqual(5);
+  });
+
   it("confirms assignment activity and treats only Herdr's stalled result as ineffective", async () => {
     const run = vi.fn()
       .mockResolvedValueOnce({ result: { agent: { agent_status: "done" } } })
@@ -136,6 +159,18 @@ describe("HerdrController", () => {
     });
     const controller = new HerdrController({ run: vi.fn().mockRejectedValue(failure) } as CommandRunner, "/srv/projects");
     await expect(controller.promptAndConfirm("w1:p1", "Assignment")).rejects.toBe(failure);
+  });
+
+  it("reads unwrapped pane text and can submit a staged composer", async () => {
+    const run = vi.fn().mockResolvedValue({ result: { accepted: true } });
+    const runText = vi.fn().mockResolvedValue("durable/path/START_HERE.md");
+    const controller = new HerdrController({ run, runText }, "/srv/projects");
+
+    await expect(controller.readText("w1:p1")).resolves.toBe("durable/path/START_HERE.md");
+    await controller.sendKeys("w1:p1", "enter");
+
+    expect(runText).toHaveBeenCalledWith(["agent", "read", "w1:p1", "--source", "recent-unwrapped", "--lines", "120"]);
+    expect(run).toHaveBeenCalledWith(["agent", "send-keys", "w1:p1", "enter"]);
   });
 
   it("interrupts the active agent through Herdr terminal input", async () => {

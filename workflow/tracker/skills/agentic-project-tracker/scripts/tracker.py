@@ -5,8 +5,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import mimetypes
 import os
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any, Callable
 from urllib.error import HTTPError, URLError
@@ -15,7 +17,6 @@ from urllib.request import Request, urlopen
 
 
 PROVIDERS = ("claude", "codex")
-REVIEW_PROVIDERS = ("claude", "codex")
 PHASES = ("specification", "implementation", "review")
 PRODUCTION_RESULTS = ("unassessed", "succeeded", "failed", "rolled_back", "not_deployed")
 DEFAULT_URL = os.environ.get("AGENTIC_PROJECT_TRACKER_URL", "http://127.0.0.1:4310")
@@ -43,11 +44,21 @@ class TrackerClient:
 
     def request(self, method: str, path: str, payload: Any | None = None) -> tuple[int, Any]:
         data = None if payload is None else json.dumps(payload).encode("utf-8")
+        status, body, content_type = self.request_raw(
+            method, path, data, {"Accept": "application/json", "Content-Type": "application/json"},
+        )
+        if content_type.startswith("text/"):
+            return status, body.decode("utf-8", errors="replace")
+        return status, decode_body(body)
+
+    def request_raw(
+        self, method: str, path: str, data: bytes | None = None, headers: dict[str, str] | None = None,
+    ) -> tuple[int, bytes, str]:
         request = Request(
             f"{self.base_url}{path}",
             data=data,
             method=method,
-            headers={"Accept": "application/json", "Content-Type": "application/json"},
+            headers=headers or {},
         )
         try:
             with urlopen(request, timeout=self.timeout) as response:
@@ -61,9 +72,7 @@ class TrackerClient:
             raise ClientFailure(f"Unable to reach tracker: {error.reason}") from error
         except TimeoutError as error:
             raise ClientFailure("Tracker request timed out") from error
-        if content_type.startswith("text/"):
-            return status, body.decode("utf-8", errors="replace")
-        return status, decode_body(body)
+        return status, body, content_type
 
 
 def decode_body(body: bytes) -> Any:
@@ -87,6 +96,32 @@ def read_text(path: str) -> str:
         return Path(path).read_text(encoding="utf-8")
     except OSError as error:
         raise ClientFailure(f"Unable to read {path}: {error}") from error
+
+
+def read_bytes(path: str) -> bytes:
+    try:
+        return Path(path).read_bytes()
+    except OSError as error:
+        raise ClientFailure(f"Unable to read {path}: {error}") from error
+
+
+def write_download(path: str, content: bytes, force: bool) -> str:
+    destination = Path(path).expanduser().resolve()
+    if destination.exists() and not force:
+        raise ClientFailure(f"Refusing to overwrite {destination}; pass --force to replace it")
+    try:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(prefix=f".{destination.name}.", dir=destination.parent, delete=False) as output:
+            temporary = Path(output.name)
+            output.write(content)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary, destination)
+    except OSError as error:
+        if "temporary" in locals():
+            temporary.unlink(missing_ok=True)
+        raise ClientFailure(f"Unable to write {destination}: {error}") from error
+    return str(destination)
 
 
 def read_json(path: str) -> Any:
@@ -157,8 +192,20 @@ def cmd_health(client: TrackerClient, _args: argparse.Namespace) -> tuple[int, A
     return get(client, "/api/health")
 
 
+def cmd_readiness(client: TrackerClient, _args: argparse.Namespace) -> tuple[int, Any]:
+    return get(client, "/api/readyz")
+
+
+def cmd_operations(client: TrackerClient, _args: argparse.Namespace) -> tuple[int, Any]:
+    return get(client, "/api/operations")
+
+
 def cmd_runtime(client: TrackerClient, _args: argparse.Namespace) -> tuple[int, Any]:
     return get(client, "/api/runtime")
+
+
+def cmd_intake_show(client: TrackerClient, _args: argparse.Namespace) -> tuple[int, Any]:
+    return get(client, "/api/intake")
 
 
 def cmd_supervisor_list(client: TrackerClient, _args: argparse.Namespace) -> tuple[int, Any]:
@@ -174,7 +221,47 @@ def cmd_workflow_list(client: TrackerClient, _args: argparse.Namespace) -> tuple
 
 
 def cmd_workflow_show(client: TrackerClient, args: argparse.Namespace) -> tuple[int, Any]:
-    return get(client, f"/api/workflows/{encoded(args.id)}")
+    path = f"/api/workflows/{encoded(args.id)}"
+    if args.revision:
+        path += f"/revisions/{encoded(args.revision)}"
+    return get(client, path)
+
+
+def cmd_workflow_releases(client: TrackerClient, _args: argparse.Namespace) -> tuple[int, Any]:
+    return get(client, "/api/workflow-releases")
+
+
+def metrics_query(args: argparse.Namespace, include_workflow: bool) -> str:
+    values: dict[str, str] = {}
+    for name in ("from_date", "to_date", "production_result"):
+        value = getattr(args, name, None)
+        if value:
+            values[{"from_date": "from", "to_date": "to"}.get(name, name)] = value
+    if args.labels:
+        values["labels"] = ",".join(args.labels)
+        values["label_mode"] = args.label_mode
+    if args.repositories:
+        values["repositories"] = ",".join(args.repositories)
+    if include_workflow:
+        if args.workflow_id:
+            values["workflow_id"] = args.workflow_id
+        if args.workflow_revision:
+            values["workflow_revision"] = args.workflow_revision
+    return f"?{urlencode(values)}" if values else ""
+
+
+def cmd_metrics_show(client: TrackerClient, args: argparse.Namespace) -> tuple[int, Any]:
+    return get(client, f"/api/metrics{metrics_query(args, True)}")
+
+
+def cmd_metrics_compare(client: TrackerClient, args: argparse.Namespace) -> tuple[int, Any]:
+    query = metrics_query(args, False)
+    values = {
+        "left_id": args.baseline_id, "left_revision": args.baseline_revision,
+        "right_id": args.candidate_id, "right_revision": args.candidate_revision,
+    }
+    separator = "&" if query else "?"
+    return get(client, f"/api/metrics/compare{query}{separator}{urlencode(values)}")
 
 
 def cmd_ticket_list(client: TrackerClient, args: argparse.Namespace) -> tuple[int, Any]:
@@ -186,8 +273,6 @@ def cmd_ticket_list(client: TrackerClient, args: argparse.Namespace) -> tuple[in
     filters = {
         "phase": args.phase,
         "status": args.status,
-        "work_provider": args.work_provider,
-        "review_provider": args.review_provider,
         "workflow_id": args.workflow_id,
         "workflow_node_name": args.workflow_node,
         "workflow_stage_name": args.workflow_stage,
@@ -210,6 +295,58 @@ def cmd_ticket_run_output(client: TrackerClient, args: argparse.Namespace) -> tu
     if not isinstance(output, str):
         raise ClientFailure("Tracker returned invalid node-run output")
     return status, {"ticket_id": args.id, "run_id": args.run_id, "output": output}
+
+
+def cmd_ticket_checkpoints(client: TrackerClient, args: argparse.Namespace) -> tuple[int, Any]:
+    return get(client, f"/api/tickets/{encoded(args.id)}/checkpoints")
+
+
+def download_ticket_content(client: TrackerClient, args: argparse.Namespace, kind: str) -> tuple[int, Any]:
+    resource_id = args.attachment_id if kind == "attachment" else args.artifact_id
+    plural = "attachments" if kind == "attachment" else "artifacts"
+    status, content, content_type = client.request_raw(
+        "GET",
+        f"/api/tickets/{encoded(args.id)}/{plural}/{encoded(resource_id)}/content?download=true",
+        headers={"Accept": "*/*"},
+    )
+    output = write_download(args.output, content, args.force)
+    return status, {
+        "ticket_id": args.id, f"{kind}_id": resource_id, "output": output,
+        "size_bytes": len(content), "content_type": content_type,
+    }
+
+
+def cmd_ticket_attachment_upload(client: TrackerClient, args: argparse.Namespace) -> tuple[int, Any]:
+    content = read_bytes(args.file)
+    filename = args.filename or Path(args.file).name
+    if not filename:
+        raise ClientFailure("Attachment filename must not be empty")
+    content_type = args.content_type or mimetypes.guess_type(filename)[0] or "application/octet-stream"
+    query = urlencode({"filename": filename, "expected_revision": args.revision})
+    status, body, response_type = client.request_raw(
+        "POST", f"/api/tickets/{encoded(args.id)}/attachments?{query}", content,
+        {
+            "Accept": "application/json", "Content-Type": "application/octet-stream",
+            "X-Attachment-Content-Type": content_type,
+        },
+    )
+    if response_type.startswith("text/"):
+        return status, body.decode("utf-8", errors="replace")
+    return status, decode_body(body)
+
+
+def cmd_ticket_attachment_download(client: TrackerClient, args: argparse.Namespace) -> tuple[int, Any]:
+    return download_ticket_content(client, args, "attachment")
+
+
+def cmd_ticket_artifact_download(client: TrackerClient, args: argparse.Namespace) -> tuple[int, Any]:
+    return download_ticket_content(client, args, "artifact")
+
+
+def cmd_ticket_attachment_remove(client: TrackerClient, args: argparse.Namespace) -> tuple[int, Any]:
+    return delete(client, f"/api/tickets/{encoded(args.id)}/attachments/{encoded(args.attachment_id)}", {
+        "expected_revision": args.revision,
+    })
 
 
 def cmd_ticket_metadata_list(client: TrackerClient, args: argparse.Namespace) -> tuple[int, Any]:
@@ -254,6 +391,8 @@ def cmd_ticket_create(client: TrackerClient, args: argparse.Namespace) -> tuple[
         payload["filename"] = args.filename
     if args.workflow_id:
         payload["workflow_id"] = args.workflow_id
+    if args.workflow_revision:
+        payload["workflow_revision"] = args.workflow_revision
     if args.workflow_inputs_json:
         payload["workflow_inputs"] = read_mapping(args.workflow_inputs_json, "Workflow inputs", (bool, str))
     if args.stage_enabled_json:
@@ -261,23 +400,47 @@ def cmd_ticket_create(client: TrackerClient, args: argparse.Namespace) -> tuple[
     return post(client, "/api/tickets", payload)
 
 
+def cmd_ticket_emit_candidates(client: TrackerClient, args: argparse.Namespace) -> tuple[int, Any]:
+    candidates = read_json(args.candidates_json)
+    if not isinstance(candidates, list) or not candidates:
+        raise ClientFailure("Candidate JSON must be a non-empty array")
+    if any(not isinstance(candidate, dict) for candidate in candidates):
+        raise ClientFailure("Every candidate must be a JSON object")
+    return post(client, f"/api/tickets/{encoded(args.id)}/candidates", {
+        "source_id": args.source_id,
+        "candidates": candidates,
+    })
+
+
 def cmd_ticket_edit(client: TrackerClient, args: argparse.Namespace) -> tuple[int, Any]:
-    if args.mode == "rewind" and args.rewind_phase is None:
-        raise ClientFailure("--rewind-phase is required with --mode rewind")
-    if args.mode == "keep_phase" and args.rewind_phase is not None:
-        raise ClientFailure("--rewind-phase may only be used with --mode rewind")
-    payload: dict[str, Any] = {
+    payload = {
         "markdown": read_text(args.markdown_file),
         "expected_revision": args.revision,
-        "mode": args.mode,
     }
-    if args.rewind_phase:
-        payload["rewind_phase"] = args.rewind_phase
     return put(client, f"/api/tickets/{encoded(args.id)}", payload)
 
 
 def cmd_ticket_simple_action(client: TrackerClient, args: argparse.Namespace) -> tuple[int, Any]:
     return post(client, f"/api/tickets/{encoded(args.id)}/{args.api_action}", {
+        "expected_revision": args.revision,
+    })
+
+
+def cmd_ticket_priority(client: TrackerClient, args: argparse.Namespace) -> tuple[int, Any]:
+    return post(client, f"/api/tickets/{encoded(args.id)}/priority", {
+        "expected_revision": args.revision, "priority": args.priority,
+    })
+
+
+def cmd_ticket_human_estimate(client: TrackerClient, args: argparse.Namespace) -> tuple[int, Any]:
+    return post(client, f"/api/tickets/{encoded(args.id)}/human-estimate", {
+        "expected_revision": args.revision,
+        "estimated_human_days": None if args.clear else args.days,
+    })
+
+
+def cmd_ticket_reset_conversation(client: TrackerClient, args: argparse.Namespace) -> tuple[int, Any]:
+    return post(client, f"/api/tickets/{encoded(args.id)}/conversations/{encoded(args.key)}/reset", {
         "expected_revision": args.revision,
     })
 
@@ -313,13 +476,6 @@ def cmd_ticket_message_action(client: TrackerClient, args: argparse.Namespace) -
     })
 
 
-def cmd_ticket_phase_action(client: TrackerClient, args: argparse.Namespace) -> tuple[int, Any]:
-    return post(client, f"/api/tickets/{encoded(args.id)}/{args.api_action}", {
-        "expected_revision": args.revision,
-        "phase": args.phase,
-    })
-
-
 def cmd_ticket_answer(client: TrackerClient, args: argparse.Namespace) -> tuple[int, Any]:
     return post(client, f"/api/tickets/{encoded(args.id)}/questions/{encoded(args.question_id)}/answer", {
         "expected_revision": args.revision,
@@ -339,9 +495,21 @@ def cmd_ticket_decide(client: TrackerClient, args: argparse.Namespace) -> tuple[
 
 
 def cmd_ticket_migrate_workflow(client: TrackerClient, args: argparse.Namespace) -> tuple[int, Any]:
-    return post(client, f"/api/tickets/{encoded(args.id)}/workflow/migrate", {
+    payload = {
         "expected_revision": args.revision, "workflow_id": args.workflow_id, "node_id": args.node_id,
-    })
+    }
+    if args.workflow_revision:
+        payload["workflow_revision"] = args.workflow_revision
+    return post(client, f"/api/tickets/{encoded(args.id)}/workflow/migrate", payload)
+
+
+def cmd_ticket_checkpoint(client: TrackerClient, args: argparse.Namespace) -> tuple[int, Any]:
+    payload: dict[str, Any] = {
+        "expected_revision": args.revision, "action": args.checkpoint_action, "node_id": args.node_id,
+    }
+    if args.checkpoint_action == "restore":
+        payload["checkpoint_id"] = args.checkpoint_id
+    return post(client, f"/api/tickets/{encoded(args.id)}/checkpoints/action", payload)
 
 
 def cmd_jira_import(client: TrackerClient, args: argparse.Namespace) -> tuple[int, Any]:
@@ -371,7 +539,13 @@ def build_parser() -> argparse.ArgumentParser:
     resources = parser.add_subparsers(dest="resource", required=True)
 
     set_handler(resources.add_parser("health", help="Show tracker process health."), cmd_health)
+    set_handler(resources.add_parser("readiness", help="Check ticket-store, library, and background-operation readiness."), cmd_readiness)
+    set_handler(resources.add_parser("operations", help="Show detailed operational readiness and background-task status."), cmd_operations)
     set_handler(resources.add_parser("runtime", help="Show active ticket/Herdr observations."), cmd_runtime)
+
+    intake = resources.add_parser("intake", help="Inspect configured campaigns, sources, source runs, candidates, and capacity metrics.")
+    intake_commands = intake.add_subparsers(dest="intake_command", required=True)
+    set_handler(intake_commands.add_parser("show", help="Show the intake operations overview."), cmd_intake_show)
 
     supervisor = resources.add_parser("supervisor", help="Inspect reporting supervisors.")
     supervisor_commands = supervisor.add_subparsers(dest="supervisor_command", required=True)
@@ -384,9 +558,36 @@ def build_parser() -> argparse.ArgumentParser:
     workflow = resources.add_parser("workflow", help="Inspect workflow artifacts for ticket selection and controls.")
     workflow_commands = workflow.add_subparsers(dest="workflow_command", required=True)
     set_handler(workflow_commands.add_parser("list", help="List workflow artifacts."), cmd_workflow_list)
+    set_handler(workflow_commands.add_parser("releases", help="List default and trial workflow revisions."), cmd_workflow_releases)
     workflow_show = workflow_commands.add_parser("show", help="Show a workflow artifact.")
     workflow_show.add_argument("id")
+    workflow_show.add_argument("--revision", help="Show an exact immutable revision instead of the editor head.")
     set_handler(workflow_show, cmd_workflow_show)
+
+    metrics = resources.add_parser("metrics", help="Inspect factory and workflow-release metrics.")
+    metrics_commands = metrics.add_subparsers(dest="metrics_command", required=True)
+
+    def add_metrics_filters(command: argparse.ArgumentParser, include_workflow: bool) -> None:
+        command.add_argument("--from", dest="from_date", help="Include tickets created at or after this ISO date or timestamp.")
+        command.add_argument("--to", dest="to_date", help="Include tickets created at or before this ISO date or timestamp.")
+        command.add_argument("--label", dest="labels", action="append", default=[], help="Filter by a label; repeat for multiple labels.")
+        command.add_argument("--label-mode", choices=("any", "all"), default="any")
+        command.add_argument("--repository", dest="repositories", action="append", default=[], help="Filter by repository ID; repeat as needed.")
+        command.add_argument("--production-result", choices=PRODUCTION_RESULTS)
+        if include_workflow:
+            command.add_argument("--workflow-id")
+            command.add_argument("--workflow-revision")
+
+    metrics_show = metrics_commands.add_parser("show", help="Show platform, ticket, node, branch, cost, and duration metrics.")
+    add_metrics_filters(metrics_show, True)
+    set_handler(metrics_show, cmd_metrics_show)
+    metrics_compare = metrics_commands.add_parser("compare", help="Compare two exact immutable workflow releases.")
+    metrics_compare.add_argument("baseline_id")
+    metrics_compare.add_argument("baseline_revision")
+    metrics_compare.add_argument("candidate_id")
+    metrics_compare.add_argument("candidate_revision")
+    add_metrics_filters(metrics_compare, False)
+    set_handler(metrics_compare, cmd_metrics_compare)
 
     jira = resources.add_parser("jira", help="Import a Jira issue as a tracker ticket draft.")
     jira_commands = jira.add_subparsers(dest="jira_command", required=True)
@@ -400,9 +601,7 @@ def build_parser() -> argparse.ArgumentParser:
     ticket_list = ticket_commands.add_parser("list", help="List and locally filter ticket summaries.")
     ticket_list.add_argument("--include-archived", action="store_true")
     ticket_list.add_argument("--phase", choices=("specification", "implementation", "review", "done"))
-    ticket_list.add_argument("--status", choices=("pending", "ready", "running", "blocked", "waiting_approval", "completed", "failed", "cancelled"))
-    ticket_list.add_argument("--work-provider", choices=PROVIDERS)
-    ticket_list.add_argument("--review-provider", choices=REVIEW_PROVIDERS)
+    ticket_list.add_argument("--status", choices=("pending", "ready", "running", "blocked", "waiting_approval", "waiting_external", "completed", "failed", "cancelled"))
     ticket_list.add_argument("--workflow-id", help="Filter by pinned workflow artifact ID.")
     ticket_list.add_argument("--workflow-node", help="Filter by displayed current-node name.")
     ticket_list.add_argument("--workflow-stage", help="Filter by displayed current-stage name.")
@@ -417,6 +616,31 @@ def build_parser() -> argparse.ArgumentParser:
     add_ticket_id(ticket_run_output)
     ticket_run_output.add_argument("run_id", help="Node run ID returned by ticket show.")
     set_handler(ticket_run_output, cmd_ticket_run_output)
+    ticket_checkpoints = ticket_commands.add_parser("checkpoint-list", help="List tracker-hosted repository checkpoints for a ticket.")
+    add_ticket_id(ticket_checkpoints)
+    set_handler(ticket_checkpoints, cmd_ticket_checkpoints)
+    attachment_upload = ticket_commands.add_parser("attachment-upload", help="Attach a local file to a ticket.")
+    add_ticket_id(attachment_upload); add_revision(attachment_upload)
+    attachment_upload.add_argument("--file", required=True, help="Local file to upload.")
+    attachment_upload.add_argument("--filename", help="Stored filename; defaults to the local basename.")
+    attachment_upload.add_argument("--content-type", help="Media type; defaults to a filename-derived type.")
+    set_handler(attachment_upload, cmd_ticket_attachment_upload)
+    attachment_download = ticket_commands.add_parser("attachment-download", help="Download a ticket attachment to a local file.")
+    add_ticket_id(attachment_download)
+    attachment_download.add_argument("attachment_id", help="Attachment ID returned by ticket show.")
+    attachment_download.add_argument("--output", required=True, help="Local destination path.")
+    attachment_download.add_argument("--force", action="store_true", help="Replace an existing destination atomically.")
+    set_handler(attachment_download, cmd_ticket_attachment_download)
+    attachment_remove = ticket_commands.add_parser("attachment-remove", help="Remove a ticket attachment reference.")
+    add_ticket_id(attachment_remove); add_revision(attachment_remove)
+    attachment_remove.add_argument("attachment_id", help="Attachment ID returned by ticket show.")
+    set_handler(attachment_remove, cmd_ticket_attachment_remove)
+    artifact_download = ticket_commands.add_parser("artifact-download", help="Download a recorded tracker artifact to a local file.")
+    add_ticket_id(artifact_download)
+    artifact_download.add_argument("artifact_id", help="Artifact ID returned by ticket or node-run state.")
+    artifact_download.add_argument("--output", required=True, help="Local destination path.")
+    artifact_download.add_argument("--force", action="store_true", help="Replace an existing destination atomically.")
+    set_handler(artifact_download, cmd_ticket_artifact_download)
     ticket_metadata_list = ticket_commands.add_parser("metadata-list", help="Read all durable workflow metadata for a ticket.")
     add_ticket_id(ticket_metadata_list)
     set_handler(ticket_metadata_list, cmd_ticket_metadata_list)
@@ -444,17 +668,39 @@ def build_parser() -> argparse.ArgumentParser:
     ticket_create.add_argument("--auto-id", action="store_true", help="Replace the Markdown ID with an atomically allocated tracker ID.")
     ticket_create.add_argument("--filename", help="Optional storage filename hint.")
     ticket_create.add_argument("--workflow-id", help="Optional workflow artifact to pin; otherwise the tracker uses standard-delivery.")
+    ticket_create.add_argument("--workflow-revision", help="Optional active trial revision to pin instead of the workflow's default revision.")
     ticket_create.add_argument("--workflow-inputs-json", metavar="PATH", help="JSON object of declared workflow input values; use - for stdin.")
     ticket_create.add_argument("--stage-enabled-json", metavar="PATH", help="JSON object mapping configurable stage IDs to booleans; use - for stdin.")
     set_handler(ticket_create, cmd_ticket_create)
+
+    emit_candidates = ticket_commands.add_parser("emit-candidates", help="Submit child-work candidates through a configured intake source.")
+    add_ticket_id(emit_candidates)
+    emit_candidates.add_argument("source_id", help="Configured external or reusable intake source ID.")
+    emit_candidates.add_argument("--candidates-json", required=True, metavar="PATH", help="JSON array of candidate objects; use - for stdin.")
+    set_handler(emit_candidates, cmd_ticket_emit_candidates)
 
     ticket_edit = ticket_commands.add_parser("edit", help="Replace authoritative ticket Markdown.")
     add_ticket_id(ticket_edit)
     ticket_edit.add_argument("--markdown-file", required=True, help="Complete ticket Markdown path, or - for stdin.")
     add_revision(ticket_edit)
-    ticket_edit.add_argument("--mode", choices=("keep_phase", "rewind"), default="keep_phase")
-    ticket_edit.add_argument("--rewind-phase", choices=PHASES)
     set_handler(ticket_edit, cmd_ticket_edit)
+
+    ticket_priority = ticket_commands.add_parser("priority", help="Change queue priority without interrupting active work.")
+    add_ticket_id(ticket_priority); add_revision(ticket_priority)
+    ticket_priority.add_argument("priority", type=int, help="Integer priority displayed as P<n>.")
+    set_handler(ticket_priority, cmd_ticket_priority)
+
+    human_estimate = ticket_commands.add_parser("human-estimate", help="Set or clear estimated human implementation days.")
+    add_ticket_id(human_estimate); add_revision(human_estimate)
+    estimate_value = human_estimate.add_mutually_exclusive_group(required=True)
+    estimate_value.add_argument("--days", type=float, help="Non-negative estimated human days.")
+    estimate_value.add_argument("--clear", action="store_true", help="Clear the estimate.")
+    set_handler(human_estimate, cmd_ticket_human_estimate)
+
+    reset_conversation = ticket_commands.add_parser("reset-conversation", help="Start a fresh generation for an inactive ticket conversation.")
+    add_ticket_id(reset_conversation); add_revision(reset_conversation)
+    reset_conversation.add_argument("key", help="Conversation key exposed by ticket show.")
+    set_handler(reset_conversation, cmd_ticket_reset_conversation)
 
     ticket_decide = ticket_commands.add_parser("decide", help="Choose an outcome at the current human gate.")
     add_ticket_id(ticket_decide); add_revision(ticket_decide)
@@ -465,10 +711,24 @@ def build_parser() -> argparse.ArgumentParser:
     ticket_migrate = ticket_commands.add_parser("migrate-workflow", help="Explicitly move a paused or interrupted ticket to a workflow revision/node.")
     add_ticket_id(ticket_migrate); add_revision(ticket_migrate)
     ticket_migrate.add_argument("workflow_id"); ticket_migrate.add_argument("node_id")
+    ticket_migrate.add_argument("--workflow-revision", help="Exact active trial revision; omit to use the workflow family's default release.")
     set_handler(ticket_migrate, cmd_ticket_migrate_workflow)
+
+    ticket_checkpoint = ticket_commands.add_parser("checkpoint", help="Route a ticket through a configured Checkpoint node.")
+    add_ticket_id(ticket_checkpoint); add_revision(ticket_checkpoint)
+    ticket_checkpoint.add_argument("node_id", help="Checkpoint workflow node ID.")
+    set_handler(ticket_checkpoint, cmd_ticket_checkpoint, checkpoint_action="create", checkpoint_id=None)
+
+    ticket_restore = ticket_commands.add_parser("restore-checkpoint", help="Route a ticket through a configured Restore Checkpoint node.")
+    add_ticket_id(ticket_restore); add_revision(ticket_restore)
+    ticket_restore.add_argument("node_id", help="Restore Checkpoint workflow node ID.")
+    ticket_restore.add_argument("checkpoint_id", help="Checkpoint ID from ticket show.")
+    set_handler(ticket_restore, cmd_ticket_checkpoint, checkpoint_action="restore")
 
     for command, api_action, help_text in (
         ("ready", "ready", "Mark a pending valid ticket ready."),
+        ("draft", "draft", "Return unclaimed ready work to pending draft."),
+        ("wake", "wake", "Release the current durable external wait early."),
         ("retry", "retry", "Return failed or needs-attention work to ready."),
         ("release-supervisor", "release-supervisor", "Release inactive supervisor affinity."),
         ("unarchive", "unarchive", "Return an archived ticket to the completed queue."),
@@ -507,13 +767,6 @@ def build_parser() -> argparse.ArgumentParser:
         add_revision(action)
         add_text_input(action, "message", "Operator message or reason.")
         set_handler(action, cmd_ticket_message_action, api_action=api_action)
-
-    for command in ("rewind", "reopen"):
-        action = ticket_commands.add_parser(command, help=f"{command.title()} a ticket to an applicable phase.")
-        add_ticket_id(action)
-        add_revision(action)
-        action.add_argument("--phase", choices=PHASES, required=True)
-        set_handler(action, cmd_ticket_phase_action, api_action=command)
 
     answer = ticket_commands.add_parser("answer-question", help="Answer a durable agent question.")
     add_ticket_id(answer)

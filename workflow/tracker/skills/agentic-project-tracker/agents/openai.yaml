@@ -1,4 +1,4 @@
 interface:
   display_name: "Agentic Project Tracker"
-  short_description: "Create, monitor, and control tracker tickets"
-  default_prompt: "Use $agentic-project-tracker to inspect or manage tickets in the Agentic Project Tracker."
+  short_description: "Manage tickets, files, and workflow runs"
+  default_prompt: "Use $agentic-project-tracker to inspect or manage tickets, attachments, run artifacts, and pinned workflow releases in the Agentic Project Tracker."

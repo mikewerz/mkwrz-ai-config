@@ -2,23 +2,7 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import {
-  BATCH_QUESTION_ASSIGNMENT_DEFAULT,
-  LEGACY_ASSIGNMENT_DEFAULT,
-  PRE_BRANCH_IMPLEMENTATION_DEFAULT,
-  PRE_BRANCH_SPECIFICATION_DEFAULT,
-  PRE_CALLBACK_SCHEMA_REMINDER_DEFAULT,
-  PRE_DURABLE_BUNDLE_ASSIGNMENT_DEFAULT,
-  PRE_DURABLE_BUNDLE_CALLBACK_REMINDER_DEFAULT,
-  PRE_PROMPT_ENGINEERING_ASSIGNMENT_DEFAULT,
-  PRE_PROMPT_ENGINEERING_IMPLEMENTATION_DEFAULT,
-  PRE_PROMPT_ENGINEERING_REVIEW_DEFAULT,
-  PRE_PROMPT_ENGINEERING_SPECIFICATION_DEFAULT,
-  PRE_MERGE_PROMPT_ASSIGNMENT_DEFAULT,
-  PRE_PROJECT_ROOT_ASSIGNMENT_DEFAULT,
-  PROMPT_NAMES,
-  PromptLibrary,
-} from "./prompt-library.js";
+import { PROMPT_NAMES, PromptLibrary } from "./prompt-library.js";
 import { TicketStore } from "./ticket-store.js";
 
 let root: string;
@@ -53,52 +37,34 @@ describe("PromptLibrary", () => {
     expect(reminder.content).toContain("{{callback_helper_path}} schema complete");
     expect(reminder.tags.map((tag) => tag.name)).toContain("assignment_directory");
 
+    const requiredSupervisorPrompts = await Promise.all(["assignment", "guidance", "callback-reminder"].map((name) => first.get(name)));
+    expect(requiredSupervisorPrompts.map((prompt) => ({ name: prompt.name, valid: prompt.valid, errors: prompt.errors }))).toEqual([
+      { name: "assignment", valid: true, errors: [] },
+      { name: "guidance", valid: true, errors: [] },
+      { name: "callback-reminder", valid: true, errors: [] },
+    ]);
+    const guidance = requiredSupervisorPrompts[1]!;
+    expect(guidance.content).toContain("{{update_path}}");
+    expect(guidance.tags.map((tag) => tag.name)).toContain("message");
+
     const guidancePath = join(root, "prompts", "guidance.md");
     await writeFile(guidancePath, "Custom guidance for {{ticket_id}}: {{message}}\n");
     await new PromptLibrary(root).start();
     expect(await readFile(guidancePath, "utf8")).toBe("Custom guidance for {{ticket_id}}: {{message}}\n");
   });
 
-  it("upgrades only the unchanged legacy assignment default", async () => {
+  it("never rewrites an existing assignment artifact during startup", async () => {
     const promptDirectory = join(root, "prompts");
     await mkdir(promptDirectory, { recursive: true });
     const assignmentPath = join(promptDirectory, "assignment.md");
-    for (const olderDefault of [LEGACY_ASSIGNMENT_DEFAULT, BATCH_QUESTION_ASSIGNMENT_DEFAULT, PRE_PROJECT_ROOT_ASSIGNMENT_DEFAULT, PRE_PROMPT_ENGINEERING_ASSIGNMENT_DEFAULT, PRE_MERGE_PROMPT_ASSIGNMENT_DEFAULT, PRE_DURABLE_BUNDLE_ASSIGNMENT_DEFAULT]) {
-      await writeFile(assignmentPath, `${olderDefault.trim()}\n`);
-      await new PromptLibrary(root).start();
-      expect(await readFile(assignmentPath, "utf8")).toContain("{{start_here_path}}");
-      expect(await readFile(assignmentPath, "utf8")).toContain("{{callback_helper_path}}");
-      expect(await readFile(assignmentPath, "utf8")).toContain("{{project_root}}");
-    }
-
     await writeFile(assignmentPath, "Operator-owned assignment prompt\n");
     await new PromptLibrary(root).start();
     expect(await readFile(assignmentPath, "utf8")).toBe("Operator-owned assignment prompt\n");
   });
 
-  it("upgrades unchanged phase and reminder defaults without replacing operator edits", async () => {
+  it("never rewrites existing node or reminder prompt artifacts during startup", async () => {
     const promptDirectory = join(root, "prompts");
     await mkdir(promptDirectory, { recursive: true });
-    await writeFile(join(promptDirectory, "specification.md"), `${PRE_BRANCH_SPECIFICATION_DEFAULT}\n`);
-    await writeFile(join(promptDirectory, "implementation.md"), `${PRE_BRANCH_IMPLEMENTATION_DEFAULT}\n`);
-    await writeFile(join(promptDirectory, "callback-reminder.md"), `${PRE_CALLBACK_SCHEMA_REMINDER_DEFAULT}\n`);
-
-    await new PromptLibrary(root).start();
-
-    expect(await readFile(join(promptDirectory, "specification.md"), "utf8")).toContain("remote default branch");
-    expect(await readFile(join(promptDirectory, "implementation.md"), "utf8")).toContain("resumed iteration");
-    expect(await readFile(join(promptDirectory, "callback-reminder.md"), "utf8")).toContain("{{callback_helper_path}}");
-
-    await writeFile(join(promptDirectory, "specification.md"), `${PRE_PROMPT_ENGINEERING_SPECIFICATION_DEFAULT}\n`);
-    await writeFile(join(promptDirectory, "implementation.md"), `${PRE_PROMPT_ENGINEERING_IMPLEMENTATION_DEFAULT}\n`);
-    await writeFile(join(promptDirectory, "review.md"), `${PRE_PROMPT_ENGINEERING_REVIEW_DEFAULT}\n`);
-    await writeFile(join(promptDirectory, "callback-reminder.md"), `${PRE_DURABLE_BUNDLE_CALLBACK_REMINDER_DEFAULT}\n`);
-    await new PromptLibrary(root).start();
-    expect(await readFile(join(promptDirectory, "specification.md"), "utf8")).toContain("decision-complete specification");
-    expect(await readFile(join(promptDirectory, "implementation.md"), "utf8")).toContain("Deliver the ticket's requested behavior");
-    expect(await readFile(join(promptDirectory, "review.md"), "utf8")).toContain("evidence-based review");
-    expect(await readFile(join(promptDirectory, "callback-reminder.md"), "utf8")).toContain("{{start_here_path}}");
-
     const custom = "Use the repository's documented preparation process for {{ticket_id}}.\n";
     await writeFile(join(promptDirectory, "specification.md"), custom);
     await new PromptLibrary(root).start();
@@ -142,12 +108,17 @@ describe("PromptLibrary", () => {
   it("revision-fences edits and rejects missing, unknown, or malformed tags", async () => {
     const library = new PromptLibrary(root);
     const assignment = await library.get("assignment");
+    expect(assignment.version).toBe(1);
     const updated = await library.update("assignment", `${assignment.content}\nKeep the response concise.`, assignment.revision);
+    expect(updated.version).toBe(2);
     expect(updated.content).toContain("Keep the response concise.");
     await expect(library.update("assignment", assignment.content, assignment.revision)).rejects.toMatchObject({ status: 409 });
     await expect(library.update("assignment", "Only {{ticket_id}}", updated.revision)).rejects.toMatchObject({ status: 422 });
     await expect(library.preview("implementation", "Use {{TicketId}}", "implementation")).rejects.toMatchObject({ status: 422 });
     await expect(library.preview("implementation", "Use {{ticket_id", "implementation")).rejects.toMatchObject({ status: 422 });
+    const restored = await library.restore("assignment", updated.revision);
+    expect(restored.version).toBe(1);
+    expect(restored.content).toBe(assignment.content);
   });
 
   it("keeps the reserved prompts directory out of the ticket queue", async () => {

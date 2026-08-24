@@ -1,6 +1,6 @@
-import { randomUUID } from "node:crypto";
-import { chmod, mkdir, open, rename } from "node:fs/promises";
-import { join, resolve } from "node:path";
+import { createHash, randomUUID } from "node:crypto";
+import { chmod, mkdir, open, readdir, rename, rm } from "node:fs/promises";
+import { basename, join, resolve } from "node:path";
 import type { PromptStore } from "./prompts.js";
 import type { ClaimedTicket, Guidance } from "./types.js";
 
@@ -10,6 +10,7 @@ export interface AssignmentBundle {
   runDirectory: string;
   startHerePath: string;
   callbackHelperPath: string;
+  attachmentsDirectory: string;
 }
 
 interface CallbackConfiguration {
@@ -18,12 +19,12 @@ interface CallbackConfiguration {
   node_id: string;
   lease_id: string;
   callback_base: string;
-  endpoints: { comment: string; ask: string; complete: string; fail: string; metadata: string };
+  endpoints: { comment: string; ask: string; complete: string; fail: string; metadata: string; candidates: string };
   allowed_outcomes: Array<{ id: string; label: string; description: string }>;
   schemas: Record<string, unknown>;
 }
 
-async function atomicWrite(path: string, content: string): Promise<void> {
+async function atomicWrite(path: string, content: string | Uint8Array): Promise<void> {
   const temporary = `${path}.${process.pid}.${randomUUID()}.tmp`;
   const handle = await open(temporary, "wx");
   try { await handle.writeFile(content); await handle.sync(); } finally { await handle.close(); }
@@ -44,13 +45,14 @@ async function callbackHelperProgram(): Promise<void> {
   const [command, ...args] = process.argv.slice(2);
   const usage = () => {
     console.error("Usage:");
-    console.error("  ./callback schema [complete|ask|fail|comment|metadata-put]");
+    console.error("  ./callback schema [complete|ask|fail|comment|metadata-put|candidates]");
     console.error("  ./callback complete <payload.json|->");
     console.error("  ./callback ask <payload.json|->");
     console.error("  ./callback fail <payload.json|->");
     console.error("  ./callback comment <payload.json|->");
     console.error("  ./callback metadata get [key]");
     console.error("  ./callback metadata put <key> <value.json|->");
+    console.error("  ./callback emit-candidates <payload.json|->");
   };
   const readPayload = async (path: string | undefined) => {
     if (!path) throw new Error("A JSON payload file is required. Use '-' to read stdin.");
@@ -108,6 +110,10 @@ async function callbackHelperProgram(): Promise<void> {
       await send("PUT", `${configuration.endpoints.metadata}/${encodeURIComponent(args[1])}`, { value });
       return;
     }
+    if (command === "emit-candidates") {
+      await send("POST", configuration.endpoints.candidates, await readPayload(args[0]));
+      return;
+    }
     usage();
     process.exitCode = 2;
   } catch (error) {
@@ -123,20 +129,20 @@ function callbackHelperSource(): string {
 export function assignmentValues(ticket: ClaimedTicket, callbackBaseUrl: string, projectRoot: string): Record<string, string> {
   const lease = ticket.frontmatter.execution.lease_id;
   const node = ticket.workflow_node;
-  const outputLog = ticket.frontmatter.workflow?.incoming?.output_log_path;
+  const outputLog = ticket.frontmatter.workflow.incoming?.output_log_path;
   const outputLogUrls = outputLog ? outputLog.split("\n").filter(Boolean).map((path) => new URL(path, callbackBaseUrl).toString()).join("\n") : "No persisted output log.";
   return {
     ticket_id: ticket.frontmatter.id,
     phase: ticket.frontmatter.phase,
     callback_base: new URL(`/api/work/${lease}/`, callbackBaseUrl).toString(),
-    node_id: node?.id ?? ticket.frontmatter.phase,
-    node_name: node?.name ?? ticket.frontmatter.phase,
-    allowed_outcomes: node?.outcomes?.length ? node.outcomes.map((outcome) => `- ${outcome.id}: ${outcome.label}${outcome.description ? ` — ${outcome.description}` : ""}`).join("\n") : "- completed: Complete the assigned work\n- failed: The work cannot continue",
-    incoming_outcome: ticket.frontmatter.workflow?.incoming?.outcome ?? "none",
-    incoming_summary: ticket.frontmatter.workflow?.incoming?.summary ?? "No prior transition summary.",
-    incoming_handoff: ticket.frontmatter.workflow?.incoming?.handoff ?? "No explicit handoff message.",
-    incoming_node: ticket.frontmatter.workflow?.incoming?.source_node ?? "none",
-    incoming_output: ticket.frontmatter.workflow?.incoming?.output ?? "No inline output was configured.",
+    node_id: node.id,
+    node_name: node.name,
+    allowed_outcomes: node.outcomes.map((outcome) => `- ${outcome.id}: ${outcome.label}${outcome.description ? ` — ${outcome.description}` : ""}`).join("\n"),
+    incoming_outcome: ticket.frontmatter.workflow.incoming?.outcome ?? "none",
+    incoming_summary: ticket.frontmatter.workflow.incoming?.summary ?? "No prior transition summary.",
+    incoming_handoff: ticket.frontmatter.workflow.incoming?.handoff ?? "No explicit handoff message.",
+    incoming_node: ticket.frontmatter.workflow.incoming?.source_node ?? "none",
+    incoming_output: ticket.frontmatter.workflow.incoming?.output ?? "No inline output was configured.",
     incoming_output_log: outputLogUrls,
     ticket_path: ticket.path,
     ticket_markdown: ticket.markdown,
@@ -146,16 +152,16 @@ export function assignmentValues(ticket: ClaimedTicket, callbackBaseUrl: string,
 
 function callbackConfiguration(ticket: ClaimedTicket, callbackBaseUrl: string): CallbackConfiguration {
   const base = new URL(`/api/work/${ticket.frontmatter.execution.lease_id}/`, callbackBaseUrl).toString();
-  const allowed = ticket.workflow_node?.outcomes ?? [];
+  const allowed = ticket.workflow_node.outcomes;
   return {
     schema_version: 1,
     ticket_id: ticket.frontmatter.id,
-    node_id: ticket.workflow_node?.id ?? ticket.frontmatter.phase,
+    node_id: ticket.workflow_node.id,
     lease_id: ticket.frontmatter.execution.lease_id,
     callback_base: base,
     endpoints: {
       comment: new URL("comment", base).toString(), ask: new URL("ask", base).toString(),
-      complete: new URL("complete", base).toString(), fail: new URL("fail", base).toString(), metadata: new URL("metadata", base).toString(),
+      complete: new URL("complete", base).toString(), fail: new URL("fail", base).toString(), metadata: new URL("metadata", base).toString(), candidates: new URL("candidates", base).toString(),
     },
     allowed_outcomes: allowed.map(({ id, label, description }) => ({ id, label, description })),
     schemas: {
@@ -164,6 +170,7 @@ function callbackConfiguration(ticket: ClaimedTicket, callbackBaseUrl: string): 
       fail: { reason: "Concrete blocker or unrecoverable failure." },
       comment: { message: "Concise durable progress note or decision." },
       "metadata-put": { any: "JSON value; the helper wraps it as the endpoint's value field" },
+      candidates: { source_id: "configured-source-id", candidates: [{ external_key: "stable-deduplication-key", title: "Child work item", description: "Complete ticket description", repositories: [{ id: "repository-id", primary: true }], metadata: { discovered_by: "current-node" } }] },
     },
   };
 }
@@ -193,6 +200,7 @@ ${helperPath} comment comment.json
 ${helperPath} metadata get
 ${helperPath} metadata get release
 ${helperPath} metadata put release release-value.json
+${helperPath} emit-candidates candidates.json
 \`\`\`
 
 Use \`-\` instead of a filename to read JSON from stdin. The helper validates completion outcomes, writes every request and response under \`outbox/\`, and then calls the lease-fenced tracker endpoint.
@@ -214,13 +222,14 @@ export class AssignmentBundleWriter {
     const runId = ticket.frontmatter.execution.node_run_id;
     if (!runId) throw new Error(`Ticket ${ticket.frontmatter.id} has no node run ID`);
     const attempt = String(ticket.frontmatter.execution.attempt ?? 1).padStart(4, "0");
-    const nodeId = ticket.workflow_node?.id ?? ticket.frontmatter.phase;
+    const nodeId = ticket.workflow_node.id;
     const ticketDirectory = join(this.root, this.supervisorId, "tickets", ticket.frontmatter.id);
     const runDirectory = join(ticketDirectory, "runs", `${attempt}-${nodeId}-${runId}`);
     return {
       root: this.root, ticketDirectory, runDirectory,
       startHerePath: join(runDirectory, "START_HERE.md"),
       callbackHelperPath: join(runDirectory, "callback"),
+      attachmentsDirectory: join(runDirectory, "attachments"),
     };
   }
 
@@ -240,14 +249,18 @@ export class AssignmentBundleWriter {
   }
 
   async refresh(bundle: AssignmentBundle, ticket: ClaimedTicket, callbackBaseUrl: string, projectRoot: string, prompts: PromptStore): Promise<void> {
+    const attachments = await this.materializeAttachments(bundle, ticket, callbackBaseUrl);
     const values = assignmentValues(ticket, callbackBaseUrl, projectRoot);
-    const nodeInstructions = ticket.node_prompt
-      ? prompts.renderContent(ticket.node_prompt.id, ticket.node_prompt.content, values)
-      : prompts.render(ticket.frontmatter.phase, values);
+    if (!ticket.node_prompt) throw new Error(`Agent node ${ticket.workflow_node.id} has no pinned prompt`);
+    const nodeInstructions = prompts.renderContent(ticket.node_prompt.id, ticket.node_prompt.content, values);
     const configuration = callbackConfiguration(ticket, callbackBaseUrl);
     const repositories = ticket.frontmatter.repositories.map((repository) => ({ ...repository, path: join(projectRoot, repository.id) }));
+    const artifacts = (ticket.frontmatter.artifacts ?? []).map((artifact) => ({
+      ...artifact,
+      url: new URL(`/api/tickets/${encodeURIComponent(ticket.frontmatter.id)}/artifacts/${encodeURIComponent(artifact.id)}/content`, callbackBaseUrl).toString(),
+    }));
     const generatedNotice = "> Generated assignment snapshot. You may edit these files for your own notes, but edits are not sent back to the tracker and are not durable workflow changes.\n";
-    const startHere = `# Start here: ${ticket.frontmatter.id} — ${ticket.workflow_node?.name ?? ticket.frontmatter.phase}
+    const startHere = `# Start here: ${ticket.frontmatter.id} — ${ticket.workflow_node.name}
 
 ${generatedNotice}
 This directory contains the durable input for node run \`${ticket.frontmatter.execution.node_run_id}\`.
@@ -256,9 +269,11 @@ This directory contains the durable input for node run \`${ticket.frontmatter.ex
 
 1. [node.md](./node.md) — the exact objective and node-specific instructions.
 2. [ticket.md](./ticket.md) — the complete ticket snapshot.
-3. [incoming.md](./incoming.md) — the preceding outcome, handoff, and Script output references.
-4. [callbacks.md](./callbacks.md) — allowed outcomes and the callback contract.
-5. [context.json](./context.json) — machine-readable execution and repository context when needed.
+3. [attachments.md](./attachments.md) — local paths for every ticket attachment.
+4. [incoming.md](./incoming.md) — the preceding outcome, handoff, and Script output references.
+5. [artifacts.md](./artifacts.md) — tracker-owned Script artifacts and checkpoint provenance.
+6. [callbacks.md](./callbacks.md) — allowed outcomes and the callback contract.
+7. [context.json](./context.json) — machine-readable execution and repository context when needed.
 
 ## Workspace
 
@@ -266,6 +281,10 @@ This directory contains the durable input for node run \`${ticket.frontmatter.ex
 ${repositories.map((repository) => `- ${repository.primary ? "Primary" : "Additional"} repository \`${repository.id}\`: \`${repository.path}\``).join("\n")}
 
 Use your normal tools, credentials, judgment, planning, and subagents. Work autonomously inside the current node.
+
+## Ticket attachments
+
+${attachments.length ? attachments.map((attachment) => `- \`${attachment.filename}\`: \`${attachment.path}\``).join("\n") : "No files are attached to this ticket."}
 
 ## Before becoming idle
 
@@ -295,7 +314,7 @@ Full output log: ${values.incoming_output_log}
       ticket: { id: ticket.frontmatter.id, title: ticket.frontmatter.title, tracker_path: ticket.path, phase: ticket.frontmatter.phase, revision: (ticket.frontmatter as Record<string, unknown>).revision ?? null },
       workflow: ticket.frontmatter.workflow ?? null, node: ticket.workflow_node ?? null,
       execution: ticket.frontmatter.execution, resolved_agent_profile: ticket.resolved_agent_profile ?? null,
-      project_root: projectRoot, repositories,
+      project_root: projectRoot, repositories, attachments, artifacts, checkpoints: ticket.frontmatter.checkpoints ?? [],
       prompt: ticket.node_prompt ? { id: ticket.node_prompt.id, revision: ticket.node_prompt.revision } : null,
     };
     await Promise.all([
@@ -303,10 +322,38 @@ Full output log: ${values.incoming_output_log}
       atomicWrite(join(bundle.runDirectory, "ticket.md"), `${generatedNotice}\n${ticket.markdown.trim()}\n`),
       atomicWrite(join(bundle.runDirectory, "node.md"), `# Current node instructions\n\n${generatedNotice}\n${nodeInstructions.trim()}\n`),
       atomicWrite(join(bundle.runDirectory, "incoming.md"), incoming),
+      atomicWrite(join(bundle.runDirectory, "attachments.md"), `# Ticket attachments\n\n${generatedNotice}\n${attachments.length ? attachments.map((attachment) => `- **${attachment.filename}** (${attachment.content_type}, ${attachment.size_bytes} bytes)\n  - Local path: \`${attachment.path}\`\n  - SHA-256: \`${attachment.sha256}\``).join("\n") : "No files are attached to this ticket."}\n`),
+      atomicWrite(join(bundle.runDirectory, "artifacts.md"), `# Tracker artifacts and checkpoints\n\n${generatedNotice}\n## Artifacts\n\n${artifacts.length ? artifacts.map((artifact) => `- **${artifact.filename}** — ${artifact.kind}, ${artifact.size_bytes} bytes\n  - URL: ${artifact.url}\n  - SHA-256: \`${artifact.sha256}\`${artifact.node_run_id ? `\n  - Node run: \`${artifact.node_run_id}\`` : ""}`).join("\n") : "No workflow artifacts have been stored."}\n\n## Checkpoints\n\n${(ticket.frontmatter.checkpoints ?? []).length ? (ticket.frontmatter.checkpoints ?? []).map((checkpoint) => `- **${checkpoint.label}** — \`${checkpoint.id}\`, ${checkpoint.kind}, ${checkpoint.repositories.length} repositories`).join("\n") : "No checkpoints have been recorded."}\n`),
       atomicWrite(join(bundle.runDirectory, "context.json"), `${JSON.stringify(context, null, 2)}\n`),
       atomicWrite(join(bundle.runDirectory, "callbacks.json"), `${JSON.stringify(configuration, null, 2)}\n`),
       atomicWrite(join(bundle.runDirectory, "callbacks.md"), callbackMarkdown(configuration, bundle.callbackHelperPath)),
     ]);
+  }
+
+  private async materializeAttachments(bundle: AssignmentBundle, ticket: ClaimedTicket, callbackBaseUrl: string): Promise<Array<{
+    id: string; filename: string; content_type: string; size_bytes: number; sha256: string; path: string;
+  }>> {
+    await mkdir(bundle.attachmentsDirectory, { recursive: true });
+    const activeIds = new Set((ticket.frontmatter.attachments ?? []).map((attachment) => attachment.id));
+    for (const entry of await readdir(bundle.attachmentsDirectory, { withFileTypes: true })) {
+      if (!activeIds.has(entry.name)) await rm(join(bundle.attachmentsDirectory, entry.name), { recursive: true, force: true });
+    }
+    const output = [];
+    for (const attachment of ticket.frontmatter.attachments ?? []) {
+      const filename = basename(attachment.filename);
+      const directory = join(bundle.attachmentsDirectory, attachment.id);
+      const path = join(directory, filename);
+      await mkdir(directory, { recursive: true });
+      const url = new URL(`/api/tickets/${encodeURIComponent(ticket.frontmatter.id)}/attachments/${encodeURIComponent(attachment.id)}/content`, callbackBaseUrl);
+      const response = await fetch(url);
+      if (!response.ok) throw new Error(`Could not download attachment ${filename}: tracker returned HTTP ${response.status}`);
+      const content = new Uint8Array(await response.arrayBuffer());
+      const sha256 = createHash("sha256").update(content).digest("hex");
+      if (content.byteLength !== attachment.size_bytes || sha256 !== attachment.sha256) throw new Error(`Attachment ${filename} failed its assignment integrity check`);
+      await atomicWrite(path, content);
+      output.push({ ...attachment, path });
+    }
+    return output;
   }
 
   async appendUpdate(bundle: AssignmentBundle, guidance: Guidance): Promise<string> {
