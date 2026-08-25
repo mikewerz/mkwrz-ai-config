@@ -80,7 +80,7 @@ describe("health endpoint", () => {
 
     // Assert
     expect(capabilities.body).toEqual({
-      supervisor_protocol_versions: [1, 2],
+      supervisor_protocol_versions: [1, 2, 3],
       workflow_schema_versions: [2],
       intake_protocol_versions: [1],
       activity_capabilities: [
@@ -252,6 +252,41 @@ describe("tracker API", () => {
     await request(app).post(`/api/work/${lease}/telemetry`).send({ telemetry: { nope: true } }).expect(422);
   }, 15_000);
 
+  it("stores idempotent, sequence-fenced execution trace chunks before and after a terminal callback", async () => {
+    // Arrange
+    const app = createApp(store, join(root, "missing-client"));
+    const created = await request(app).post("/api/tickets").send({ markdown: ticketMarkdown(), stage_enabled: { specification: false, review: false } }).expect(201);
+    await request(app).post("/api/tickets/APT-0001/ready").send({ expected_revision: created.body.frontmatter.revision }).expect(200);
+    const claim = await request(app).post("/api/work/claim").send({ supervisor_id: "vm", provider: "claude", available_providers: ["claude"] }).expect(200);
+    const lease = claim.body.frontmatter.execution.lease_id as string;
+    const traceId = "2dd15b49-32ef-4d47-8a46-595e58b9719d";
+    const first = [{ sequence: 1, timestamp: "2026-08-25T12:00:00.000Z", elapsed_ms: 0, event: "execution.trace_started", data: { provider: "claude" } }];
+
+    // Execute
+    const stored = await request(app).post(`/api/work/${lease}/trace/events`).send({ trace_id: traceId, first_sequence: 1, events: first }).expect(201);
+    const duplicate = await request(app).post(`/api/work/${lease}/trace/events`).send({ trace_id: traceId, first_sequence: 1, events: first }).expect(201);
+    await request(app).post(`/api/work/${lease}/complete`).send({
+      summary: "Implemented", outcome: "completed", pull_requests: [{ repository: "demo", url: "https://github.com/example/demo/pull/99" }],
+    }).expect(200);
+    await request(app).post(`/api/work/${lease}/trace/events`).send({
+      trace_id: traceId, first_sequence: 2, completed: true,
+      events: [{ sequence: 2, timestamp: "2026-08-25T12:00:01.000Z", elapsed_ms: 1000, event: "execution.trace_finished", data: { disposition: "callback" } }],
+    }).expect(201);
+
+    // Verify
+    expect(duplicate.body.artifact.id).toBe(stored.body.artifact.id);
+    await request(app).post(`/api/work/${lease}/trace/events`).send({ trace_id: traceId, first_sequence: 4, events: first.map((item) => ({ ...item, sequence: 4 })) }).expect(409);
+    const ticket = await request(app).get("/api/tickets/APT-0001").expect(200);
+    const chunks = ticket.body.frontmatter.artifacts.filter((artifact: { kind: string }) => artifact.kind === "execution_trace");
+    expect(chunks).toHaveLength(2);
+    expect(chunks.map((artifact: { metadata: Record<string, unknown> }) => artifact.metadata)).toEqual([
+      expect.objectContaining({ trace_id: traceId, first_sequence: 1, last_sequence: 1, completed: false }),
+      expect.objectContaining({ trace_id: traceId, first_sequence: 2, last_sequence: 2, completed: true }),
+    ]);
+    const content = await request(app).get(`/api/tickets/APT-0001/artifacts/${chunks[1].id}/content`).expect(200);
+    expect(content.text).toContain('"event":"execution.trace_finished"');
+  }, 15_000);
+
   it("reprioritizes tickets in any state and returns unclaimed ready work to draft without adding a workflow visit", async () => {
     const app = createApp(store, join(root, "missing-client"));
     const first = await request(app).post("/api/tickets").send({ markdown: ticketMarkdown({ id: "APT-0001", priority: 10 }), stage_enabled: { specification: false, review: false } }).expect(201);
@@ -332,6 +367,12 @@ describe("tracker API", () => {
     const downloadedQuality = await request(app).get(`/api/tickets/APT-0001/artifacts/${quality.body.artifact.id}/content`).expect(200);
     expect(Buffer.isBuffer(downloadedQuality.body) ? downloadedQuality.body : Buffer.from(downloadedQuality.text)).toEqual(qualityYaml);
     expect(downloadedQuality.headers.etag).toBe(`"sha256:${quality.body.artifact.sha256}"`);
+    const reviewMarkdown = Buffer.from("# Verification summary\n\nAll declared checks passed.\n");
+    const evidence = await request(app).post(`/api/work/${activity.body.frontmatter.execution.lease_id}/artifacts?kind=evidence&filename=review.md&content_type=text%2Fmarkdown&title=Verification%20summary&description=Evidence%20for%20the%20approval%20gate&category=review&featured=true`)
+      .set("Content-Type", "application/octet-stream").send(reviewMarkdown).expect(201);
+    expect(evidence.body.artifact).toMatchObject({ kind: "evidence", filename: "review.md", metadata: { presentation: { title: "Verification summary", description: "Evidence for the approval gate", category: "review", featured: true } } });
+    const downloadedEvidence = await request(app).get(`/api/tickets/APT-0001/artifacts/${evidence.body.artifact.id}/content`).expect(200);
+    expect(Buffer.isBuffer(downloadedEvidence.body) ? downloadedEvidence.body : Buffer.from(downloadedEvidence.text)).toEqual(reviewMarkdown);
     const activityResult = await request(app).post(`/api/work/${activity.body.frontmatter.execution.lease_id}/activity-result`).send({
       success: true, summary: "Verified", output: "combined", stdout: "one\ntwo\nthree", stderr: "warning", exit_code: 0,
       script_path: null, working_directory: "/srv/projects/demo",
@@ -350,7 +391,15 @@ describe("tracker API", () => {
     expect(waiting.body.frontmatter).toMatchObject({ status: "waiting_approval", metadata: { "verification.report": "report-123" }, workflow: { current_node: "approval", incoming: { output: "two\nthree", output_log_path: expect.stringContaining(`/runs/${activityRun.id}/output`) } } });
     expect(activityRun).toMatchObject({ metadata_writes: { "verification.report": "report-123" }, external_references: [{ type: "test-report", id: "report-123" }], manifest_artifact_id: activityManifest.body.artifact.id });
     await request(app).post("/api/tickets/APT-0001/decide").send({ expected_revision: waiting.body.frontmatter.revision, decision: "rejected" }).expect(422);
-    await request(app).post("/api/tickets/APT-0001/decide").send({ expected_revision: waiting.body.frontmatter.revision, decision: "approved" }).expect(200);
+    const approved = await request(app).post("/api/tickets/APT-0001/decide").send({
+      expected_revision: waiting.body.frontmatter.revision,
+      decision: "approved",
+      message: "Review pull request example/demo#42.",
+    }).expect(200);
+    expect(approved.body.frontmatter.workflow).toMatchObject({
+      current_node: "deliver",
+      incoming: { outcome: "approved", summary: "Review pull request example/demo#42.", handoff: "Review pull request example/demo#42." },
+    });
     const assignment = await request(app).post("/api/work/claim").send({ supervisor_id: "factory-vm", provider: "codex", available_providers: ["codex"], activity_capabilities: ["inline_javascript"] }).expect(200);
     expect(assignment.body).toMatchObject({ workflow_node: { id: "deliver", conversation_key: "work" }, node_prompt: { id: "implementation" } });
     await request(app).put(`/api/work/${assignment.body.frontmatter.execution.lease_id}/metadata/release`).send({ value: "candidate" }).expect(200);
@@ -902,8 +951,9 @@ describe("tracker API", () => {
     expect(second.body.frontmatter.workflow.current_node).toBe("implementation");
     expect(second.body.frontmatter.workflow.node_runs.filter((run: { node_id: string }) => run.node_id === "implementation")).toHaveLength(2);
     const secondLease = second.body.frontmatter.execution.lease_id as string;
-    const delivered = await request(app).post(`/api/work/${secondLease}/delivered`).send({}).expect(200);
+    const delivered = await request(app).post(`/api/work/${secondLease}/delivered`).send({ confirmation: "submitted_staged_prompt" }).expect(200);
     expect(delivered.body.ticket.frontmatter.execution).toMatchObject({ delivery_status: "delivered", delivery_confirmed_at: expect.any(String) });
+    expect(delivered.body.ticket.body).toContain("Assignment delivery recovered by submitting the staged prompt; agent monitoring started.");
     const runtime = await request(app).get("/api/runtime").expect(200);
     expect(runtime.body.agents[0]).toMatchObject({ delivery_status: "delivered", delivery_confirmed_at: expect.any(String), attempt: 2 });
   });
@@ -1023,7 +1073,7 @@ describe("tracker API", () => {
     }).expect(200);
     await request(app).post("/api/tickets").send({ markdown: ticketMarkdown() }).expect(201);
     await request(app).post("/api/tickets/APT-0001/ready").send({ expected_revision: 1 }).expect(200);
-    await request(app).post("/api/work/claim").send({ supervisor_id: "vm", provider: "claude" }).expect(204);
+    await request(app).post("/api/work/claim").send({ supervisor_id: "vm", provider: "codex" }).expect(204);
 
     const spec1 = await request(app).post("/api/work/claim").send({ supervisor_id: "vm", provider: "claude" }).expect(200);
     await request(app).post(`/api/work/${spec1.body.frontmatter.execution.lease_id}/heartbeat`).send({ pane_id: "w1:p1", session_ref: "claude-ticket-1" }).expect(200);
@@ -1072,6 +1122,8 @@ describe("tracker API", () => {
         { question: "May I add a dependency?", options: ["Yes", "No", "Only if maintained"], answer: null },
       ],
     });
+    let inbox = await request(app).get("/api/tickets").expect(200);
+    expect(inbox.body.tickets[0].attention).toMatchObject({ kinds: expect.arrayContaining(["question", "blocked"]), pending_questions: 2 });
 
     asked = await request(app).post(`/api/tickets/APT-0001/questions/${asked.body.frontmatter.questions[0].id}/answer`).send({
       expected_revision: asked.body.frontmatter.revision, answer: "Current and previous major versions.",
@@ -1082,6 +1134,9 @@ describe("tracker API", () => {
     }).expect(200);
     expect(asked.body.frontmatter.status).toBe("running");
     expect(asked.body.frontmatter.execution.guidance).toHaveLength(2);
+    inbox = await request(app).get("/api/tickets").expect(200);
+    expect(inbox.body.tickets[0].attention.pending_questions).toBe(0);
+    expect(inbox.body.tickets[0].attention.kinds).not.toContain("question");
   });
 
   it("retains questions, supports multiple PRs per repository, and archives completed work", async () => {

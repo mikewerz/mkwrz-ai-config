@@ -50,12 +50,12 @@ Node 22.12 or newer is required by the applications under test.
 - Rejected required quality evidence, lease expiry, same-node retry, and
   eventual successful completion without an agent.
 - Agent workflow claiming, assignment-bundle creation, Herdr lifecycle calls,
-  fake terminal callback, completed node-run audit history, and automatic
+  generated review-evidence publication, fake terminal callback, completed node-run audit history, and automatic
   same-node recovery when the fake pane rejects the first prompt deliveries.
 - Fail-closed fake-Herdr startup and provider credential scrubbing.
 - Stable lease/artifact errors, artifact quotas, orphan diagnostics, recovery,
   retention garbage collection, and run-ledger hydration after restart.
-- Chromium smoke coverage for the production queue, ticket form,
+- Chromium smoke coverage for the production attention inbox, queue, ticket form,
   continuous intake, configuration, and workflow navigation.
 - Scheduled supervisor Script-source execution, safe previews without ticket or
   cursor mutation, tracker-owned admission, stable-key deduplication,

@@ -83,6 +83,10 @@ python3 scripts/tracker.py ticket checkpoint-list AGENT-0001
 
 Upload and removal mutate the ticket and therefore require the current revision. An attachment added during active work causes the supervisor to refresh the assignment bundle and guide the agent to reread `attachments.md`. Downloads are read-only but refuse to overwrite an existing local path unless `--force` is supplied. Attachment and artifact IDs come from `ticket show`; checkpoint metadata may be read directly with `checkpoint-list`.
 
+Artifacts with kind `evidence` are permissive human-readable run outputs. Optional `metadata.presentation` fields (`title`, `description`, `category`, and `featured`) affect tracker display only. The outside-agent client may inspect or download them, but only an active lease's generated `publish-artifact` helper may create them.
+
+Artifacts with kind `execution_trace` are immutable JSONL chunks streamed by the supervisor. Chunks from one attempt share `metadata.trace_id`; concatenate them in ascending `metadata.first_sequence`. Events distinguish raw Herdr commands and observations from `delivery.*` supervisor decisions. Prompt and terminal bodies are intentionally represented by byte counts and SHA-256 digests rather than copied content. These artifacts are read-only diagnostic evidence and never authorize an outside agent to issue supervisor callbacks.
+
 ## Comments, guidance, and questions
 
 ```bash
@@ -129,7 +133,7 @@ python3 scripts/tracker.py ticket production-assessment AGENT-0001 --revision 16
 python3 scripts/tracker.py ticket unarchive AGENT-0001 --revision 17
 ```
 
-Always inspect the ticket immediately before these commands. For `ticket decide`, use only a choice ID exposed by the current `workflow_node.choices`; include `--message` when that choice requires a comment. Do not guess a revision or silently repeat a conflicted transition.
+Always inspect the ticket immediately before these commands. For `ticket decide`, use only a choice ID exposed by the current `workflow_node.choices`. `--message` may attach optional context for the next node and is mandatory when the choice requires a comment; it never changes which target the choice follows. Do not guess a revision or silently repeat a conflicted transition.
 
 Priority changes do not interrupt active work. `draft` is valid only for ready work that has not been claimed and does not add a workflow visit. Human estimates are optional metric inputs and may be changed independently of workflow execution. `wake` releases only the current durable external wait; it does not skip the Wait node's declared route. `reset-conversation` requires an existing inactive conversation key and starts a new generation without changing the current node.
 

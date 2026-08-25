@@ -5,7 +5,7 @@ import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "nod
 import { EventEmitter } from "node:events";
 import { watch, type FSWatcher } from "chokidar";
 import {
-  HttpError, type ActivityCapability, type ArtifactKind, type ArtifactRecord, type HarnessTelemetryRecord, type HarnessTelemetrySnapshot, type HerdrObservation, type JsonValue, type LoadedTicket, type Phase, type Provider, type PullRequestRef, type RepositoryClaimBlocker, type TicketAttachment, type TicketCheckpoint, type TicketFrontmatter, type TokenUsage,
+  HttpError, type ActivityCapability, type ArtifactKind, type ArtifactRecord, type ExecutionTraceEvent, type HarnessTelemetryRecord, type HarnessTelemetrySnapshot, type HerdrObservation, type JsonValue, type LoadedTicket, type Phase, type Provider, type PullRequestRef, type RepositoryClaimBlocker, type TicketAttachment, type TicketCheckpoint, type TicketFrontmatter, type TokenUsage,
   type TicketSummary, supervisorReservationActive,
 } from "./domain.js";
 import { appendEvent, ensureInteractionLog, parseDocument, serializeDocument } from "./markdown.js";
@@ -500,6 +500,71 @@ export class TicketStore extends EventEmitter {
     }
   }
 
+  async appendExecutionTrace(
+    leaseId: string,
+    traceId: string,
+    firstSequence: number,
+    events: ExecutionTraceEvent[],
+    completed: boolean,
+  ): Promise<{ artifact: ArtifactRecord; next_sequence: number }> {
+    return this.serial(async () => {
+      const current = this.indexedTickets().find((item): item is LoadedTicket & { frontmatter: TicketFrontmatter } => Boolean(
+        item.valid && item.frontmatter?.workflow?.node_runs.some((run) => run.lease_id === leaseId),
+      ));
+      if (!current) throw new HttpError(409, "Execution lease is unknown or no longer retained", undefined, "LEASE_STALE");
+      const run = current.frontmatter.workflow!.node_runs.find((candidate) => candidate.lease_id === leaseId)!;
+      const chunks = current.frontmatter.artifacts.filter((artifact) => artifact.kind === "execution_trace"
+        && artifact.node_run_id === run.id && artifact.metadata.trace_id === traceId)
+        .sort((left, right) => Number(left.metadata.first_sequence) - Number(right.metadata.first_sequence));
+      const last = chunks.at(-1);
+      const expected = last ? Number(last.metadata.last_sequence) + 1 : 1;
+      const lastSequence = events.at(-1)!.sequence;
+      const content = Buffer.from(`${events.map((event) => JSON.stringify(event)).join("\n")}\n`);
+      const duplicate = chunks.find((artifact) => Number(artifact.metadata.first_sequence) === firstSequence
+        && Number(artifact.metadata.last_sequence) === lastSequence && artifact.sha256 === digest(content));
+      if (duplicate) return { artifact: duplicate, next_sequence: lastSequence + 1 };
+      if (firstSequence !== expected) throw new HttpError(409, `Trace ${traceId} expected sequence ${expected}, received ${firstSequence}`, {
+        trace_id: traceId, expected_sequence: expected, received_sequence: firstSequence,
+      }, "EXECUTION_TRACE_SEQUENCE_MISMATCH");
+      if (current.frontmatter.artifacts.length >= MAX_ARTIFACTS_PER_TICKET) throw new HttpError(422, `Ticket cannot contain more than ${MAX_ARTIFACTS_PER_TICKET} artifact references`);
+      const artifact = await this.artifactStore.put({
+        ticket_id: current.frontmatter.id,
+        node_run_id: run.id,
+        kind: "execution_trace",
+        filename: `${run.id}.${String(firstSequence).padStart(6, "0")}-${String(lastSequence).padStart(6, "0")}.herdr-trace.jsonl`,
+        content_type: "application/x-ndjson",
+        content,
+        metadata: {
+          schema_version: 1,
+          trace_id: traceId,
+          first_sequence: firstSequence,
+          last_sequence: lastSequence,
+          event_count: events.length,
+          completed,
+          presentation: {
+            title: `Herdr operational trace ${run.node_id} attempt ${run.attempt}`,
+            description: `Events ${firstSequence}-${lastSequence} for node run ${run.id}.`,
+            category: "operational trace",
+          },
+        },
+        policy: await this.artifactPolicy(),
+      });
+      try {
+        const ticket = structuredClone(current.frontmatter);
+        ticket.artifacts.push(artifact);
+        await this.mutateLoaded(current, ticket, current.body, {
+          event: "execution.trace_chunk_stored",
+          message: `Operational trace events ${firstSequence}-${lastSequence} stored for ${run.node_id}.`,
+          silent: true,
+        });
+        return { artifact, next_sequence: lastSequence + 1 };
+      } catch (error) {
+        await this.artifactStore.deleteRecord(artifact.id);
+        throw error;
+      }
+    });
+  }
+
   private async referencedArtifactIds(): Promise<Set<string>> {
     const tickets = await this.list();
     return new Set(tickets.flatMap((loaded) => loaded.frontmatter?.artifacts.map((artifact) => artifact.id) ?? []));
@@ -586,11 +651,11 @@ export class TicketStore extends EventEmitter {
         } : null,
         inputs: {
           ticket_attachments: current.frontmatter.attachments.map((attachment) => ({ id: attachment.id, filename: attachment.filename, sha256: attachment.sha256 })),
-          prior_artifacts: current.frontmatter.artifacts.filter((artifact) => artifact.node_run_id !== run.id && artifact.kind !== "execution_manifest")
+          prior_artifacts: current.frontmatter.artifacts.filter((artifact) => artifact.node_run_id !== run.id && artifact.kind !== "execution_manifest" && artifact.kind !== "execution_trace")
             .map((artifact) => ({ id: artifact.id, kind: artifact.kind, filename: artifact.filename, sha256: artifact.sha256, node_run_id: artifact.node_run_id })),
           incoming: current.frontmatter.workflow!.incoming,
         },
-        outputs: current.frontmatter.artifacts.filter((artifact) => artifact.node_run_id === run.id && artifact.kind !== "execution_manifest")
+        outputs: current.frontmatter.artifacts.filter((artifact) => artifact.node_run_id === run.id && artifact.kind !== "execution_manifest" && artifact.kind !== "execution_trace")
           .map((artifact) => ({ id: artifact.id, kind: artifact.kind, filename: artifact.filename, sha256: artifact.sha256, size_bytes: artifact.size_bytes })),
         pull_requests: current.frontmatter.pull_requests,
         runtime,
@@ -721,6 +786,7 @@ export class TicketStore extends EventEmitter {
       let workflowNodeId: string | null = null;
       let workflowNodeName: string | null = null;
       let workflowStageName: string | null = null;
+      let workflowNodeType: string | null = null;
       if (ticket?.workflow && this.workflowLibrary) {
         try {
           const identity = activeWorkflowIdentity(ticket);
@@ -730,6 +796,7 @@ export class TicketStore extends EventEmitter {
           workflowNodeId = node.id;
           workflowNodeName = node.name;
           workflowStageName = definition.stages.find((stage) => stage.id === node.stage)?.name ?? node.stage;
+          workflowNodeType = node.type;
         } catch { provider = null; }
       }
       const claimBlockers: RepositoryClaimBlocker[] = ticket?.status === "ready" ? reserved.flatMap((active) => {
@@ -744,6 +811,24 @@ export class TicketStore extends EventEmitter {
           repositories,
         }] : [];
       }) : [];
+      const pendingQuestions = ticket?.questions.filter((question) => question.answer === null).length ?? 0;
+      const currentWait = ticket?.workflow && workflowNodeId
+        ? Object.values(ticket.workflow.wait_states ?? {})
+          .filter((wait) => wait.node_id === workflowNodeId)
+          .sort((left, right) => right.attempt - left.attempt || right.started_at.localeCompare(left.started_at))[0]
+        : undefined;
+      const latestSettledRun = ticket?.workflow?.node_runs.filter((run) => run.status !== "running").at(-1);
+      const deliveryFailure = latestSettledRun?.outcome === "delivery_failed" ? latestSettledRun : null;
+      const githubFeedback = ticket?.workflow?.incoming?.actor === "github" ? ticket.workflow.incoming : null;
+      const attentionKinds: TicketSummary["attention"]["kinds"] = [];
+      if (pendingQuestions > 0) attentionKinds.push("question");
+      if (ticket?.status === "waiting_approval" && workflowNodeType === "human_gate") attentionKinds.push("human_gate");
+      if (ticket?.status === "blocked") attentionKinds.push("blocked");
+      if (ticket?.status === "failed") attentionKinds.push("failed");
+      if (deliveryFailure && (ticket?.status === "ready" || ticket?.status === "blocked")) attentionKinds.push("delivery_failure");
+      if (githubFeedback && (ticket?.status === "ready" || ticket?.status === "blocked") && !ticket.archived_at) attentionKinds.push("github_feedback");
+      if (ticket?.status === "waiting_external" && currentWait) attentionKinds.push("expiring_wait");
+      if (claimBlockers.length > 0) attentionKinds.push("repository_blocked");
       return {
         id: ticket?.id || loaded.relativePath, title: ticket?.title || basename(loaded.path),
         phase: ticket?.phase ?? "implementation", status: ticket?.status ?? "pending",
@@ -761,6 +846,14 @@ export class TicketStore extends EventEmitter {
         repositories: ticket?.repositories.map((repository) => repository.id) ?? [],
         assigned_supervisor: ticket?.assigned_supervisor ?? null,
         estimated_human_days: ticket?.estimated_human_days ?? null,
+        attention: {
+          kinds: attentionKinds,
+          pending_questions: pendingQuestions,
+          wait_wake_at: currentWait?.wake_at ?? null,
+          wait_deadline_at: currentWait?.deadline_at ?? null,
+          delivery_failure_summary: deliveryFailure?.summary ?? null,
+          github_feedback_summary: githubFeedback?.summary ?? null,
+        },
       };
     }));
     return summaries.sort((a, b) => b.priority - a.priority || a.created_at.localeCompare(b.created_at) || a.id.localeCompare(b.id));
@@ -1266,10 +1359,18 @@ export class TicketStore extends EventEmitter {
     });
   }
 
-  async confirmAssignmentDelivery(leaseId: string): Promise<LoadedTicket> {
+  async confirmAssignmentDelivery(
+    leaseId: string,
+    confirmation: "direct" | "observed_activity" | "submitted_staged_prompt" = "direct",
+  ): Promise<LoadedTicket> {
     const leased = await this.byLease(leaseId);
+    const message = confirmation === "submitted_staged_prompt"
+      ? "Assignment delivery recovered by submitting the staged prompt; agent monitoring started."
+      : confirmation === "observed_activity"
+        ? "Assignment delivery confirmed from observed agent activity; agent monitoring started."
+        : "Assignment prompt delivery confirmed; agent monitoring started.";
     return this.command(leased.frontmatter.id, {
-      event: "work.assignment_delivered", message: "Assignment prompt delivered; agent execution is running.",
+      event: "work.assignment_delivered", message,
     }, (ticket) => {
       if (ticket.execution?.lease_id !== leaseId) throw new HttpError(409, "Lease is stale or fenced", undefined, "LEASE_STALE");
       if (ticket.execution.node_type !== "agent") throw new HttpError(409, "Lease is not an agent assignment", undefined, "ASSIGNMENT_DELIVERY_INVALID");

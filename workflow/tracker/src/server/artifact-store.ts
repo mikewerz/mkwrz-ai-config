@@ -9,7 +9,7 @@ function sha256(content: Buffer): string {
   return createHash("sha256").update(content).digest("hex");
 }
 
-const artifactKinds = new Set<ArtifactKind>(["attachment", "script_output", "script_artifact", "quality_report", "checkpoint_bundle", "checkpoint_manifest", "execution_manifest"]);
+const artifactKinds = new Set<ArtifactKind>(["attachment", "evidence", "script_output", "script_artifact", "quality_report", "checkpoint_bundle", "checkpoint_manifest", "execution_manifest", "execution_trace"]);
 function artifactRecord(value: unknown): value is ArtifactRecord {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const record = value as Record<string, unknown>;

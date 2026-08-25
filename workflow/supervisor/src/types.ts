@@ -98,7 +98,7 @@ export interface ClaimedTicket {
     working_directory?: { relative_to: "selected_repository" | "primary_repository" | "project_root"; path?: string; path_input?: string };
     inline?: { language: "shell" | "python" | "javascript"; code: string };
     script_output?: { persist_stdout: boolean; prompt_tail_lines: number };
-    artifacts?: Array<{ name: string; path: string; content_type: string; required: boolean; interpretation?: { kind: "quality_report"; schema: "agentic-quality/v1"; required_attributes: string[] } }>;
+    artifacts?: Array<{ name: string; path: string; content_type: string; required: boolean; presentation?: { title?: string; description?: string; category?: string; featured?: boolean }; interpretation?: { kind: "quality_report"; schema: "agentic-quality/v1"; required_attributes: string[] } }>;
     checkpoint_label?: string;
     checkpoint_source?: { mode: "latest" | "id" | "metadata"; checkpoint_id?: string; metadata_key?: string };
     outcomes: Array<{ id: string; label: string; description: string; target: string }>;
@@ -110,9 +110,17 @@ export interface ClaimedTicket {
 }
 
 export interface ArtifactRecord {
-  id: string; kind: "attachment" | "script_output" | "script_artifact" | "quality_report" | "checkpoint_bundle" | "checkpoint_manifest" | "execution_manifest";
+  id: string; kind: "attachment" | "evidence" | "script_output" | "script_artifact" | "quality_report" | "checkpoint_bundle" | "checkpoint_manifest" | "execution_manifest" | "execution_trace";
   ticket_id: string; node_run_id: string | null; filename: string; content_type: string;
   size_bytes: number; sha256: string; created_at: string; metadata: Record<string, unknown>;
+}
+
+export interface ExecutionTraceEvent {
+  sequence: number;
+  timestamp: string;
+  elapsed_ms: number;
+  event: string;
+  data: Record<string, unknown>;
 }
 
 export interface TicketCheckpoint {

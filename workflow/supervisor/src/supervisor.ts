@@ -9,9 +9,11 @@ import type { HarnessTelemetrySnapshot } from "./types.js";
 import { AssignmentBundleWriter, assignmentValues, type AssignmentBundle } from "./assignments.js";
 import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { createHash } from "node:crypto";
 import { captureRepositoryState, fileIdentity, supervisorRuntime } from "./provenance.js";
 import { log } from "./logger.js";
 import { executeIntakeSource, IntakeExecutionError } from "./intake.js";
+import { ExecutionTraceRecorder, type ExecutionTraceSink } from "./execution-trace.js";
 
 export interface SupervisorOptions {
   trackerUrl: string;
@@ -40,13 +42,29 @@ function errorMessage(error: unknown): string {
 }
 
 function deliveryActivityObserved(before: AgentObservation, after: AgentObservation): boolean {
-  return (before.state !== "working" && after.state === "working")
-    || (before.revision !== null && after.revision !== null && before.revision !== after.revision)
-    || (before.sessionRef === null && after.sessionRef !== null);
+  // Pane revisions advance for ordinary terminal rendering, and a native
+  // session reference can appear late during provider startup. Neither proves
+  // that the assignment reached the agent. Only Herdr's semantic transition
+  // from a settled input-ready state into working is acceptable lifecycle
+  // evidence after an ambiguous prompt. Unknown/blocked startup transitions
+  // remain unconfirmed and fall through to assignment-specific pane evidence.
+  return (before.state === "idle" || before.state === "done") && after.state === "working";
 }
 
 function agentCanAcceptInput(observation: AgentObservation): boolean {
   return observation.launchPending !== true && observation.interactiveReady !== false;
+}
+
+function stagedComposerEvidence(paneText: string, marker: string): "assignment_marker" | "collapsed_paste" | null {
+  if (paneText.includes(marker)) return "assignment_marker";
+  return /\[Pasted text(?: #\d+)? \+\d+ lines\]/i.test(paneText) ? "collapsed_paste" : null;
+}
+
+type AssignmentDeliveryConfirmation = "direct" | "observed_activity" | "submitted_staged_prompt";
+
+interface ConfirmedAssignmentDelivery {
+  observation: AgentObservation;
+  confirmation: AssignmentDeliveryConfirmation;
 }
 
 function bundleValues(ticket: ClaimedTicket, callbackBaseUrl: string, projectRoot: string, bundle: AssignmentBundle): Record<string, string> {
@@ -188,29 +206,41 @@ export class Supervisor {
     this.prompts.replace(byName as PromptTemplates);
   }
 
-  private async promptAssignment(provider: Provider, ticket: ClaimedTicket, paneId: string, bundle: AssignmentBundle, initial: AgentObservation): Promise<AgentObservation> {
+  private async promptAssignment(provider: Provider, ticket: ClaimedTicket, paneId: string, bundle: AssignmentBundle, initial: AgentObservation, trace?: ExecutionTraceSink): Promise<ConfirmedAssignmentDelivery> {
     const assignment = buildAssignmentPrompt(ticket, this.callbackBaseUrl, this.herdr.projectRoot, this.prompts, bundle);
-    if (await this.herdr.promptAndConfirm(paneId, assignment)) return initial;
+    trace?.record("delivery.assignment_prepared", {
+      assignment_path: bundle.startHerePath, callback_helper_path: bundle.callbackHelperPath,
+      prompt_bytes: Buffer.byteLength(assignment), prompt_sha256: createHash("sha256").update(assignment).digest("hex"),
+    });
+    if (await this.herdr.promptAndConfirm(paneId, assignment)) {
+      trace?.record("delivery.confirmed", { confirmation: "direct" });
+      return { observation: initial, confirmation: "direct" };
+    }
 
-    // Herdr's stalled result is ambiguous for full-screen agents. Claude may
-    // already have the text in its composer, or may process it after Herdr's
-    // five-second lifecycle window. Never paste the assignment a second time.
+    // Herdr's stalled and timeout results are ambiguous for full-screen agents.
+    // Claude may already have the text in its composer, or may process it after
+    // Herdr's wait window. Never paste the assignment a second time.
     const deadline = Date.now() + this.assignmentPromptRecoveryMs;
     let observation = initial;
     let readFailureLogged = false;
     const marker = bundle.startHerePath;
-    log("warn", "assignment.prompt_stalled_recovery_started", {
+    log("warn", "assignment.prompt_delivery_uncertain_recovery_started", {
       provider, ticket_id: ticket.frontmatter.id, node_id: ticket.workflow_node.id,
       lease_id: ticket.frontmatter.execution.lease_id, recovery_ms: this.assignmentPromptRecoveryMs,
     });
+    trace?.record("delivery.recovery_started", { recovery_ms: this.assignmentPromptRecoveryMs, initial_state: initial.state });
     while (true) {
       const after = await this.herdr.observe(paneId);
-      if (agentCanAcceptInput(after) && deliveryActivityObserved(initial, after)) {
+      if (deliveryActivityObserved(initial, after)) {
+        trace?.record("delivery.evaluated", {
+          accepted: true, confirmation: "observed_activity", evidence: "settled_to_working_transition",
+          before_state: initial.state, after_state: after.state,
+        });
         log("warn", "assignment.prompt_recovered", {
           provider, ticket_id: ticket.frontmatter.id, node_id: ticket.workflow_node.id,
-          lease_id: ticket.frontmatter.execution.lease_id, recovery: "observed_activity",
+          lease_id: ticket.frontmatter.execution.lease_id, recovery: "observed_activity", activity_evidence: "state_transition_to_working",
         });
-        return after;
+        return { observation: after, confirmation: "observed_activity" };
       }
       observation = after;
 
@@ -225,19 +255,46 @@ export class Supervisor {
           }, error);
         }
       }
-      if (agentCanAcceptInput(after) && paneText.includes(marker)) {
+      const composerEvidence = stagedComposerEvidence(paneText, marker);
+      trace?.record("delivery.evaluated", {
+        accepted: Boolean(agentCanAcceptInput(after) && composerEvidence),
+        before_state: initial.state, after_state: after.state,
+        revision_changed: initial.revision !== after.revision,
+        session_ref_appeared: initial.sessionRef === null && after.sessionRef !== null,
+        interactive_ready: after.interactiveReady ?? null, launch_pending: after.launchPending ?? null,
+        composer_evidence: composerEvidence,
+        ignored_signals: [
+          ...(initial.revision !== after.revision ? ["revision_changed"] : []),
+          ...(initial.sessionRef === null && after.sessionRef !== null ? ["session_ref_appeared"] : []),
+        ],
+      });
+      if (agentCanAcceptInput(after) && composerEvidence) {
         await this.herdr.sendKeys(paneId, "enter");
         const submitted = await this.herdr.observe(paneId).catch(() => observation);
+        trace?.record("delivery.confirmed", { confirmation: "submitted_staged_prompt", composer_evidence: composerEvidence });
         log("warn", "assignment.prompt_recovered", {
           provider, ticket_id: ticket.frontmatter.id, node_id: ticket.workflow_node.id,
-          lease_id: ticket.frontmatter.execution.lease_id, recovery: "submitted_staged_prompt",
+          lease_id: ticket.frontmatter.execution.lease_id, recovery: "submitted_staged_prompt", composer_evidence: composerEvidence,
         });
-        return submitted;
+        return { observation: submitted, confirmation: "submitted_staged_prompt" };
       }
 
       const remaining = deadline - Date.now();
       if (remaining <= 0) break;
       await sleep(Math.min(ASSIGNMENT_PROMPT_RECOVERY_POLL_MS, remaining));
+    }
+    try {
+      trace?.record("delivery.recovery_expired", { recovery_ms: this.assignmentPromptRecoveryMs, action: "clear_composer" });
+      await this.herdr.sendKeys(paneId, "ctrl+c");
+      log("warn", "assignment.prompt_recovery_cleared_composer", {
+        provider, ticket_id: ticket.frontmatter.id, node_id: ticket.workflow_node.id,
+        lease_id: ticket.frontmatter.execution.lease_id, pane_id: paneId,
+      });
+    } catch (error) {
+      log("warn", "assignment.prompt_recovery_clear_failed", {
+        provider, ticket_id: ticket.frontmatter.id, node_id: ticket.workflow_node.id,
+        lease_id: ticket.frontmatter.execution.lease_id, pane_id: paneId,
+      }, error);
     }
     throw new Error(`Herdr did not expose or start the assignment prompt for ${ticket.frontmatter.id} within ${this.assignmentPromptRecoveryMs}ms`);
   }
@@ -353,6 +410,7 @@ export class Supervisor {
           for (const artifact of result.pending_artifacts ?? []) {
             const record = await this.tracker.uploadArtifact(lease, {
               kind: artifact.kind, artifactName: artifact.key, filename: artifact.filename, contentType: artifact.content_type, content: await readFile(artifact.path),
+              ...(artifact.presentation ? { presentation: artifact.presentation } : {}),
             });
             uploaded.set(artifact.key, record.id);
           }
@@ -442,6 +500,25 @@ export class Supervisor {
     const lease = ticket.frontmatter.execution.lease_id;
     const trackerDeliveryPending = ticket.frontmatter.execution.delivery_status === "starting";
     let assignmentDelivered = !trackerDeliveryPending || this.locallyDeliveredLeases.has(lease);
+    const trace = new ExecutionTraceRecorder(
+      this.tracker,
+      lease,
+      join(this.assignments.root, this.options.supervisorId, "tickets", ticket.frontmatter.id, "trace-spool", ticket.frontmatter.execution.node_run_id ?? lease),
+      {
+        ticket_id: ticket.frontmatter.id, workflow_id: ticket.frontmatter.workflow.id,
+        workflow_revision: ticket.frontmatter.workflow.revision, node_id: ticket.workflow_node.id,
+        node_run_id: ticket.frontmatter.execution.node_run_id ?? null, lease_id: lease,
+        supervisor_id: this.options.supervisorId, provider,
+        model: ticket.resolved_agent_profile?.model ?? null, reasoning: ticket.resolved_agent_profile?.reasoning ?? null,
+        project_root: this.herdr.projectRoot,
+      },
+    );
+    await trace.start();
+    let traceDisposition = "supervisor_loop_ended";
+    const executeWithTrace = typeof this.herdr.withTrace === "function"
+      ? (work: () => Promise<void>) => this.herdr.withTrace(trace, work)
+      : (work: () => Promise<void>) => work();
+    return executeWithTrace(async () => {
     log("info", assignmentDelivered ? "work.agent_resuming" : "work.assignment_starting", {
       provider, supervisor_id: this.options.supervisorId, ticket_id: ticket.frontmatter.id, node_id: ticket.workflow_node.id, lease_id: lease,
     });
@@ -462,6 +539,11 @@ export class Supervisor {
       node_id: ticket.workflow_node.id, lease_id: lease, pane_id: observation.paneId,
       interactive_ready: observation.interactiveReady ?? null, launch_pending: observation.launchPending ?? null,
       startup_wait_ms: Date.now() - agentStartupStartedAt,
+    });
+    trace.record("agent.ready", {
+      pane_id: observation.paneId, state: observation.state,
+      interactive_ready: observation.interactiveReady ?? null, launch_pending: observation.launchPending ?? null,
+      session_ref: observation.sessionRef, startup_wait_ms: Date.now() - agentStartupStartedAt,
     });
     const telemetryContext = (sessionRef: string): TelemetryContext => ({ harness: provider, sessionRef, cwd: observation.foregroundCwd ?? observation.cwd });
     let telemetryBaseline = ticket.frontmatter.execution.telemetry?.baseline ?? null;
@@ -496,15 +578,17 @@ export class Supervisor {
       await this.finalizeExecution(ticket, lease, repositoryStart, {
         agent: { provider, conversation, generation, pane_id: observation.paneId, session_ref: observation.sessionRef, disposition: "interrupted_before_prompt" },
       });
+      traceDisposition = "interrupted_before_prompt";
       return;
     }
     if (!assignmentDelivered) {
       // Do not enter the reminder loop until Herdr has observed assignment activity.
       // An ambiguous stalled submission is recovered without pasting a duplicate.
-      observation = await this.promptAssignment(provider, currentTicket, observation.paneId, bundle, observation);
+      const delivered = await this.promptAssignment(provider, currentTicket, observation.paneId, bundle, observation, trace);
+      observation = delivered.observation;
       assignmentDelivered = true;
       this.locallyDeliveredLeases.add(lease);
-      await this.tracker.confirmAssignmentDelivery(lease).catch((error) => {
+      await this.tracker.confirmAssignmentDelivery(lease, delivered.confirmation).catch((error) => {
         // A fast terminal callback may fence the lease before prompt delivery returns.
         if (!(error instanceof TrackerError && error.status === 409)) throw error;
       });
@@ -526,6 +610,7 @@ export class Supervisor {
         throw error;
       });
       if (control === null) {
+        trace.record("tracker.callback_observed", { lease_active: false });
         this.locallyDeliveredLeases.delete(lease);
         let finalObservation = null;
         try {
@@ -546,9 +631,11 @@ export class Supervisor {
         });
         await this.herdr.interrupt(observation.paneId).catch(() => undefined);
         log("info", "work.agent_settled", { provider, supervisor_id: this.options.supervisorId, ticket_id: ticket.frontmatter.id, node_id: ticket.workflow_node.id, lease_id: lease, disposition: "callback" });
+        traceDisposition = "callback";
         return;
       }
       if (control?.interrupt) {
+        trace.record("tracker.interrupt_observed", { request: control.interrupt });
         await this.herdr.interrupt(observation.paneId);
         try {
           const finalObservation = await this.herdr.observe(observation.paneId);
@@ -567,11 +654,17 @@ export class Supervisor {
             disposition: "interrupted",
           },
         });
+        traceDisposition = "interrupted";
         return;
       }
       let current;
       try { current = await this.herdr.observe(observation.paneId); }
-      catch (error) { log("error", "herdr.agent_disappeared", { provider, ticket_id: ticket.frontmatter.id, node_id: ticket.workflow_node.id, lease_id: lease }, error); return; }
+      catch (error) {
+        trace.record("agent.observation_failed", { error: errorMessage(error) });
+        log("error", "herdr.agent_disappeared", { provider, ticket_id: ticket.frontmatter.id, node_id: ticket.workflow_node.id, lease_id: lease }, error);
+        traceDisposition = "agent_disappeared";
+        return;
+      }
       const revisionAdvanced = current.revision !== null && lastObservedRevision !== null && current.revision !== lastObservedRevision;
       if (current.state === "working" || revisionAdvanced) lastObservedActivityAt = Date.now();
       lastObservedRevision = current.revision;
@@ -590,6 +683,7 @@ export class Supervisor {
           ...bundleValues(currentTicket, this.callbackBaseUrl, this.herdr.projectRoot, bundle),
           message: item.message, update_path: updatePath,
         }));
+        trace.record("guidance.delivered", { guidance_id: item.id, sequence: item.sequence, update_path: updatePath });
         lastObservedActivityAt = Date.now();
         cursor = Math.max(cursor, item.sequence);
       }
@@ -622,6 +716,11 @@ export class Supervisor {
         callbackReminderSent = true;
         await this.refreshPrompts();
         await this.herdr.prompt(current.paneId, buildCallbackReminder(currentTicket, this.callbackBaseUrl, this.herdr.projectRoot, this.prompts, bundle));
+        trace.record("callback_reminder.delivered", { pane_id: current.paneId, assignment_path: bundle.startHerePath });
+        log("warn", "assignment.callback_reminder_sent", {
+          provider, supervisor_id: this.options.supervisorId, ticket_id: ticket.frontmatter.id,
+          node_id: ticket.workflow_node.id, lease_id: lease, pane_id: current.paneId,
+        });
       }
     }
     } catch (error) {
@@ -634,19 +733,29 @@ export class Supervisor {
             provider, supervisor_id: this.options.supervisorId, ticket_id: ticket.frontmatter.id,
             node_id: ticket.workflow_node.id, lease_id: lease, disposition: result.blocked ? "blocked" : "requeued",
           }, error);
+          trace.record("delivery.failed", { reason, disposition: result.blocked ? "blocked" : "requeued" });
+          traceDisposition = result.blocked ? "delivery_failed_blocked" : "delivery_failed_requeued";
           await sleep(this.options.idlePollMs);
           return;
         } catch (reportError) {
-          if (reportError instanceof TrackerError && reportError.status === 409) return;
+          if (reportError instanceof TrackerError && reportError.status === 409) {
+            trace.record("delivery.report_fenced", { reason });
+            traceDisposition = "delivery_report_fenced";
+            return;
+          }
           log("error", "work.assignment_delivery_report_failed", {
             provider, supervisor_id: this.options.supervisorId, ticket_id: ticket.frontmatter.id,
             node_id: ticket.workflow_node.id, lease_id: lease,
           }, reportError);
         }
       }
+      trace.record("execution.supervisor_failed", { error: errorMessage(error), assignment_delivered: assignmentDelivered });
+      traceDisposition = assignmentDelivered ? "supervisor_failed" : "delivery_report_failed";
       throw error;
     } finally {
       stopLeaseRenewal();
+      await trace.close(traceDisposition);
     }
+    });
   }
 }

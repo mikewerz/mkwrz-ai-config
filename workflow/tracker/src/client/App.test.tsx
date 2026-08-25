@@ -12,6 +12,7 @@ const summary = {
   priority: 50, provider: "claude", revision: 7, created_at: "2026-08-14T11:00:00Z", updated_at: "2026-08-14T12:01:30Z", valid: true, errors: [], path: "APT-42.md", claim_blockers: [], archived_at: null,
   labels: ["dashboard"], repositories: ["demo"], assigned_supervisor: "coordinator-vm", estimated_human_days: null,
   workflow_id: "standard-delivery", workflow_node_id: "implementation", workflow_node_name: "Implementation", workflow_stage_name: "Implementation",
+  attention: { kinds: [] as Array<"question" | "human_gate" | "blocked" | "failed" | "delivery_failure" | "github_feedback" | "expiring_wait" | "repository_blocked">, pending_questions: 0, wait_wake_at: null as string | null, wait_deadline_at: null as string | null, delivery_failure_summary: null as string | null, github_feedback_summary: null as string | null },
 };
 
 const execution = {
@@ -153,6 +154,7 @@ describe("operator UI", () => {
   beforeEach(() => {
     installLocalStorage();
     document.documentElement.removeAttribute("data-theme");
+    summary.attention = { kinds: [], pending_questions: 0, wait_wake_at: null, wait_deadline_at: null, delivery_failure_summary: null, github_feedback_summary: null };
     current = structuredClone(detail);
     current.workflow_definition = structuredClone(workflowDefinition);
     current.workflow_node = structuredClone(workflowDefinition.nodes.find((node) => node.id === "implementation"));
@@ -284,6 +286,15 @@ describe("operator UI", () => {
         current.frontmatter.revision += 1;
         return Response.json(current);
       }
+      if (path === "/api/tickets/APT-42/artifacts/evidence-1/content" && !init?.method) {
+        return new Response("# Review summary\n\n- Verification passed.\n- Ready for approval.", { headers: { "Content-Type": "text/markdown" } });
+      }
+      if (path === "/api/tickets/APT-42/artifacts/trace-1/content" && !init?.method) {
+        return new Response([
+          JSON.stringify({ sequence: 1, timestamp: "2026-08-14T11:00:00Z", elapsed_ms: 0, event: "herdr.command_started", data: { command: "agent.prompt", payload_bytes: 400, payload_sha256: "1".repeat(64) } }),
+          JSON.stringify({ sequence: 2, timestamp: "2026-08-14T11:00:01Z", elapsed_ms: 1000, event: "delivery.confirmed", data: { confirmation: "direct" } }),
+        ].join("\n") + "\n", { headers: { "Content-Type": "application/x-ndjson" } });
+      }
       if (path === "/api/tickets/APT-42" && !init?.method) return Response.json(current);
       if (path === "/api/tickets/APT-42" && init?.method === "PUT") {
         current = { ...current, markdown: String(JSON.parse(String(init.body)).markdown) };
@@ -305,6 +316,11 @@ describe("operator UI", () => {
         current.frontmatter.status = "pending";
         current.frontmatter.execution = null;
         current.frontmatter.revision += 1;
+        return Response.json(current);
+      }
+      if (path === "/api/tickets/APT-42/decide" && init?.method === "POST") {
+        current.frontmatter.status = "ready";
+        current.frontmatter.workflow.current_node = "implementation";
         return Response.json(current);
       }
       if (path.startsWith("/api/tickets/APT-42/questions/") && path.endsWith("/answer") && init?.method === "POST") {
@@ -352,6 +368,50 @@ describe("operator UI", () => {
     expect(await screen.findByRole("button", { name: "Use Retro Hacker theme" })).toHaveAttribute("aria-pressed", "true");
   });
 
+  it("puts a unified attention inbox first and exposes gate and question actions inline", async () => {
+    current.frontmatter.status = "waiting_approval";
+    current.frontmatter.execution = null;
+    current.frontmatter.workflow.current_node = "specification-approval";
+    current.workflow_node = structuredClone(workflowDefinition.nodes.find((node) => node.id === "specification-approval"));
+    current.frontmatter.questions = [{ id: "question-1", question: "**Which rollout window?**", options: ["Morning", "Evening"], asked_at: "2026-08-14T12:00:00Z", answer: null, answered_at: null }];
+    summary.attention = { kinds: ["question", "human_gate"], pending_questions: 1, wait_wake_at: null, wait_deadline_at: null, delivery_failure_summary: null, github_feedback_summary: null };
+
+    render(<App />);
+    const navigation = await screen.findByRole("navigation");
+    expect(within(navigation).getAllByRole("button")[0]).toHaveTextContent("Inbox");
+    fireEvent.click(within(navigation).getByRole("button", { name: /Inbox/ }));
+
+    const answer = await screen.findByRole("textbox", { name: /Inbox answer/ });
+    const item = answer.closest("article")!;
+    expect(within(item).getByText("Which rollout window?")).toBeInTheDocument();
+    expect(within(item).getByRole("button", { name: "Morning" })).toBeInTheDocument();
+    expect(answer).toBeInTheDocument();
+    expect(within(item).getByRole("button", { name: /^Approve/ })).toBeInTheDocument();
+    expect(within(item).getByRole("button", { name: /^Request changes/ })).toBeInTheDocument();
+  });
+
+  it("restores the selected ticket, evidence position, graph zoom, and queue filters", async () => {
+    current.frontmatter.artifacts = [{ id: "evidence-1", kind: "evidence", ticket_id: "APT-42", node_run_id: null, filename: "review.md", content_type: "text/markdown", size_bytes: 72, sha256: "f".repeat(64), created_at: "2026-08-14T11:05:00Z", metadata: { presentation: { title: "Release review", category: "review", featured: true } } }];
+    window.localStorage.setItem("agentic-project-tracker.view", JSON.stringify("tickets"));
+    window.localStorage.setItem("agentic-project-tracker.selected-ticket", JSON.stringify("APT-42"));
+    window.localStorage.setItem("agentic-project-tracker.evidence.tab", JSON.stringify("review"));
+    window.localStorage.setItem("agentic-project-tracker.evidence.preview.APT-42", JSON.stringify("evidence-1"));
+    window.localStorage.setItem("agentic-project-tracker.graph.zoom", JSON.stringify(1.15));
+
+    const first = render(<App />);
+    expect(await screen.findByRole("heading", { name: "UI ticket" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Reset zoom" })).toHaveTextContent("115%");
+    expect(await screen.findByRole("heading", { name: "Review summary" })).toBeInTheDocument();
+    first.unmount();
+
+    window.localStorage.removeItem("agentic-project-tracker.selected-ticket");
+    window.localStorage.setItem("agentic-project-tracker.queue.query", JSON.stringify("dashboard"));
+    window.localStorage.setItem("agentic-project-tracker.queue.status", JSON.stringify("running"));
+    render(<App />);
+    expect(await screen.findByLabelText("Search tickets")).toHaveValue("dashboard");
+    expect(screen.getByLabelText("Queue status")).toHaveValue("running");
+  });
+
   it("authors campaigns and sources through structured intake forms while retaining advanced YAML", async () => {
     // Arrange and execute
     render(<App />);
@@ -390,6 +450,23 @@ describe("operator UI", () => {
     expect(screen.getByRole("link", { name: /Open draft PR/i })).toHaveAttribute("href", "https://github.com/example/demo/pull/42");
     expect(screen.queryByLabelText("Raw ticket Markdown")).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Save ticket" })).not.toBeInTheDocument();
+    expect(screen.getByLabelText("What happens next")).toHaveTextContent("Claude working");
+    expect(screen.getByLabelText("What happens next")).toHaveTextContent("Agent callback selects the next path");
+    expect(screen.getAllByText("Running")).toHaveLength(1);
+    expect(screen.getByText("Active")).toBeInTheDocument();
+    expect(screen.getByText("Elapsed")).toBeInTheDocument();
+  });
+
+  it("keeps a long Herdr pane name inside the responsive runtime heading", async () => {
+    const paneName = "apt_agent00_b30459488a_claude_wg";
+    current.frontmatter.execution.herdr_observation.display_name = paneName;
+
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: /UI ticket/i }));
+
+    const heading = await screen.findByRole("heading", { name: paneName });
+    expect(heading).toHaveAttribute("title", paneName);
+    expect(heading.closest(".runtime-heading")).toBeInTheDocument();
   });
 
   it("separates assignment delivery from neutral Herdr idle observations", async () => {
@@ -430,10 +507,12 @@ describe("operator UI", () => {
       ...(index === 12 ? { supervisor_id: "worker-a", provider: "claude", input_revision: 7, conversation_generation: 2, output_path: ".runs/output.log", output_bytes: 2_048, manifest_artifact_id: "execution-manifest" } : {}),
     }));
     current.frontmatter.artifacts = [
+      { id: "evidence-1", kind: "evidence", ticket_id: "APT-42", node_run_id: "run-12", filename: "review.md", content_type: "text/markdown", size_bytes: 72, sha256: "f".repeat(64), created_at: "2026-08-14T11:05:00Z", metadata: { presentation: { title: "Release review", description: "Readable outside a human gate.", category: "review", featured: true } } },
       { id: "execution-manifest", kind: "execution_manifest", ticket_id: "APT-42", node_run_id: "run-12", filename: "run-12.execution-manifest.json", content_type: "application/json", size_bytes: 900, sha256: "a".repeat(64), created_at: "2026-08-14T11:04:00Z", metadata: {} },
-      { id: "script-report", kind: "script_artifact", ticket_id: "APT-42", node_run_id: "run-12", filename: "verification.html", content_type: "text/html", size_bytes: 1_024, sha256: "b".repeat(64), created_at: "2026-08-14T11:03:00Z", metadata: {} },
+      { id: "script-report", kind: "script_artifact", ticket_id: "APT-42", node_run_id: "run-11", filename: "verification.html", content_type: "text/html", size_bytes: 1_024, sha256: "b".repeat(64), created_at: "2026-08-14T11:03:00Z", metadata: {} },
       { id: "checkpoint-manifest", kind: "checkpoint_manifest", ticket_id: "APT-42", node_run_id: "run-12", filename: "checkpoint-1.json", content_type: "application/json", size_bytes: 500, sha256: "c".repeat(64), created_at: "2026-08-14T11:02:00Z", metadata: {} },
       { id: "checkpoint-bundle", kind: "checkpoint_bundle", ticket_id: "APT-42", node_run_id: "run-12", filename: "demo.bundle", content_type: "application/x-git-bundle", size_bytes: 4_096, sha256: "d".repeat(64), created_at: "2026-08-14T11:01:00Z", metadata: {} },
+      { id: "trace-1", kind: "execution_trace", ticket_id: "APT-42", node_run_id: "run-12", filename: "run-12.000001-000002.herdr-trace.jsonl", content_type: "application/x-ndjson", size_bytes: 400, sha256: "1".repeat(64), created_at: "2026-08-14T11:01:30Z", metadata: { trace_id: "trace-id", first_sequence: 1, last_sequence: 2, event_count: 2, completed: true } },
     ];
     current.frontmatter.checkpoints = [{ id: "checkpoint-1", label: "Before release", kind: "workflow", node_id: "implementation", node_run_id: "run-12", created_at: "2026-08-14T11:02:00Z", manifest_artifact_id: "checkpoint-manifest", repositories: [{ repository: "demo", head_sha: "1".repeat(40), snapshot_sha: "2".repeat(40), branch: "main", remote_url: "https://github.com/example/demo.git", dirty: true, bundle_artifact_id: "checkpoint-bundle" }] }];
     current.frontmatter.attachments = [{ id: "attachment-1", filename: "requirements.txt", content_type: "text/plain", size_bytes: 42, sha256: "e".repeat(64), created_at: "2026-08-14T10:00:00Z" }];
@@ -442,18 +521,35 @@ describe("operator UI", () => {
     fireEvent.click(await screen.findByRole("button", { name: /UI ticket/i }));
     const evidence = (await screen.findByRole("heading", { name: "Evidence & artifacts" })).closest("section")!;
 
+    expect(within(evidence).queryByText("verification.html")).not.toBeInTheDocument();
+    fireEvent.click(within(evidence).getByRole("checkbox", { name: /Latest from each node/ }));
     expect(within(evidence).getByText("verification.html")).toBeInTheDocument();
-    const manifestRow = within(evidence).getByText("run-12.execution-manifest.json").closest("article")!;
-    expect(within(manifestRow).getByRole("link", { name: "Download" })).toHaveAttribute("href", "/api/tickets/APT-42/artifacts/execution-manifest/content?download=true");
+    const evidenceRow = within(evidence).getByText(/Release review/).closest("article")!;
+    expect(within(evidenceRow).getByText("Readable outside a human gate.")).toBeInTheDocument();
+    fireEvent.click(within(evidenceRow).getByRole("button", { name: "Preview" }));
+    expect(await within(evidenceRow).findByRole("heading", { name: "Review summary" })).toBeInTheDocument();
+    fireEvent.click(within(evidenceRow).getByRole("button", { name: "Fullscreen" }));
+    const dialog = await screen.findByRole("dialog", { name: /Artifact preview: Release review/ });
+    expect(within(dialog).getByRole("heading", { name: "Release review" })).toBeInTheDocument();
+    fireEvent.click(within(dialog).getByRole("button", { name: "Close" }));
+    fireEvent.click(within(evidenceRow).getByRole("button", { name: "Close preview" }));
+    expect(within(evidenceRow).queryByRole("heading", { name: "Review summary" })).not.toBeInTheDocument();
     fireEvent.click(within(evidence).getByRole("tab", { name: /Run history/ }));
     expect(evidence.querySelectorAll(".run-evidence")).toHaveLength(13);
     expect(within(evidence).getByText("Historic Run")).toBeInTheDocument();
     expect(within(evidence).getByText("worker-a · Claude")).toBeInTheDocument();
     expect(within(evidence).getByText("workflow-r1 · ticket r7")).toBeInTheDocument();
-    fireEvent.click(within(evidence).getByRole("tab", { name: /Manifests/ }));
+    fireEvent.click(within(evidence).getByRole("tab", { name: /Operational traces/ }));
+    fireEvent.click(within(evidence).getByText(/Herdr operational trace/).closest("summary")!);
+    expect((await within(evidence).findAllByText(/agent\.prompt/)).length).toBeGreaterThan(0);
+    expect(within(evidence).getByText("Delivery Confirmed")).toBeInTheDocument();
+    expect(within(evidence).getByRole("link", { name: "JSONL 1" })).toHaveAttribute("href", "/api/tickets/APT-42/artifacts/trace-1/content?download=true");
+    fireEvent.click(within(evidence).getByRole("tab", { name: /Technical artifacts/ }));
+    const manifestRow = within(evidence).getByText("run-12.execution-manifest.json").closest("article")!;
+    expect(within(manifestRow).getByRole("link", { name: "Download" })).toHaveAttribute("href", "/api/tickets/APT-42/artifacts/execution-manifest/content?download=true");
     expect(within(evidence).getByText("run-12.execution-manifest.json")).toBeInTheDocument();
     expect(within(evidence).getByText("checkpoint-1.json")).toBeInTheDocument();
-    fireEvent.click(within(evidence).getByRole("tab", { name: /Outputs/ }));
+    fireEvent.click(within(evidence).getByRole("tab", { name: /Review packet/ }));
     expect(within(evidence).getByRole("link", { name: /Implementation output/ })).toHaveAttribute("href", "/api/tickets/APT-42/runs/run-12/output");
     fireEvent.click(within(evidence).getByRole("tab", { name: /Checkpoints/ }));
     expect(within(evidence).getByText("Before release")).toBeInTheDocument();
@@ -461,6 +557,33 @@ describe("operator UI", () => {
     fireEvent.click(within(evidence).getByRole("tab", { name: /Attachments/ }));
     expect(within(evidence).getByText("requirements.txt")).toBeInTheDocument();
     expect(within(evidence).getByLabelText("Add ticket attachments")).toBeInTheDocument();
+  });
+
+  it("summarizes a completed execution path, accounting, evidence, PRs, and production result", async () => {
+    const timing = { active_ms: 60_000, quota_paused_ms: 0, human_wait_ms: 0, external_wait_ms: 0, state: "active", last_accounted_at: null, pause_limit_id: null, pause_until: null };
+    current.frontmatter.status = "completed";
+    current.frontmatter.phase = "done";
+    current.frontmatter.execution = null;
+    current.frontmatter.production_result = "succeeded";
+    current.frontmatter.production_assessment_note = "Healthy in production.";
+    current.frontmatter.questions = [{ id: "q1", question: "Ship it?", options: [], answer: "Yes", asked_at: "2026-08-14T11:00:00Z", answered_at: "2026-08-14T11:01:00Z" }];
+    current.frontmatter.artifacts = [{ id: "evidence-1", kind: "evidence", ticket_id: "APT-42", node_run_id: "run-1", filename: "review.md", content_type: "text/markdown", size_bytes: 72, sha256: "f".repeat(64), created_at: "2026-08-14T11:05:00Z", metadata: { presentation: { title: "Release review", category: "review", featured: true } } }];
+    current.frontmatter.workflow.current_node = "done";
+    current.frontmatter.workflow.completed_at = "2026-08-14T12:05:00Z";
+    const usage = { input_tokens: 10_000, cached_input_tokens: 0, cache_write_input_tokens: 0, output_tokens: 2_000, reasoning_output_tokens: 0, total_tokens: 12_000 };
+    const snapshot = { schema_version: 1, harness: "claude", session_ref: "session-1", observed_at: "2026-08-14T11:01:00Z", source: { kind: "session_log", detail: "session.jsonl" }, model: { id: "claude-opus", provider: "anthropic", observed_ids: ["claude-opus"] }, reasoning: { effort: "high", enabled: true, source: "session" }, usage, cost: { total_usd: 1.25, kind: "reported" }, context: { used_tokens: 12_000, window_tokens: 200_000, used_percent: 6 }, rate_limits: [], attributes: {} };
+    current.frontmatter.workflow.node_runs = [{ id: "run-1", workflow_revision: "workflow-r1", node_id: "implementation", node_type: "agent", visit: 1, attempt: 1, status: "completed", outcome: "completed", summary: "Implemented", started_at: "2026-08-14T11:00:00Z", completed_at: "2026-08-14T11:01:00Z", lease_id: "lease-1", timing, telemetry: { baseline: { ...snapshot, usage: { ...usage, input_tokens: 0, output_tokens: 0, total_tokens: 0 }, cost: { total_usd: 0, kind: "reported" } }, latest: snapshot, delta: { usage, cost_usd: 1.25 } } }];
+    current.workflow_node = structuredClone(workflowDefinition.nodes.find((node) => node.id === "done"));
+
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: /UI ticket/i }));
+    const recap = await screen.findByLabelText("Execution recap");
+    expect(within(recap).getByText("Implementation")).toBeInTheDocument();
+    expect(within(recap).getByText("12K")).toBeInTheDocument();
+    expect(within(recap).getByText("$1.25")).toBeInTheDocument();
+    expect(within(recap).getByRole("link", { name: /demo · PR/ })).toHaveAttribute("href", "https://github.com/example/demo/pull/42");
+    expect(within(recap).getByRole("link", { name: /Release review/ })).toBeInTheDocument();
+    expect(within(recap).getByText("Healthy in production.")).toBeInTheDocument();
   });
 
   it("shows normalized quality evidence from immutable YAML artifacts", async () => {
@@ -839,8 +962,42 @@ describe("operator UI", () => {
     current.workflow_node = structuredClone(workflowDefinition.nodes.find((node) => node.id === "specification-approval"));
     render(<App />);
     fireEvent.click(await screen.findByRole("button", { name: /UI ticket/i }));
-    expect(await screen.findByRole("button", { name: "Approve" })).toBeInTheDocument();
+    const review = await screen.findByRole("region", { name: "Review materials" });
+    expect(within(review).getByRole("button", { name: /Approve/ })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Check GitHub feedback" })).toBeInTheDocument();
+  });
+
+  it("previews permissive review evidence beside the human-gate decision", async () => {
+    current.frontmatter.phase = "specification";
+    current.frontmatter.status = "waiting_approval";
+    current.frontmatter.execution = null;
+    current.frontmatter.workflow.current_node = "specification-approval";
+    current.frontmatter.workflow.incoming = { source_node: "specification", target_node: "specification-approval", outcome: "completed", summary: "The proposed specification is ready for review.", handoff: "Review the evidence." };
+    current.frontmatter.workflow.node_runs = [{ id: "spec-run-1", workflow_revision: "workflow-r1", node_id: "specification", node_type: "agent", visit: 1, attempt: 1, status: "completed", outcome: "completed", summary: "The proposed specification is ready for review.", started_at: "2026-08-14T12:00:00Z", completed_at: "2026-08-14T12:01:00Z", lease_id: "spec-lease", telemetry: null, timing: { active_ms: 60_000, quota_paused_ms: 0, human_wait_ms: 0, external_wait_ms: 0, state: "active", last_accounted_at: null, pause_limit_id: null, pause_until: null } }];
+    current.frontmatter.artifacts = [{
+      id: "evidence-1", kind: "evidence", ticket_id: "APT-42", node_run_id: "spec-run-1", filename: "review.md", content_type: "text/markdown",
+      size_bytes: 66, sha256: "b".repeat(64), created_at: "2026-08-14T12:01:00Z",
+      metadata: { presentation: { title: "Specification review", description: "The important decisions and verification evidence.", category: "approval", featured: true } },
+    }];
+    current.workflow_node = structuredClone(workflowDefinition.nodes.find((node) => node.id === "specification-approval"));
+
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: /UI ticket/i }));
+
+    const workflow = await screen.findByRole("region", { name: "Ticket workflow" });
+    const review = await screen.findByRole("region", { name: "Review materials" });
+    expect(workflow.nextElementSibling).toBe(review);
+    expect(within(review).getByRole("heading", { name: "Approve specification" })).toBeInTheDocument();
+    expect(within(review).getByRole("heading", { name: "Specification review" })).toBeInTheDocument();
+    expect(within(review).getByText("The important decisions and verification evidence.")).toBeInTheDocument();
+    expect(await within(review).findByText("Verification passed.")).toBeInTheDocument();
+    const prompt = vi.spyOn(window, "prompt").mockReturnValue("Review pull request example/demo#42.");
+    fireEvent.click(within(review).getByRole("button", { name: /Approve/ }));
+    await waitFor(() => expect(fetch).toHaveBeenCalledWith("/api/tickets/APT-42/decide", expect.objectContaining({
+      method: "POST",
+      body: expect.stringMatching(/"decision":"approved".*"message":"Review pull request example\/demo#42\."/),
+    })));
+    expect(prompt).toHaveBeenCalledWith(expect.stringContaining("The selected answer controls workflow routing; this comment does not."));
   });
 
   it("uses a structured editor while a ticket is pending", async () => {
@@ -939,20 +1096,28 @@ describe("operator UI", () => {
     expect(fetch).toHaveBeenCalledWith("/api/tickets?include_archived=true", expect.anything());
   });
 
-  it("offers agent-suggested answers while preserving a freeform response", async () => {
+  it("places a formatted pending question below the workflow and supports suggested or freeform answers", async () => {
     current.frontmatter.status = "blocked";
     current.frontmatter.questions = [{
-      id: "question-1", phase: "implementation", question: "Which environment?",
+      id: "question-1", phase: "implementation", question: "Which **environment** should receive this change?\n\n- Consider deployment risk.\n- Preserve current data.",
       options: ["Development", "Staging", "Both"], asked_at: "2026-08-14T12:01:00Z", answer: null, answered_at: null,
     }];
     render(<App />);
     fireEvent.click(await screen.findByRole("button", { name: /UI ticket/i }));
-    const answer = await screen.findByLabelText("Answer: Which environment?");
-    expect(answer).toHaveAttribute("placeholder", "Type any answer…");
-    fireEvent.click(screen.getByRole("button", { name: "Staging" }));
+    const workflow = await screen.findByRole("region", { name: "Ticket workflow" });
+    const questions = await screen.findByRole("region", { name: "Agent questions" });
+    expect(workflow.nextElementSibling).toBe(questions);
+    expect(within(questions).getByRole("heading", { name: "Agent needs your input" })).toBeInTheDocument();
+    expect(within(questions).getByText("environment").tagName).toBe("STRONG");
+    expect(within(questions).getByText("Consider deployment risk.")).toBeInTheDocument();
+    const answer = within(questions).getByRole("textbox");
+    expect(answer).toHaveAttribute("placeholder", "Write a response or choose an option above…");
+    const staging = within(questions).getByRole("button", { name: "Staging" });
+    fireEvent.click(staging);
+    expect(staging).toHaveAttribute("aria-pressed", "true");
     expect(answer).toHaveValue("Staging");
     fireEvent.change(answer, { target: { value: "Production after the change window" } });
-    fireEvent.click(screen.getByRole("button", { name: "Send answer" }));
+    fireEvent.click(within(questions).getByRole("button", { name: "Send response" }));
     await waitFor(() => expect(fetch).toHaveBeenCalledWith("/api/tickets/APT-42/questions/question-1/answer", expect.objectContaining({
       method: "POST", body: expect.stringContaining('"answer":"Production after the change window"'),
     })));

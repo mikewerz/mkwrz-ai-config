@@ -1,4 +1,4 @@
-import type { ActivityCapability, AgentObservation, ArtifactRecord, ClaimedIntakeRun, ClaimedTicket, Guidance, HarnessTelemetrySnapshot, IntakeCandidate, InterruptRequest, Provider, SupervisorPresence, TrackerConfig, TrackerPrompt } from "./types.js";
+import type { ActivityCapability, AgentObservation, ArtifactRecord, ClaimedIntakeRun, ClaimedTicket, ExecutionTraceEvent, Guidance, HarnessTelemetrySnapshot, IntakeCandidate, InterruptRequest, Provider, SupervisorPresence, TrackerConfig, TrackerPrompt } from "./types.js";
 
 export class TrackerError extends Error {
   constructor(public readonly status: number, message: string, public readonly code: string | null = null) { super(message); }
@@ -92,8 +92,13 @@ export class TrackerClient {
     return this.request<unknown>(`/api/work/${lease}/activity-result`, { method: "POST", body: JSON.stringify(result) });
   }
 
-  async uploadArtifact(lease: string, input: { kind: "script_artifact" | "quality_report" | "checkpoint_bundle"; artifactName: string; filename: string; contentType: string; content: Buffer }): Promise<ArtifactRecord> {
-    const query = new URLSearchParams({ kind: input.kind, artifact_name: input.artifactName, filename: input.filename, content_type: input.contentType });
+  async uploadArtifact(lease: string, input: { kind: "evidence" | "script_artifact" | "quality_report" | "checkpoint_bundle"; artifactName?: string; filename: string; contentType: string; content: Buffer; presentation?: { title?: string; description?: string; category?: string; featured?: boolean } }): Promise<ArtifactRecord> {
+    const query = new URLSearchParams({ kind: input.kind, filename: input.filename, content_type: input.contentType });
+    if (input.artifactName) query.set("artifact_name", input.artifactName);
+    if (input.presentation?.title) query.set("title", input.presentation.title);
+    if (input.presentation?.description) query.set("description", input.presentation.description);
+    if (input.presentation?.category) query.set("category", input.presentation.category);
+    if (input.presentation?.featured) query.set("featured", "true");
     const response = await this.fetch(`/api/work/${lease}/artifacts?${query}`, {
       method: "POST", headers: { "Content-Type": "application/octet-stream" }, body: new Uint8Array(input.content),
     }, this.artifactTimeoutMs);
@@ -173,13 +178,27 @@ export class TrackerClient {
     return this.request<{ active: boolean }>(`/api/work/${lease}/heartbeat`, { method: "POST", body: "{}" });
   }
 
-  confirmAssignmentDelivery(lease: string): Promise<unknown> {
-    return this.request<unknown>(`/api/work/${lease}/delivered`, { method: "POST", body: "{}" });
+  confirmAssignmentDelivery(lease: string, confirmation: "direct" | "observed_activity" | "submitted_staged_prompt" = "direct"): Promise<unknown> {
+    return this.request<unknown>(`/api/work/${lease}/delivered`, {
+      method: "POST", body: JSON.stringify({ confirmation }),
+    });
   }
 
   rejectAssignmentDelivery(lease: string, reason: string): Promise<{ requeued: boolean; blocked: boolean }> {
     return this.request<{ requeued: boolean; blocked: boolean }>(`/api/work/${lease}/delivery-failed`, {
       method: "POST", body: JSON.stringify({ reason }),
+    });
+  }
+
+  appendExecutionTrace(lease: string, input: { traceId: string; firstSequence: number; events: ExecutionTraceEvent[]; completed?: boolean }): Promise<{ artifact: ArtifactRecord; next_sequence: number }> {
+    return this.request<{ artifact: ArtifactRecord; next_sequence: number }>(`/api/work/${lease}/trace/events`, {
+      method: "POST",
+      body: JSON.stringify({
+        trace_id: input.traceId,
+        first_sequence: input.firstSequence,
+        events: input.events,
+        ...(input.completed ? { completed: true } : {}),
+      }),
     });
   }
 

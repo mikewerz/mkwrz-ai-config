@@ -315,7 +315,7 @@ The old coarse `phase` values—`specification`, `implementation`, `review`, and
 
 Herdr lifecycle state is observational. A pane becoming idle or done never advances a workflow. An agent node advances only through its lease-fenced callback.
 
-Agent startup and prompt submission are also outside the workflow graph. A claim remains `starting` while the supervisor waits for Herdr to report that the provider is interactively ready and launch is no longer pending, through a short stable-settle interval, and until prompt delivery is confirmed. Herdr's stalled-prompt signal is ambiguous, so the supervisor does not paste the bootstrap twice: it looks for the assignment's unique durable path in pane output and sends only `Enter` when the prompt is staged, or accepts observed lifecycle activity. If Herdr cannot become ready, start, or expose the bootstrap within the bounded recovery windows, the tracker records an operational `delivery_failed` attempt and retries the same node without emitting any declared outcome or transition context. Workflow authors should not add failure edges for provider startup races; reserve declared failure outcomes for work the agent actually began and evaluated.
+Agent startup and prompt submission are also outside the workflow graph. A claim remains `starting` while the supervisor waits for Herdr to report that the provider is interactively ready and launch is no longer pending, through a short stable-settle interval, and until prompt delivery is confirmed. Herdr's stalled-prompt signal and wait timeout are both ambiguous, so neither is delivery proof. The supervisor does not paste the bootstrap twice: it accepts only a semantic transition from settled `idle`/`done` to `working`, or reads the pane and sends only `Enter` when it sees either the assignment's unique durable path or Claude's collapsed `[Pasted text #N +M lines]` composer token. Pane repaint revisions, late native-session discovery, and unknown/blocked startup transitions are not delivery proof. Ticket history distinguishes direct confirmation from working-transition or staged-composer recovery. If Herdr cannot become ready, start, or expose staged input within the bounded recovery windows, the supervisor clears any potentially hidden composer with `Ctrl+C` before the tracker records an operational `delivery_failed` attempt and retries the same node without emitting any declared outcome or transition context. Workflow authors should not add failure edges for provider startup races; reserve declared failure outcomes for work the agent actually began and evaluated.
 
 ## Choose the right data channel
 
@@ -687,6 +687,39 @@ Routing is based only on the process exit code:
 
 Declared `artifacts` are exact regular-file paths relative to the resolved working directory. After the process exits, the supervisor uploads every produced file to the tracker's content-addressed artifact store. A missing required file makes the activity fail; a missing optional file is ignored. Artifact bytes do not enter Markdown frontmatter. Later assignments receive tracker URLs and digests in `artifacts.md` and `context.json`.
 
+### Human-readable review evidence
+
+Use an ordinary artifact when an operator should inspect a result during execution or before choosing a Human Gate outcome. Contents are intentionally permissive: Markdown, standalone HTML, images, PDF, JSON, YAML, text, and arbitrary downloadable files are all valid. There is no required report schema and artifact content never selects a workflow edge. Every artifact remains expandable from the ticket's **Evidence & artifacts** card regardless of ticket state; its review packet can show only featured evidence, keep the newest artifact from each node, filter by node/category/media type, and move through fullscreen previews. Low-level manifests and checkpoint bundles are grouped under **Technical artifacts**. An active Human Gate additionally presents the preceding node's evidence in the focused **Review materials** card.
+
+An Agent can publish any file before its terminal callback with the generated helper:
+
+```sh
+/absolute/path/to/publish-artifact review.md \
+  --title "Implementation review" \
+  --description "What changed, how it was verified, and remaining risk." \
+  --category approval \
+  --featured
+```
+
+`title`, `description`, `category`, and `featured` are optional presentation hints, not a content contract. MIME type is inferred from common extensions or can be supplied with `--content-type`. A Script declaration may attach the same optional hints:
+
+```yaml
+artifacts:
+  - name: smoke-report
+    path: reports/smoke.html
+    content_type: text/html
+    required: false
+    presentation:
+      title: Non-production smoke test
+      description: Interactive report for release approval.
+      category: verification
+      featured: true
+```
+
+When a Human Gate is current, the ticket places artifacts from the immediately preceding completed node run in a **Review materials** card directly beneath the graph. Featured evidence is selected first. Markdown, sandboxed standalone HTML, images, PDF, JSON, YAML, and text receive inline previews; other or oversized files retain Open and Download links. The completion summary remains visible when no artifact was published. Keep important evidence self-contained: an HTML artifact should embed its styles and data rather than assume a repository-relative asset server.
+
+Use strict `agentic-quality/v1` only when scalar values must participate in workflow metrics. Do not force prose approval reports into that schema.
+
 ### Quality-report artifacts
 
 A Script can publish a YAML quality report as immutable evidence and make its registered attributes available to ticket and workflow metrics. Mark the artifact explicitly; YAML content type alone does not cause interpretation:
@@ -811,9 +844,9 @@ The ticket's Checkpoints card may route work to any configured Checkpoint or Res
 
 ### Human Gate
 
-A Human Gate pauses the workflow and presents declared `choices` in the UI. Each choice has an ID, label, description, target, optional `comment_required`, and optional metric classification.
+A Human Gate pauses the workflow and presents declared `choices` in the UI. Each choice has an ID, label, description, target, optional `comment_required`, and optional metric classification. Every choice lets the operator include an optional comment; `comment_required: true` makes that field mandatory.
 
-The operator's selection becomes the transition outcome. A required comment becomes actionable feedback to the destination. Labels should read as decisions—“Approve”, “Request changes”, “Abort deployment”—and descriptions should explain the consequence.
+The operator's selection alone becomes the transition outcome and selects the target edge. Any accompanying comment is recorded as the transition summary and immediate handoff to the destination; it never changes routing. This makes a comment suitable for a selected PR URL, release identifier, or other small operator-supplied parameter. Use ticket metadata when the value must remain authoritative across multiple later nodes or loops. Labels should read as decisions—“Approve”, “Request changes”, “Abort deployment”—and descriptions should explain the consequence.
 
 A gate may observe associated GitHub PRs:
 
@@ -991,6 +1024,8 @@ The manifest records the exact workflow/node/prompt revision, visit and attempt,
 
 Treat the manifest as provenance and debugging evidence, not as a cryptographic supply-chain attestation. It is generated after a run, is best effort if the tracker is unavailable at finalization, and does not replace signed build provenance, SBOMs, deployment records, or checkpoint bundles where policy requires them. The ticket's **Evidence & artifacts** view links every available manifest both from its corresponding node run and from the manifest inventory. The same view exposes the complete hydrated run ledger, generic artifacts, persisted output, checkpoint manifests and bundles, and operator attachments without requiring knowledge of the tracker-owned storage paths.
 
+Agent attempts also stream a Herdr operational trace. Workflow authors do not configure or route on this trace. It records supervisor-to-Herdr commands, meaningful pane observations, prompt-delivery evaluations, recovery actions, and timestamps as tracker-owned immutable JSONL chunks. The ticket's **Operational traces** tab groups those chunks by attempt, offers command/decision/error filters, and retains raw downloads. Prompt contents remain in the durable assignment bundle; the trace records only assignment paths, byte counts, and digests so it remains compact and does not become a second prompt source.
+
 ## GitHub and PR design
 
 PR behavior is explicit in the workflow:
@@ -1019,6 +1054,7 @@ It contains:
 - `context.json`: structured ticket, workflow, repository, PR, metadata, and callback context.
 - `callbacks.md` and `callbacks.json`: callback contract.
 - `callback`: executable lease-aware helper.
+- `publish-artifact`: executable helper for unrestricted human-readable evidence with optional display hints.
 - `updates/`: ordered live guidance, answers, and refreshed-ticket notifications.
 - `outbox/`: local callback request/response records.
 
@@ -1031,6 +1067,8 @@ The helper is the authoritative callback interface. An agent can run commands su
 printf '%s\n' '{"outcome":"completed","summary":"Implemented and verified the change."}' \
   | /absolute/path/to/callback complete -
 ```
+
+Publish review evidence before the terminal callback closes the lease. Running `/absolute/path/to/publish-artifact --help` recovers its compact command contract without putting an artifact schema in the reusable prompt.
 
 An authoring prompt should not duplicate the full HTTP schema. `START_HERE.md`, `callbacks.md`, and `callback schema ...` remain current even if a long conversation compacts away the initial bootstrap.
 

@@ -3,7 +3,7 @@ import { existsSync } from "node:fs";
 import { resolve } from "node:path";
 import express, { type NextFunction, type Request, type Response } from "express";
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
-import { ACTIVITY_CAPABILITIES, HttpError, PRODUCTION_RESULTS, PROVIDERS, isProgressed, type ActivityCapability, type ArtifactKind, type HarnessTelemetrySnapshot, type JsonValue, type Phase, type ProductionResult, type PullRequestRef, type ResolvedAgentProfile, type TicketFrontmatter } from "./domain.js";
+import { ACTIVITY_CAPABILITIES, HttpError, PRODUCTION_RESULTS, PROVIDERS, isProgressed, type ActivityCapability, type ArtifactKind, type ExecutionTraceEvent, type HarnessTelemetrySnapshot, type JsonValue, type Phase, type ProductionResult, type PullRequestRef, type ResolvedAgentProfile, type TicketFrontmatter } from "./domain.js";
 import { MAX_ARTIFACT_BYTES, MAX_ATTACHMENT_BYTES, TicketStore, mergePullRequests } from "./ticket-store.js";
 import { SupervisorRegistry, type SupervisorPresenceInput } from "./supervisor-registry.js";
 import { TrackerConfigStore, type RepositoryConfig } from "./config-store.js";
@@ -100,6 +100,20 @@ function message(value: unknown, field = "message"): string {
   return value.trim();
 }
 
+function artifactPresentation(query: Request["query"]): Record<string, JsonValue> | undefined {
+  const hint = (value: unknown, maximum: number): string | undefined => {
+    if (typeof value !== "string") return undefined;
+    const trimmed = value.trim();
+    return trimmed && trimmed.length <= maximum ? trimmed : undefined;
+  };
+  const title = hint(query.title, 160);
+  const description = hint(query.description, 500);
+  const category = hint(query.category, 64);
+  const featured = query.featured === "true" || query.featured === "1";
+  if (!title && !description && !category && !featured) return undefined;
+  return { presentation: { ...(title ? { title } : {}), ...(description ? { description } : {}), ...(category ? { category } : {}), ...(featured ? { featured: true } : {}) } };
+}
+
 function metadataKey(value: unknown): string {
   const key = message(value, "metadata key");
   if (!/^[A-Za-z][A-Za-z0-9_.-]{0,127}$/.test(key)) throw new HttpError(422, "metadata key must start with a letter and contain only letters, numbers, dot, underscore, or hyphen");
@@ -112,6 +126,24 @@ function jsonPayload(value: unknown, field: string, depth = 0): JsonValue {
   if (Array.isArray(value)) return value.map((item, index) => jsonPayload(item, `${field}[${index}]`, depth + 1));
   if (isRecord(value)) return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, jsonPayload(item, `${field}.${key}`, depth + 1)]));
   throw new HttpError(422, `${field} must be JSON-compatible`);
+}
+
+function executionTraceEvents(value: unknown, firstSequence: number): ExecutionTraceEvent[] {
+  if (!Array.isArray(value) || value.length < 1 || value.length > 100) throw new HttpError(422, "events must contain between 1 and 100 trace events", undefined, "EXECUTION_TRACE_INVALID");
+  return value.map((candidate, index) => {
+    if (!isRecord(candidate)) throw new HttpError(422, `events[${index}] must be an object`, undefined, "EXECUTION_TRACE_INVALID");
+    const sequence = candidate.sequence;
+    const timestamp = candidate.timestamp;
+    const elapsedMs = candidate.elapsed_ms;
+    const event = candidate.event;
+    if (sequence !== firstSequence + index || !Number.isSafeInteger(sequence) || Number(sequence) < 1) throw new HttpError(422, `events[${index}].sequence is not contiguous`, undefined, "EXECUTION_TRACE_INVALID");
+    if (typeof timestamp !== "string" || Number.isNaN(Date.parse(timestamp))) throw new HttpError(422, `events[${index}].timestamp is invalid`, undefined, "EXECUTION_TRACE_INVALID");
+    if (!Number.isSafeInteger(elapsedMs) || Number(elapsedMs) < 0) throw new HttpError(422, `events[${index}].elapsed_ms is invalid`, undefined, "EXECUTION_TRACE_INVALID");
+    if (typeof event !== "string" || !/^[a-z][a-z0-9_.-]{0,127}$/.test(event)) throw new HttpError(422, `events[${index}].event is invalid`, undefined, "EXECUTION_TRACE_INVALID");
+    const data = jsonPayload(candidate.data ?? {}, `events[${index}].data`);
+    if (!isRecord(data)) throw new HttpError(422, `events[${index}].data must be an object`, undefined, "EXECUTION_TRACE_INVALID");
+    return { sequence: Number(sequence), timestamp, elapsed_ms: Number(elapsedMs), event, data };
+  });
 }
 
 function productionResult(value: unknown): ProductionResult {
@@ -348,7 +380,7 @@ export function createApp(
   };
   app.get("/api/operations", async (_request, response) => response.json(await operationalStatus()));
   app.get("/api/capabilities", (_request, response) => response.json({
-    supervisor_protocol_versions: [1, 2],
+    supervisor_protocol_versions: [1, 2, 3],
     workflow_schema_versions: [2],
     intake_protocol_versions: [1],
     activity_capabilities: [...ACTIVITY_CAPABILITIES],
@@ -720,11 +752,11 @@ export function createApp(
 
   app.post("/api/work/:lease/artifacts", express.raw({ type: "application/octet-stream", limit: MAX_ARTIFACT_BYTES }), async (request, response) => {
     const kind = String(request.query.kind ?? "") as ArtifactKind;
-    if (!["script_output", "script_artifact", "quality_report", "checkpoint_bundle"].includes(kind)) throw new HttpError(422, "Unsupported lease artifact kind");
+    if (!["evidence", "script_output", "script_artifact", "quality_report", "checkpoint_bundle"].includes(kind)) throw new HttpError(422, "Unsupported lease artifact kind");
     const filename = String(request.query.filename ?? "");
     const contentType = String(request.query.content_type ?? "application/octet-stream");
     if (!Buffer.isBuffer(request.body)) throw new HttpError(422, "Artifact body must be application/octet-stream");
-    let metadata: Record<string, JsonValue> | undefined;
+    let metadata = artifactPresentation(request.query);
     if (kind === "quality_report") {
       const leased = await store.byLease(String(request.params.lease));
       if (!leased.frontmatter.workflow || leased.execution.node_type !== "script") throw new HttpError(409, "Quality reports may only be uploaded by Script nodes");
@@ -735,7 +767,7 @@ export function createApp(
       if (!declaration?.interpretation || declaration.interpretation.kind !== "quality_report") throw new HttpError(422, `Artifact ${artifactName} is not declared as a quality report`);
       if (contentType !== declaration.content_type) throw new HttpError(422, `Artifact ${artifactName} must use declared content type ${declaration.content_type}`);
       const config = await configStore.read();
-      metadata = parseQualityReport(request.body, artifactName, declaration.interpretation.required_attributes, config.quality, config.revision);
+      metadata = { ...parseQualityReport(request.body, artifactName, declaration.interpretation.required_attributes, config.quality, config.revision), ...(metadata ?? {}) };
     }
     response.status(201).json({ artifact: await store.addArtifactForLease(String(request.params.lease), {
       kind, filename, contentType, content: request.body, ...(metadata ? { metadata } : {}),
@@ -1276,11 +1308,26 @@ export function createApp(
     response.json({ active: true, ticket: ticketJson(updated) });
   });
 
+  app.post("/api/work/:lease/trace/events", async (request, response) => {
+    const traceId = typeof request.body?.trace_id === "string" ? request.body.trace_id : "";
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(traceId)) {
+      throw new HttpError(422, "trace_id must be a UUID", undefined, "EXECUTION_TRACE_INVALID");
+    }
+    const firstSequence = request.body?.first_sequence;
+    if (!Number.isSafeInteger(firstSequence) || Number(firstSequence) < 1) throw new HttpError(422, "first_sequence must be a positive integer", undefined, "EXECUTION_TRACE_INVALID");
+    if (Buffer.byteLength(JSON.stringify(request.body ?? {})) > 262_144) throw new HttpError(413, "Trace batch must not exceed 256 KiB", undefined, "EXECUTION_TRACE_TOO_LARGE");
+    const events = executionTraceEvents(request.body?.events, Number(firstSequence));
+    const result = await store.appendExecutionTrace(String(request.params.lease), traceId, Number(firstSequence), events, request.body?.completed === true);
+    response.status(201).json(result);
+  });
+
   app.post("/api/work/:lease/delivered", async (request, response) => {
     const leaseId = String(request.params.lease);
-    const updated = await store.confirmAssignmentDelivery(leaseId);
+    const confirmation = request.body?.confirmation === "observed_activity" || request.body?.confirmation === "submitted_staged_prompt"
+      ? request.body.confirmation : "direct";
+    const updated = await store.confirmAssignmentDelivery(leaseId, confirmation);
     log("info", "work.assignment_delivered", {
-      ticket_id: updated.frontmatter?.id, node_id: updated.frontmatter?.execution?.node_id, lease_id: leaseId,
+      ticket_id: updated.frontmatter?.id, node_id: updated.frontmatter?.execution?.node_id, lease_id: leaseId, confirmation,
     });
     response.json({ delivered: true, ticket: ticketJson(updated) });
   });

@@ -1,7 +1,9 @@
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { promisify } from "node:util";
 import type { AgentObservation, Provider } from "./types.js";
+import type { ExecutionTraceSink } from "./execution-trace.js";
 
 const exec = promisify(execFile);
 const PANE_BUSY_RETRY_INTERVAL_MS = 500;
@@ -80,7 +82,7 @@ function jsonErrorCode(value: unknown): string | null {
   return null;
 }
 
-function commandErrorCode(error: unknown): string | null {
+export function commandErrorCode(error: unknown): string | null {
   if (!error || typeof error !== "object") return null;
   const stderrValue = (error as { stderr?: unknown }).stderr;
   const stderr = typeof stderrValue === "string" ? stderrValue : Buffer.isBuffer(stderrValue) ? stderrValue.toString("utf8") : "";
@@ -92,6 +94,32 @@ function commandErrorCode(error: unknown): string | null {
     } catch { /* Herdr may emit a non-JSON diagnostic before its JSON error line. */ }
   }
   return null;
+}
+
+function commandRequest(args: string[]): Record<string, unknown> {
+  const command = `${args[0] ?? "unknown"}.${args[1] ?? "unknown"}`;
+  if (command === "agent.prompt") {
+    const payload = args[3] ?? "";
+    return {
+      command, target: args[2] ?? null, payload_bytes: Buffer.byteLength(payload),
+      payload_sha256: createHash("sha256").update(payload).digest("hex"),
+      wait: args.includes("--wait"), timeout_ms: args.includes("--timeout") ? Number(args[args.indexOf("--timeout") + 1]) : null,
+    };
+  }
+  if (command === "agent.send-keys") return { command, target: args[2] ?? null, keys: args.slice(3) };
+  return { command, args };
+}
+
+function resultSummary(args: string[], value: unknown): Record<string, unknown> {
+  const command = `${args[0] ?? "unknown"}.${args[1] ?? "unknown"}`;
+  const serialized = typeof value === "string" ? value : JSON.stringify(value) ?? String(value);
+  if (command === "agent.read") return {
+    response_bytes: Buffer.byteLength(serialized), response_sha256: createHash("sha256").update(serialized).digest("hex"),
+  };
+  return serialized.length <= 4_096 ? { response: value } : {
+    response_bytes: Buffer.byteLength(serialized), response_sha256: createHash("sha256").update(serialized).digest("hex"),
+    response_excerpt: serialized.slice(0, 2_048),
+  };
 }
 
 export function resumeArguments(provider: Provider, sessionRef: string | null): string[] {
@@ -122,6 +150,7 @@ export function agentName(ticketId: string, provider: Provider, conversation: st
 export class HerdrController {
   private readonly agentReadyTimeoutMs: number;
   private readonly agentReadySettleMs: number;
+  private readonly trace = new AsyncLocalStorage<ExecutionTraceSink>();
 
   constructor(private readonly runner: CommandRunner, readonly projectRoot: string, options: HerdrControllerOptions = {}) {
     this.agentReadyTimeoutMs = Number.isFinite(options.agentReadyTimeoutMs) && Number(options.agentReadyTimeoutMs) >= 0
@@ -130,11 +159,50 @@ export class HerdrController {
       ? Number(options.agentReadySettleMs) : 10_000;
   }
 
+  withTrace<T>(sink: ExecutionTraceSink, work: () => Promise<T>): Promise<T> {
+    return this.trace.run(sink, work);
+  }
+
+  private async run(args: string[]): Promise<unknown> {
+    const startedAt = Date.now();
+    const sink = this.trace.getStore();
+    sink?.record("herdr.command_started", commandRequest(args));
+    try {
+      const result = await this.runner.run(args);
+      sink?.record("herdr.command_completed", { ...commandRequest(args), duration_ms: Date.now() - startedAt, ...resultSummary(args, result) });
+      return result;
+    } catch (error) {
+      sink?.record("herdr.command_failed", {
+        ...commandRequest(args), duration_ms: Date.now() - startedAt,
+        error_code: commandErrorCode(error) ?? (error && typeof error === "object" && typeof (error as { code?: unknown }).code === "string" ? (error as { code: string }).code : null),
+        error: error instanceof Error ? error.message : String(error),
+      });
+      throw error;
+    }
+  }
+
+  private async runText(args: string[]): Promise<string> {
+    const startedAt = Date.now();
+    const sink = this.trace.getStore();
+    sink?.record("herdr.command_started", commandRequest(args));
+    try {
+      const result = this.runner.runText ? await this.runner.runText(args) : String(await this.runner.run(args));
+      sink?.record("herdr.command_completed", { ...commandRequest(args), duration_ms: Date.now() - startedAt, ...resultSummary(args, result) });
+      return result;
+    } catch (error) {
+      sink?.record("herdr.command_failed", {
+        ...commandRequest(args), duration_ms: Date.now() - startedAt, error_code: commandErrorCode(error),
+        error: error instanceof Error ? error.message : String(error),
+      });
+      throw error;
+    }
+  }
+
   private async startAgent(args: string[]): Promise<void> {
     const deadline = Date.now() + PANE_BUSY_RETRY_TIMEOUT_MS;
     while (true) {
       try {
-        await this.runner.run(args);
+        await this.run(args);
         return;
       } catch (error) {
         if (commandErrorCode(error) !== "agent_pane_busy" || Date.now() >= deadline) throw error;
@@ -189,7 +257,7 @@ export class HerdrController {
       await this.startAgent(["agent", "start", agentName(ticketId, provider, conversation), "--kind", provider, "--pane", existingPane, "--", ...launchArguments(provider, sessionRef, profile?.model, profile?.reasoning)]);
       return this.waitForInteractiveReady(existingPane);
     }
-    const created = resultRecord(await this.runner.run(["workspace", "create", "--cwd", this.projectRoot, "--label", ticketId, "--no-focus"]));
+    const created = resultRecord(await this.run(["workspace", "create", "--cwd", this.projectRoot, "--label", ticketId, "--no-focus"]));
     const rootPane = created.root_pane as { pane_id?: unknown } | undefined;
     const paneId = typeof rootPane?.pane_id === "string" ? rootPane.pane_id : null;
     if (!paneId) throw new Error("Herdr workspace creation did not return a root pane ID");
@@ -198,46 +266,44 @@ export class HerdrController {
   }
 
   async prompt(paneId: string, prompt: string): Promise<void> {
-    await this.runner.run(["agent", "prompt", paneId, prompt]);
+    await this.run(["agent", "prompt", paneId, prompt]);
   }
 
   async promptAndConfirm(paneId: string, prompt: string): Promise<boolean> {
     try {
-      await this.runner.run(["agent", "prompt", paneId, prompt, "--wait", "--timeout", "6000"]);
+      await this.run(["agent", "prompt", paneId, prompt, "--wait", "--timeout", "6000"]);
       return true;
     } catch (error) {
       const code = commandErrorCode(error);
       if (code === "agent_prompt_stalled") return false;
-      // With a timeout greater than Herdr's five-second stalled-prompt window,
-      // timeout means activity began but the turn had not settled yet.
-      if (code === "timeout") return true;
+      // A Herdr wait timeout is not delivery proof. In particular, a full-screen
+      // provider can have the prompt staged in its composer without submitting
+      // it. Let the supervisor inspect pane activity/text and recover safely.
+      if (code === "timeout") return false;
       throw error;
     }
   }
 
   async readText(paneId: string): Promise<string> {
     const args = ["agent", "read", paneId, "--source", "recent-unwrapped", "--lines", "120"];
-    if (this.runner.runText) return this.runner.runText(args);
-    const result = await this.runner.run(args);
-    if (typeof result === "string") return result;
-    return JSON.stringify(result);
+    return this.runText(args);
   }
 
   async sendKeys(paneId: string, ...keys: string[]): Promise<void> {
-    await this.runner.run(["agent", "send-keys", paneId, ...keys]);
+    await this.run(["agent", "send-keys", paneId, ...keys]);
   }
 
   async interrupt(paneId: string): Promise<void> {
     await this.sendKeys(paneId, "ctrl+c");
-    await this.runner.run(["agent", "wait", paneId, "--until", "idle", "--until", "done", "--timeout", "15000"]);
+    await this.run(["agent", "wait", paneId, "--until", "idle", "--until", "done", "--timeout", "15000"]);
   }
 
   async observe(paneId: string): Promise<AgentObservation> {
-    const result = resultRecord(await this.runner.run(["agent", "get", paneId]));
+    const result = resultRecord(await this.run(["agent", "get", paneId]));
     const agent = (result.agent ?? result) as Record<string, unknown>;
     const session = agent.agent_session && typeof agent.agent_session === "object"
       ? agent.agent_session as Record<string, unknown> : {};
-    return {
+    const observation: AgentObservation = {
       paneId,
       state: typeof agent.agent_status === "string" ? agent.agent_status : typeof agent.status === "string" ? agent.status : "unknown",
       sessionRef: typeof session.value === "string" ? session.value : null,
@@ -257,5 +323,13 @@ export class HerdrController {
       interactiveReady: typeof agent.interactive_ready === "boolean" ? agent.interactive_ready : null,
       launchPending: typeof agent.launch_pending === "boolean" ? agent.launch_pending : null,
     };
+    this.trace.getStore()?.record("herdr.observation", {
+      pane_id: observation.paneId, state: observation.state, session_ref: observation.sessionRef,
+      workspace_id: observation.workspaceId, tab_id: observation.tabId, terminal_id: observation.terminalId,
+      cwd: observation.cwd, foreground_cwd: observation.foregroundCwd, revision: observation.revision,
+      interactive_ready: observation.interactiveReady ?? null, launch_pending: observation.launchPending ?? null,
+      session_source: observation.sessionSource, session_kind: observation.sessionKind,
+    });
+    return observation;
   }
 }

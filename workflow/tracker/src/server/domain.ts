@@ -35,7 +35,7 @@ export interface TicketAttachment {
   created_at: string;
 }
 
-export type ArtifactKind = "attachment" | "script_output" | "script_artifact" | "quality_report" | "checkpoint_bundle" | "checkpoint_manifest" | "execution_manifest";
+export type ArtifactKind = "attachment" | "evidence" | "script_output" | "script_artifact" | "quality_report" | "checkpoint_bundle" | "checkpoint_manifest" | "execution_manifest" | "execution_trace";
 export interface ArtifactRecord {
   id: string;
   kind: ArtifactKind;
@@ -47,6 +47,14 @@ export interface ArtifactRecord {
   sha256: string;
   created_at: string;
   metadata: Record<string, JsonValue>;
+}
+
+export interface ExecutionTraceEvent {
+  sequence: number;
+  timestamp: string;
+  elapsed_ms: number;
+  event: string;
+  data: Record<string, JsonValue>;
 }
 
 export interface TicketArtifactRef extends ArtifactRecord {}
@@ -416,6 +424,14 @@ export interface TicketSummary {
   repositories: string[];
   assigned_supervisor: string | null;
   estimated_human_days: number | null;
+  attention: {
+    kinds: Array<"question" | "human_gate" | "blocked" | "failed" | "delivery_failure" | "github_feedback" | "expiring_wait" | "repository_blocked">;
+    pending_questions: number;
+    wait_wake_at: string | null;
+    wait_deadline_at: string | null;
+    delivery_failure_summary: string | null;
+    github_feedback_summary: string | null;
+  };
 }
 
 export interface RepositoryClaimBlocker {

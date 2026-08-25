@@ -56,7 +56,7 @@ function bundle(): AssignmentBundle {
   const runDirectory = "/srv/assignments/vm/tickets/APT-1/runs/0001-implementation-run-1";
   return {
     root: "/srv/assignments", ticketDirectory: "/srv/assignments/vm/tickets/APT-1", runDirectory,
-    startHerePath: `${runDirectory}/START_HERE.md`, callbackHelperPath: `${runDirectory}/callback`, attachmentsDirectory: `${runDirectory}/attachments`,
+    startHerePath: `${runDirectory}/START_HERE.md`, callbackHelperPath: `${runDirectory}/callback`, artifactHelperPath: `${runDirectory}/publish-artifact`, attachmentsDirectory: `${runDirectory}/attachments`,
   };
 }
 
@@ -106,7 +106,9 @@ describe("assignment prompt", () => {
     });
     const internals = supervisor as unknown as {
       prompts: PromptStore;
-      promptAssignment(provider: Provider, value: ClaimedTicket, paneId: string, bundle: AssignmentBundle, initial: AgentObservation): Promise<AgentObservation>;
+      promptAssignment(provider: Provider, value: ClaimedTicket, paneId: string, bundle: AssignmentBundle, initial: AgentObservation): Promise<{
+        observation: AgentObservation; confirmation: string;
+      }>;
     };
     internals.prompts.replace(trackerPromptTemplates());
 
@@ -117,6 +119,37 @@ describe("assignment prompt", () => {
     expect(promptAndConfirm.mock.calls[0]?.[1]).toContain(bundle().callbackHelperPath);
     expect(promptAndConfirm.mock.calls[0]?.[1]).not.toContain("# Goal\n\nShip it.");
     expect(readText).toHaveBeenCalledWith("w1:p1");
+    expect(sendKeys).toHaveBeenCalledWith("w1:p1", "enter");
+  });
+
+  it("submits Claude's collapsed multiline paste when the assignment marker is hidden", async () => {
+    const idle: AgentObservation = {
+      paneId: "w1:p1", state: "idle", sessionRef: "session-1", workspaceId: "w1", tabId: "w1:t1",
+      terminalId: "term-1", focused: false, cwd: "/srv/projects", foregroundCwd: "/srv/projects",
+      terminalTitle: null, terminalTitleStripped: null, displayName: "Claude", revision: 1,
+      sessionSource: "herdr:claude", sessionKind: "id", tokens: {}, interactiveReady: true, launchPending: false,
+    };
+    const sendKeys = vi.fn().mockResolvedValue(undefined);
+    const supervisor = new Supervisor({
+      projectRoot: "/srv/projects", promptAndConfirm: vi.fn().mockResolvedValue(false),
+      observe: vi.fn().mockResolvedValue(idle), readText: vi.fn().mockResolvedValue("Claude Code\n[Pasted text #1 +14 lines]"), sendKeys,
+    } as unknown as HerdrController, {
+      trackerUrl: "http://tracker.test", supervisorId: "vm", providers: ["claude"],
+      heartbeatIntervalMs: 30_000, idlePollMs: 1_000, assignmentRoot: temporaryAssignmentRoot(),
+    });
+    const internals = supervisor as unknown as {
+      prompts: PromptStore;
+      promptAssignment(provider: Provider, value: ClaimedTicket, paneId: string, bundle: AssignmentBundle, initial: AgentObservation): Promise<{
+        observation: AgentObservation; confirmation: string;
+      }>;
+    };
+    internals.prompts.replace(trackerPromptTemplates());
+
+    await expect(internals.promptAssignment("claude", ticket("implementation"), "w1:p1", bundle(), idle)).resolves.toMatchObject({
+      confirmation: "submitted_staged_prompt",
+    });
+
+    expect(sendKeys).toHaveBeenCalledTimes(1);
     expect(sendKeys).toHaveBeenCalledWith("w1:p1", "enter");
   });
 
@@ -135,13 +168,48 @@ describe("assignment prompt", () => {
     });
     const internals = supervisor as unknown as {
       prompts: PromptStore;
-      promptAssignment(provider: Provider, value: ClaimedTicket, paneId: string, bundle: AssignmentBundle, initial: AgentObservation): Promise<AgentObservation>;
+      promptAssignment(provider: Provider, value: ClaimedTicket, paneId: string, bundle: AssignmentBundle, initial: AgentObservation): Promise<{
+        observation: AgentObservation; confirmation: string;
+      }>;
     };
     internals.prompts.replace(trackerPromptTemplates());
 
-    await expect(internals.promptAssignment("claude", ticket("implementation"), "w1:p1", bundle(), before)).resolves.toEqual(after);
+    await expect(internals.promptAssignment("claude", ticket("implementation"), "w1:p1", bundle(), before)).resolves.toEqual({
+      observation: after, confirmation: "observed_activity",
+    });
 
     expect(promptAndConfirm).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not mistake pane rendering or late session discovery for assignment delivery", async () => {
+    const before: AgentObservation = {
+      paneId: "w1:p1", state: "idle", sessionRef: null, workspaceId: "w1", tabId: "w1:t1",
+      terminalId: "term-1", focused: false, cwd: "/srv/projects", foregroundCwd: "/srv/projects",
+      terminalTitle: null, terminalTitleStripped: null, displayName: "Claude", revision: 10,
+      sessionSource: null, sessionKind: null, tokens: {}, interactiveReady: true, launchPending: false,
+    };
+    const after: AgentObservation = {
+      ...before, sessionRef: "session-1", sessionSource: "herdr:claude", sessionKind: "id", revision: 11,
+    };
+    const sendKeys = vi.fn().mockResolvedValue(undefined);
+    const supervisor = new Supervisor({
+      projectRoot: "/srv/projects", promptAndConfirm: vi.fn().mockResolvedValue(false),
+      observe: vi.fn().mockResolvedValue(after), readText: vi.fn().mockResolvedValue("Claude Code\nReady for input"), sendKeys,
+    } as unknown as HerdrController, {
+      trackerUrl: "http://tracker.test", supervisorId: "vm", providers: ["claude"],
+      heartbeatIntervalMs: 30_000, idlePollMs: 1_000, assignmentPromptRecoveryMs: 0, assignmentRoot: temporaryAssignmentRoot(),
+    });
+    const internals = supervisor as unknown as {
+      prompts: PromptStore;
+      promptAssignment(provider: Provider, value: ClaimedTicket, paneId: string, bundle: AssignmentBundle, initial: AgentObservation): Promise<unknown>;
+    };
+    internals.prompts.replace(trackerPromptTemplates());
+
+    await expect(internals.promptAssignment("claude", ticket("implementation"), "w1:p1", bundle(), before))
+      .rejects.toThrow("did not expose or start the assignment prompt");
+
+    expect(sendKeys).toHaveBeenCalledTimes(1);
+    expect(sendKeys).toHaveBeenCalledWith("w1:p1", "ctrl+c");
   });
 
   it("renews a starting lease independently of Herdr startup work", async () => {
@@ -192,7 +260,8 @@ describe("assignment prompt", () => {
     await expect(internals.runAssignment("codex", ticket("review"))).resolves.toBeUndefined();
 
     expect(herdr.promptAndConfirm).toHaveBeenCalledTimes(1);
-    expect(herdr.sendKeys).not.toHaveBeenCalled();
+    expect(herdr.sendKeys).toHaveBeenCalledTimes(1);
+    expect(herdr.sendKeys).toHaveBeenCalledWith("w1:p1", "ctrl+c");
     expect(herdr.prompt).not.toHaveBeenCalled();
     expect(fetch).toHaveBeenCalledWith(expect.objectContaining({ href: "http://tracker.test/api/work/lease-1/delivery-failed" }), expect.objectContaining({ method: "POST" }));
   });

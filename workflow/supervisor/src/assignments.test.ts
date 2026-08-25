@@ -112,6 +112,22 @@ describe("durable assignment bundles", () => {
     expect(callbacks.endpoints.complete).toBe("http://tracker.test/api/work/lease-42/complete");
   });
 
+  it("generates a discoverable evidence helper beside the callback helper", async () => {
+    // Arrange
+    const root = await temporaryRoot();
+
+    // Act
+    const bundle = await new AssignmentBundleWriter(root, "worker").prepare(claimedTicket(), "http://tracker.test", "/srv/projects", prompts());
+    const { stderr } = await execute(process.execPath, [bundle.artifactHelperPath, "--help"]);
+    const callbacks = JSON.parse(await readFile(join(bundle.runDirectory, "callbacks.json"), "utf8"));
+
+    // Assert
+    expect(stderr).toContain("publish-artifact <file>");
+    expect(callbacks.endpoints.artifacts).toBe("http://tracker.test/api/work/lease-42/artifacts");
+    expect(await readFile(bundle.startHerePath, "utf8")).toContain(bundle.artifactHelperPath);
+    expect(await readFile(join(bundle.runDirectory, "callbacks.md"), "utf8")).toContain("publish evidence before the terminal callback");
+  });
+
   it("refreshes snapshots and persists guidance beside the active run", async () => {
     const root = await temporaryRoot();
     const writer = new AssignmentBundleWriter(root, "worker");

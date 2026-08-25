@@ -43,6 +43,25 @@ describe("HerdrController", () => {
     expect(agentName("APT-123_really-long-ticket", "codex", "work")).not.toBe(agentName("APT-123_really-long-ticket", "codex", "review"));
   });
 
+  it("traces Herdr commands and observations without copying prompt or terminal contents", async () => {
+    // Arrange
+    const runner = new FakeRunner();
+    const controller = new HerdrController(runner, "/srv/projects");
+    const events: Array<{ event: string; data?: Record<string, unknown> }> = [];
+
+    // Execute
+    await controller.withTrace({ record: (event, data) => events.push({ event, ...(data ? { data } : {}) }) }, async () => {
+      await controller.promptAndConfirm("w1:p1", "secret durable assignment contents");
+      await controller.observe("w1:p1");
+    });
+
+    // Verify
+    const serialized = JSON.stringify(events);
+    expect(serialized).not.toContain("secret durable assignment contents");
+    expect(events).toContainEqual(expect.objectContaining({ event: "herdr.command_started", data: expect.objectContaining({ command: "agent.prompt", payload_bytes: 34, payload_sha256: expect.stringMatching(/^[a-f0-9]{64}$/) }) }));
+    expect(events).toContainEqual(expect.objectContaining({ event: "herdr.observation", data: expect.objectContaining({ pane_id: "w1:p1", state: "working", revision: 12 }) }));
+  });
+
   it("waits for a new macOS login-shell pane to accept the agent start", async () => {
     vi.useFakeTimers();
     let starts = 0;
@@ -136,7 +155,7 @@ describe("HerdrController", () => {
     expect(observations).toBeGreaterThanOrEqual(5);
   });
 
-  it("confirms assignment activity and treats only Herdr's stalled result as ineffective", async () => {
+  it("treats Herdr stalled and timeout results as unconfirmed delivery", async () => {
     const run = vi.fn()
       .mockResolvedValueOnce({ result: { agent: { agent_status: "done" } } })
       .mockRejectedValueOnce(Object.assign(new Error("timed out"), {
@@ -148,7 +167,7 @@ describe("HerdrController", () => {
     const controller = new HerdrController({ run } as CommandRunner, "/srv/projects");
 
     await expect(controller.promptAndConfirm("w1:p1", "First assignment")).resolves.toBe(true);
-    await expect(controller.promptAndConfirm("w1:p1", "Second assignment")).resolves.toBe(true);
+    await expect(controller.promptAndConfirm("w1:p1", "Second assignment")).resolves.toBe(false);
     await expect(controller.promptAndConfirm("w1:p1", "Third assignment")).resolves.toBe(false);
     expect(run).toHaveBeenNthCalledWith(1, ["agent", "prompt", "w1:p1", "First assignment", "--wait", "--timeout", "6000"]);
   });

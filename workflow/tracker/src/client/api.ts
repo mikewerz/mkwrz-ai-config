@@ -22,6 +22,14 @@ export interface TicketSummary {
   repositories: string[];
   assigned_supervisor: string | null;
   estimated_human_days: number | null;
+  attention: {
+    kinds: Array<"question" | "human_gate" | "blocked" | "failed" | "delivery_failure" | "github_feedback" | "expiring_wait" | "repository_blocked">;
+    pending_questions: number;
+    wait_wake_at: string | null;
+    wait_deadline_at: string | null;
+    delivery_failure_summary: string | null;
+    github_feedback_summary: string | null;
+  };
 }
 
 export interface RepositoryClaimBlocker {
@@ -182,7 +190,7 @@ export interface TicketFrontmatter extends Record<string, unknown> {
     incoming: null | { source_node: string; target_node: string; outcome: string; summary: string | null; handoff: string | null; output?: string | null; output_log_path?: string | null; actor: string; created_at: string };
     active_workflow_id?: string; active_workflow_revision?: string;
     resolved_agent_profiles?: Record<string, { alias: string; provider: "claude" | "codex"; model: string | null; reasoning: string | null }>;
-    wait_states?: Record<string, { node_id: string; wake_at: string; deadline_at: string; delay_seconds: number; visit: number }>;
+    wait_states?: Record<string, { workflow_id: string; workflow_revision: string; node_id: string; started_at: string; wake_at: string; deadline_at: string; attempt: number; node_run_id: string }>;
     node_runs: Array<{ id: string; workflow_id?: string; workflow_revision: string; node_id: string; node_type: string; supervisor_id?: string | null; provider?: "claude" | "codex" | null; visit: number; attempt: number; status: string; outcome: string | null; summary: string | null; handoff?: string | null; output?: string | null; output_path?: string | null; output_sha256?: string | null; output_bytes?: number | null; script_path?: string | null; working_directory?: string | null; conversation_generation?: number | null; manifest_artifact_id?: string | null; wait?: { wake_at: string; deadline_at: string; delay_seconds: number } | null; metadata_writes?: Record<string, unknown>; external_references?: Array<{ type: string; id: string; url: string | null }>; input_revision?: number; started_at: string; completed_at: string | null; lease_id: string | null; telemetry: HarnessTelemetryRecord | null; timing: NodeRunTiming }>;
   };
   workflow_assignment?: null | { workflow_id: string; revision: string; version: number; selection: "default" | "manual_trial" | "experiment"; assigned_at: string; experiment_id: string | null };
@@ -346,7 +354,7 @@ export interface WorkflowNode {
   working_directory?: { relative_to: "selected_repository" | "primary_repository" | "project_root"; path?: string; path_input?: string };
   inline?: { language: "shell" | "python" | "javascript"; code: string };
   script_output?: { persist_stdout: boolean; prompt_tail_lines: number };
-  artifacts?: Array<{ name: string; path: string; content_type: string; required: boolean; interpretation?: { kind: "quality_report"; schema: "agentic-quality/v1"; required_attributes: string[] } }>;
+  artifacts?: Array<{ name: string; path: string; content_type: string; required: boolean; presentation?: { title?: string; description?: string; category?: string; featured?: boolean }; interpretation?: { kind: "quality_report"; schema: "agentic-quality/v1"; required_attributes: string[] } }>;
   checkpoint_label?: string;
   checkpoint_source?: { mode: "latest" | "id" | "metadata"; checkpoint_id?: string; metadata_key?: string };
   wait_schedule?: { initial_seconds: number; multiplier: number; maximum_seconds: number; jitter_percent: number; deadline_seconds: number };

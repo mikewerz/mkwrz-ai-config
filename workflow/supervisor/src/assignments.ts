@@ -10,6 +10,7 @@ export interface AssignmentBundle {
   runDirectory: string;
   startHerePath: string;
   callbackHelperPath: string;
+  artifactHelperPath: string;
   attachmentsDirectory: string;
 }
 
@@ -19,7 +20,7 @@ interface CallbackConfiguration {
   node_id: string;
   lease_id: string;
   callback_base: string;
-  endpoints: { comment: string; ask: string; complete: string; fail: string; metadata: string; candidates: string };
+  endpoints: { comment: string; ask: string; complete: string; fail: string; metadata: string; candidates: string; artifacts: string };
   allowed_outcomes: Array<{ id: string; label: string; description: string }>;
   schemas: Record<string, unknown>;
 }
@@ -126,6 +127,61 @@ function callbackHelperSource(): string {
   return `#!/usr/bin/env node\n${callbackHelperProgram.toString()}\ncallbackHelperProgram().catch((error) => { console.error(error?.message ?? String(error)); process.exitCode = 1; });\n`;
 }
 
+async function artifactHelperProgram(): Promise<void> {
+  const load = new Function("specifier", "return import(specifier)") as (specifier: string) => Promise<Record<string, unknown>>;
+  const { mkdir, readFile, writeFile } = await load("node:fs/promises") as unknown as typeof import("node:fs/promises");
+  const { basename, dirname, extname, join } = await load("node:path") as unknown as typeof import("node:path");
+  const helperFile = process.argv[1];
+  if (!helperFile) throw new Error("Cannot determine the artifact helper path");
+  const configurationFile = join(dirname(helperFile), "callbacks.json");
+  const configuration = JSON.parse(await readFile(configurationFile, "utf8"));
+  const [path, ...rawOptions] = process.argv.slice(2);
+  if (!path || path === "--help") {
+    console.error("Usage: ./publish-artifact <file> [--title TEXT] [--description TEXT] [--category TEXT] [--content-type MIME] [--featured]");
+    process.exitCode = path ? 0 : 2;
+    return;
+  }
+  const options: Record<string, string | boolean> = {};
+  for (let index = 0; index < rawOptions.length; index += 1) {
+    const option = rawOptions[index]!;
+    if (option === "--featured") { options.featured = true; continue; }
+    if (!["--title", "--description", "--category", "--content-type"].includes(option)) throw new Error(`Unknown option ${option}`);
+    const value = rawOptions[++index];
+    if (!value) throw new Error(`${option} requires a value`);
+    options[option.slice(2)] = value;
+  }
+  const filename = basename(path);
+  if (!filename) throw new Error("Artifact path must name a file");
+  const extension = extname(filename).toLowerCase();
+  const inferred: Record<string, string> = {
+    ".md": "text/markdown", ".markdown": "text/markdown", ".html": "text/html", ".htm": "text/html",
+    ".txt": "text/plain", ".log": "text/plain", ".json": "application/json", ".yaml": "application/yaml", ".yml": "application/yaml",
+    ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif", ".webp": "image/webp", ".svg": "image/svg+xml", ".pdf": "application/pdf",
+  };
+  const contentType = String(options["content-type"] ?? inferred[extension] ?? "application/octet-stream");
+  if (!/^[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]*\/[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]*$/.test(contentType)) throw new Error("--content-type must be a MIME type without parameters");
+  const query = new URLSearchParams({ kind: "evidence", filename, content_type: contentType });
+  for (const key of ["title", "description", "category"] as const) if (typeof options[key] === "string") query.set(key, options[key]);
+  if (options.featured === true) query.set("featured", "true");
+  const url = `${configuration.endpoints.artifacts}?${query}`;
+  const content = await readFile(path);
+  const outbox = join(dirname(configurationFile), "outbox");
+  await mkdir(outbox, { recursive: true });
+  const id = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  await writeFile(join(outbox, `${id}.artifact.request.json`), `${JSON.stringify({ created_at: new Date().toISOString(), method: "POST", url, file: path, bytes: content.byteLength }, null, 2)}\n`);
+  const response = await fetch(url, { method: "POST", headers: { "Content-Type": "application/octet-stream" }, body: content });
+  const text = await response.text();
+  let parsed: unknown = text;
+  try { parsed = text ? JSON.parse(text) : null; } catch { /* retain response text */ }
+  await writeFile(join(outbox, `${id}.artifact.response.json`), `${JSON.stringify({ status: response.status, ok: response.ok, body: parsed }, null, 2)}\n`);
+  if (!response.ok) throw new Error(`Tracker returned HTTP ${response.status}: ${text}`);
+  if (text) process.stdout.write(`${text}\n`);
+}
+
+function artifactHelperSource(): string {
+  return `#!/usr/bin/env node\n${artifactHelperProgram.toString()}\nartifactHelperProgram().catch((error) => { console.error(error?.message ?? String(error)); process.exitCode = 1; });\n`;
+}
+
 export function assignmentValues(ticket: ClaimedTicket, callbackBaseUrl: string, projectRoot: string): Record<string, string> {
   const lease = ticket.frontmatter.execution.lease_id;
   const node = ticket.workflow_node;
@@ -161,7 +217,7 @@ function callbackConfiguration(ticket: ClaimedTicket, callbackBaseUrl: string): 
     callback_base: base,
     endpoints: {
       comment: new URL("comment", base).toString(), ask: new URL("ask", base).toString(),
-      complete: new URL("complete", base).toString(), fail: new URL("fail", base).toString(), metadata: new URL("metadata", base).toString(), candidates: new URL("candidates", base).toString(),
+      complete: new URL("complete", base).toString(), fail: new URL("fail", base).toString(), metadata: new URL("metadata", base).toString(), candidates: new URL("candidates", base).toString(), artifacts: new URL("artifacts", base).toString(),
     },
     allowed_outcomes: allowed.map(({ id, label, description }) => ({ id, label, description })),
     schemas: {
@@ -175,7 +231,7 @@ function callbackConfiguration(ticket: ClaimedTicket, callbackBaseUrl: string): 
   };
 }
 
-function callbackMarkdown(configuration: CallbackConfiguration, helperPath: string): string {
+function callbackMarkdown(configuration: CallbackConfiguration, helperPath: string, artifactHelperPath: string): string {
   const outcomes = configuration.allowed_outcomes.length
     ? configuration.allowed_outcomes.map((outcome) => `- \`${outcome.id}\`: ${outcome.label} — ${outcome.description}`).join("\n")
     : "- `completed`: Complete the assigned work";
@@ -201,9 +257,10 @@ ${helperPath} metadata get
 ${helperPath} metadata get release
 ${helperPath} metadata put release release-value.json
 ${helperPath} emit-candidates candidates.json
+${artifactHelperPath} report.md --title "Implementation summary" --category review --featured
 \`\`\`
 
-Use \`-\` instead of a filename to read JSON from stdin. The helper validates completion outcomes, writes every request and response under \`outbox/\`, and then calls the lease-fenced tracker endpoint.
+Use \`-\` instead of a filename to read JSON from stdin. The callback helper validates completion outcomes, writes every request and response under \`outbox/\`, and then calls the lease-fenced tracker endpoint. The artifact helper accepts any file and optional display hints; publish evidence before the terminal callback closes the lease.
 
 Raw callback base, if the helper cannot be used: \`${configuration.callback_base}\`
 
@@ -229,6 +286,7 @@ export class AssignmentBundleWriter {
       root: this.root, ticketDirectory, runDirectory,
       startHerePath: join(runDirectory, "START_HERE.md"),
       callbackHelperPath: join(runDirectory, "callback"),
+      artifactHelperPath: join(runDirectory, "publish-artifact"),
       attachmentsDirectory: join(runDirectory, "attachments"),
     };
   }
@@ -239,10 +297,12 @@ export class AssignmentBundleWriter {
     await mkdir(join(bundle.runDirectory, "outbox"), { recursive: true });
     await atomicWrite(bundle.callbackHelperPath, callbackHelperSource());
     await chmod(bundle.callbackHelperPath, 0o755);
+    await atomicWrite(bundle.artifactHelperPath, artifactHelperSource());
+    await chmod(bundle.artifactHelperPath, 0o755);
     await this.refresh(bundle, ticket, callbackBaseUrl, projectRoot, prompts);
     await atomicWrite(join(bundle.ticketDirectory, "ACTIVE.json"), `${JSON.stringify({
       schema_version: 1, ticket_id: ticket.frontmatter.id, node_run_id: ticket.frontmatter.execution.node_run_id,
-      run_directory: bundle.runDirectory, start_here: bundle.startHerePath, callback_helper: bundle.callbackHelperPath,
+      run_directory: bundle.runDirectory, start_here: bundle.startHerePath, callback_helper: bundle.callbackHelperPath, artifact_helper: bundle.artifactHelperPath,
       updated_at: new Date().toISOString(),
     }, null, 2)}\n`);
     return bundle;
@@ -282,6 +342,8 @@ ${repositories.map((repository) => `- ${repository.primary ? "Primary" : "Additi
 
 Use your normal tools, credentials, judgment, planning, and subagents. Work autonomously inside the current node.
 
+To publish human-readable evidence for later inspection, run \`${bundle.artifactHelperPath} --help\`. Artifact contents are unrestricted and must be published before the terminal callback.
+
 ## Ticket attachments
 
 ${attachments.length ? attachments.map((attachment) => `- \`${attachment.filename}\`: \`${attachment.path}\``).join("\n") : "No files are attached to this ticket."}
@@ -310,7 +372,7 @@ Full output log: ${values.incoming_output_log}
 `;
     const context = {
       schema_version: 1, generated_at: new Date().toISOString(), supervisor_id: this.supervisorId,
-      assignment: { directory: bundle.runDirectory, start_here: bundle.startHerePath, callback_helper: bundle.callbackHelperPath },
+      assignment: { directory: bundle.runDirectory, start_here: bundle.startHerePath, callback_helper: bundle.callbackHelperPath, artifact_helper: bundle.artifactHelperPath },
       ticket: { id: ticket.frontmatter.id, title: ticket.frontmatter.title, tracker_path: ticket.path, phase: ticket.frontmatter.phase, revision: (ticket.frontmatter as Record<string, unknown>).revision ?? null },
       workflow: ticket.frontmatter.workflow ?? null, node: ticket.workflow_node ?? null,
       execution: ticket.frontmatter.execution, resolved_agent_profile: ticket.resolved_agent_profile ?? null,
@@ -326,7 +388,7 @@ Full output log: ${values.incoming_output_log}
       atomicWrite(join(bundle.runDirectory, "artifacts.md"), `# Tracker artifacts and checkpoints\n\n${generatedNotice}\n## Artifacts\n\n${artifacts.length ? artifacts.map((artifact) => `- **${artifact.filename}** — ${artifact.kind}, ${artifact.size_bytes} bytes\n  - URL: ${artifact.url}\n  - SHA-256: \`${artifact.sha256}\`${artifact.node_run_id ? `\n  - Node run: \`${artifact.node_run_id}\`` : ""}`).join("\n") : "No workflow artifacts have been stored."}\n\n## Checkpoints\n\n${(ticket.frontmatter.checkpoints ?? []).length ? (ticket.frontmatter.checkpoints ?? []).map((checkpoint) => `- **${checkpoint.label}** — \`${checkpoint.id}\`, ${checkpoint.kind}, ${checkpoint.repositories.length} repositories`).join("\n") : "No checkpoints have been recorded."}\n`),
       atomicWrite(join(bundle.runDirectory, "context.json"), `${JSON.stringify(context, null, 2)}\n`),
       atomicWrite(join(bundle.runDirectory, "callbacks.json"), `${JSON.stringify(configuration, null, 2)}\n`),
-      atomicWrite(join(bundle.runDirectory, "callbacks.md"), callbackMarkdown(configuration, bundle.callbackHelperPath)),
+      atomicWrite(join(bundle.runDirectory, "callbacks.md"), callbackMarkdown(configuration, bundle.callbackHelperPath, bundle.artifactHelperPath)),
     ]);
   }
 

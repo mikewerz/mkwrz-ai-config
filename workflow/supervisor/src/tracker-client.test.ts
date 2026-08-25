@@ -53,6 +53,58 @@ describe("TrackerClient quality artifact uploads", () => {
     // Assert
     await expect(action).rejects.toMatchObject({ status: 422, code: "QUALITY_REPORT_INVALID", message: "Quality report schema is invalid" });
   });
+
+  it("adds optional presentation hints to unrestricted evidence uploads", async () => {
+    // Arrange
+    const artifact = {
+      id: "artifact-2", kind: "evidence", ticket_id: "AGENT-0001", node_run_id: "run-1",
+      filename: "review.md", content_type: "text/markdown", size_bytes: 20, sha256: "b".repeat(64),
+      created_at: "2026-08-20T12:00:00.000Z", metadata: { presentation: { title: "Review", featured: true } },
+    };
+    const fetcher = vi.fn(async (_input: string | URL | Request, _init?: RequestInit) => Response.json({ artifact }));
+    vi.stubGlobal("fetch", fetcher);
+    const client = new TrackerClient("http://tracker.test", "worker-1", "process-1");
+
+    // Act
+    await client.uploadArtifact("lease-1", {
+      kind: "evidence", filename: "review.md", contentType: "text/markdown", content: Buffer.from("# Review\n"),
+      presentation: { title: "Review summary", description: "Approval evidence", category: "review", featured: true },
+    });
+
+    // Assert
+    const [input] = fetcher.mock.calls[0]!;
+    expect(Object.fromEntries((input as URL).searchParams)).toEqual({
+      kind: "evidence", filename: "review.md", content_type: "text/markdown", title: "Review summary",
+      description: "Approval evidence", category: "review", featured: "true",
+    });
+  });
+});
+
+describe("TrackerClient execution traces", () => {
+  it("posts provider-neutral sequence-fenced trace batches", async () => {
+    // Arrange
+    const fetcher = vi.fn(async (_input: string | URL | Request, _init?: RequestInit) => Response.json({ artifact: { id: "trace-artifact" }, next_sequence: 3 }, { status: 201 }));
+    vi.stubGlobal("fetch", fetcher);
+    const client = new TrackerClient("http://tracker.test", "worker-1", "process-1");
+    const events = [
+      { sequence: 1, timestamp: "2026-08-25T12:00:00.000Z", elapsed_ms: 0, event: "herdr.command_started", data: { command: "agent.prompt" } },
+      { sequence: 2, timestamp: "2026-08-25T12:00:01.000Z", elapsed_ms: 1_000, event: "delivery.confirmed", data: { confirmation: "direct" } },
+    ];
+
+    // Act
+    const result = await client.appendExecutionTrace("lease-1", {
+      traceId: "11111111-1111-4111-8111-111111111111", firstSequence: 1, events, completed: true,
+    });
+
+    // Assert
+    expect(result.next_sequence).toBe(3);
+    const [input, init] = fetcher.mock.calls[0]!;
+    expect((input as URL).pathname).toBe("/api/work/lease-1/trace/events");
+    expect(init).toMatchObject({ method: "POST", headers: { "Content-Type": "application/json" } });
+    expect(JSON.parse(String(init!.body))).toEqual({
+      trace_id: "11111111-1111-4111-8111-111111111111", first_sequence: 1, events, completed: true,
+    });
+  });
 });
 
 describe("TrackerClient request deadlines", () => {

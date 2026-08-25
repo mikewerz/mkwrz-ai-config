@@ -574,7 +574,7 @@ Every mutation from an agent or supervisor includes the current lease ID. A stal
 
 For a terminal callback, the tracker records the lease ID, request digest, and resulting response in the ticket's interaction event before clearing `execution`. An exact retry replays that result; reuse of the same lease with a different callback payload returns `409 Conflict`.
 
-Herdr lifecycle changes may update `observed_herdr_state` and the UI, but `idle` or `done` never completes a phase. After an actual agent launch, the supervisor waits for Herdr's `interactive_ready=true` and `launch_pending=false` predicate to remain stable before sending work; older Herdr versions without either field receive a conservative bounded startup delay. Initial assignment delivery then uses Herdr's stalled-prompt detection with a timeout longer than its five-second activity window. Because `agent_prompt_stalled` can mean either delayed lifecycle observation or text left unsent in a full-screen agent's composer, the supervisor never pastes the complete assignment twice on one lease. It polls activity and unwrapped pane text for the assignment's unique absolute `START_HERE.md` path during a bounded recovery window. Activity confirms delivery; a matching staged prompt is submitted with a single `Enter`, but never while launch remains pending or interactive readiness is false. If neither appears, the supervisor reports an infrastructure delivery error and later lease recovery retries the node rather than substituting a callback reminder. A normal timeout after activity means the agent is still working. The supervisor does not enter its monitoring/reminder loop until assignment delivery has been confirmed.
+Herdr lifecycle changes may update `observed_herdr_state` and the UI, but `idle` or `done` never completes a phase. After an actual agent launch, the supervisor waits for Herdr's `interactive_ready=true` and `launch_pending=false` predicate to remain stable before sending work; older Herdr versions without either field receive a conservative bounded startup delay instead. Initial assignment delivery then uses Herdr's stalled-prompt detection with a timeout longer than its five-second activity window. Both `agent_prompt_stalled` and a wait timeout are inconclusive: either can mean delayed lifecycle observation or text left unsent in a full-screen agent's composer. Neither constitutes delivery proof. The supervisor never pastes the complete assignment twice on one lease. It polls activity and unwrapped pane text during a bounded recovery window. Only a semantic transition from settled `idle`/`done` to `working` confirms delivery from lifecycle; pane repaint revisions, late native-session discovery, and unknown/blocked startup transitions do not. Either the assignment's unique absolute `START_HERE.md` path or Claude's collapsed `[Pasted text #N +M lines]` token confirms staged input and causes a single `Enter`, but never while launch remains pending or interactive readiness is false. The resulting ticket event states whether delivery was direct, observed from a working transition, or recovered by submitting staged input. If neither signal appears, the supervisor clears any possibly hidden composer with `Ctrl+C`, reports an infrastructure delivery error, and lets later lease recovery retry the node rather than substituting a callback reminder or concatenating prompts. The supervisor does not enter its monitoring/reminder loop until assignment delivery has been confirmed.
 
 After confirmed assignment activity, if the agent settles without sending `complete`, `ask`, or `fail`, the supervisor may remind it once per lease of the callback contract; later lifecycle changes do not re-arm that reminder. It must not infer success from terminal output. An operator may manually resume the same leased conversation through guidance after a provider cooldown.
 
@@ -599,6 +599,8 @@ Each provider gets a fresh conversation for each ticket, not for each phase and 
 - Re-review resumes the review conversation.
 
 The tracker persists provider, Herdr pane ID, native session reference, and one compact current Herdr observation in frontmatter. The observation may include workspace/tab/terminal identity, focus, cwd and foreground cwd, terminal title, display name, pane revision, session source/kind, and display metadata tokens. It never contains terminal output. The supervisor obtains native references through the official Herdr integrations. A lost native reference is an infrastructure interruption: the supervisor may start a fresh conversation for the same ticket and supplies the full durable ticket history.
+
+For every Agent-node attempt, the supervisor also streams a UUID-scoped operational trace as immutable, contiguous JSONL chunks in the tracker artifact store. The trace records Herdr commands, timestamps, durations, bounded response metadata, stable errors, meaningful pane observations, and supervisor delivery/recovery decisions. Prompt and terminal bodies remain outside the trace; only their durable path, byte count, and digest are retained. Exact batch replays are idempotent and sequence gaps fail closed. Trace capture is observational and best effort, and cannot complete or fail a workflow node.
 
 Once established, the `specification` and `implementation` agent records for a ticket must use `work_provider` and the same native session reference. The `review` record must use `review_provider` and the ticket's separate review conversation.
 
@@ -761,6 +763,7 @@ All responses identify the ticket by stable `id` and include its current `revisi
 | `POST` | `/api/work/claim` | Atomically claim matching work for one provider slot. |
 | `GET` | `/api/work/active` | Recover active leases owned by a restarting supervisor slot. |
 | `POST` | `/api/work/{lease}/heartbeat` | Extend the lease and report Herdr/session observations. |
+| `POST` | `/api/work/{lease}/trace/events` | Append an idempotent, sequence-fenced batch to the current node attempt's operational trace. |
 | `POST` | `/api/work/{lease}/telemetry` | Best-effort final harness telemetry for the lease-matched durable node run; never advances workflow. |
 | `GET` | `/api/work/{lease}/guidance` | Long-poll guidance after a supplied sequence cursor. |
 | `GET` | `/api/work/{lease}/control` | Return a pending supervisor control request, if any. |
@@ -797,7 +800,8 @@ The Vite/React application is built and served by the Express service. V1 includ
 - live priority editing plus ready, return-to-draft, specification approval/change request, retry, rewind, reopen, fail, and cancel actions;
 - comments, explicit question answers, and live guidance;
 - completed-ticket PR check and archive controls, plus an archived-ticket filter;
-- observed Herdr status, state age, heartbeat age, lease countdown, workspace/tab/pane identity, cwd, terminal title, display tokens, and an operator-facing attach hint; and
+- observed Herdr status, state age, heartbeat age, lease countdown, workspace/tab/pane identity, cwd, terminal title, display tokens, and an operator-facing attach hint;
+- a grouped Operational Traces evidence view with command, decision, and error filters plus raw JSONL downloads; and
 - clear invalid-ticket and lease-needs-attention diagnostics.
 
 Herdr remains the full terminal-monitoring interface. The tracker UI does not mirror terminal output, provide a terminal emulator, render provider traces, administer repository manifests, or edit agent permissions. Its workflow visualization is a fixed projection of the four durable phases, not a configurable graph engine.
@@ -941,7 +945,7 @@ The eventual implementations must include unit and integration coverage for:
 - guidance cursors and idempotent callbacks;
 - prompt default seeding, reserved-directory exclusion, tag validation, optimistic edits, full-envelope preview, and supervisor refresh;
 - live-description continue edits, active interrupt acknowledgement, callback fencing, and restart failure behavior;
-- Herdr command/session adaptation through fakes rather than real paid agent turns, including confirmed, still-working timeout, stalled-composer recovery without duplicate paste, unseen-prompt lease retry, and unexpected-error delivery paths;
+- Herdr command/session adaptation through fakes rather than real paid agent turns, including direct confirmation, timeout and stalled-composer recovery without duplicate paste, observed-activity confirmation, unseen-prompt lease retry, and unexpected-error delivery paths;
 - proof that observed lifecycle state never triggers semantic completion; and
 - the primary React queue, editor decision, approval, guidance, and recovery flows.
 

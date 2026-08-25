@@ -15,6 +15,10 @@ test.afterAll(async () => {
 test("loads the production queue and opens ticket creation", async ({ page }) => {
   await page.goto(tracker.baseUrl);
   await expect(page.getByText("Project Tracker", { exact: true })).toBeVisible();
+  await expect(page.locator(".topnav button").first()).toContainText("Inbox");
+  await page.getByRole("button", { name: /Inbox/ }).click();
+  await expect(page.getByRole("heading", { name: "Attention" })).toBeVisible();
+  await expect(page.getByText("Inbox zero")).toBeVisible();
   await expect(page.getByRole("button", { name: "New ticket" })).toBeVisible();
   await page.getByRole("button", { name: "New ticket" }).click();
   await expect(page.getByRole("heading", { name: /Create work ticket/i })).toBeVisible();

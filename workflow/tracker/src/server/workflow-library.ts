@@ -57,6 +57,12 @@ export interface WorkflowArtifactDeclaration {
   path: string;
   content_type: string;
   required: boolean;
+  presentation?: {
+    title?: string;
+    description?: string;
+    category?: string;
+    featured?: boolean;
+  };
   interpretation?: {
     kind: "quality_report";
     schema: "agentic-quality/v1";
@@ -577,6 +583,12 @@ function normalizeDefinition(value: unknown): WorkflowDefinition {
         path: typeof artifact.path === "string" ? artifact.path : "",
         content_type: typeof artifact.content_type === "string" ? artifact.content_type : "application/octet-stream",
         required: artifact.required === true,
+        ...(record(artifact.presentation) ? { presentation: {
+          ...(typeof artifact.presentation.title === "string" ? { title: artifact.presentation.title } : {}),
+          ...(typeof artifact.presentation.description === "string" ? { description: artifact.presentation.description } : {}),
+          ...(typeof artifact.presentation.category === "string" ? { category: artifact.presentation.category } : {}),
+          ...(artifact.presentation.featured === true ? { featured: true } : {}),
+        } } : {}),
         ...(record(artifact.interpretation) && artifact.interpretation.kind === "quality_report" ? { interpretation: {
           kind: "quality_report" as const,
           schema: "agentic-quality/v1" as const,
@@ -756,6 +768,9 @@ export function validateWorkflow(definition: WorkflowDefinition, promptIds?: Set
         if (!SAFE_ID.test(artifact.name)) errors.push(`node ${node.id}: artifact ${artifact.name || "<missing>"} needs a lowercase artifact name`);
         if (!portableRelativePath(artifact.path, false)) errors.push(`node ${node.id}: artifact ${artifact.name} path must be a contained relative path`);
         if (!artifact.content_type.includes("/")) errors.push(`node ${node.id}: artifact ${artifact.name} content_type must be a MIME type`);
+        if (artifact.presentation?.title && artifact.presentation.title.trim().length > 160) errors.push(`node ${node.id}: artifact ${artifact.name} title must not exceed 160 characters`);
+        if (artifact.presentation?.description && artifact.presentation.description.trim().length > 500) errors.push(`node ${node.id}: artifact ${artifact.name} description must not exceed 500 characters`);
+        if (artifact.presentation?.category && artifact.presentation.category.trim().length > 64) errors.push(`node ${node.id}: artifact ${artifact.name} category must not exceed 64 characters`);
         if (artifact.interpretation) {
           if (artifact.interpretation.schema !== "agentic-quality/v1") errors.push(`node ${node.id}: artifact ${artifact.name} uses an unsupported quality schema`);
           if (!["application/yaml", "application/x-yaml", "text/yaml"].includes(artifact.content_type)) errors.push(`node ${node.id}: quality artifact ${artifact.name} must use a YAML content type`);

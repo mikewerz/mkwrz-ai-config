@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import { appendFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
 import { dirname } from "node:path";
 
 const rawArguments = process.argv.slice(2);
@@ -49,11 +50,25 @@ async function completePrompt(prompt, state) {
     process.exit(65);
   }
   if (!state.callback_submitted) {
-    const configuration = JSON.parse(readFileSync(`${dirname(startHere)}/callbacks.json`, "utf8"));
+    const runDirectory = dirname(startHere);
+    const configuration = JSON.parse(readFileSync(`${runDirectory}/callbacks.json`, "utf8"));
     const outcome = configuration.allowed_outcomes[0]?.id;
     if (!outcome) {
       console.error("fake herdr found no allowed completion outcome");
       process.exit(66);
+    }
+    if (process.env.FAKE_HERDR_PUBLISH_EVIDENCE === "true" && !state.evidence_published) {
+      const reportPath = `${runDirectory}/fake-review.md`;
+      writeFileSync(reportPath, "# Fake-agent review\n\nThe deterministic system-test agent published this evidence without starting a model.\n");
+      const publication = spawnSync(process.execPath, [
+        `${runDirectory}/publish-artifact`, reportPath, "--title", "System-test review", "--description", "Evidence published through the generated assignment helper.", "--category", "approval", "--featured",
+      ], { encoding: "utf8", env: process.env });
+      if (publication.status !== 0) {
+        console.error(`fake herdr evidence publication failed: ${publication.stderr || publication.stdout}`);
+        process.exit(70);
+      }
+      state.evidence_published = true;
+      writeState(state);
     }
     const response = await fetch(configuration.endpoints.complete, {
       method: "POST",
@@ -88,6 +103,8 @@ if (args[0] === "workspace" && args[1] === "create") {
   const configuredReadyAfter = Number.parseInt(process.env.FAKE_HERDR_READY_AFTER_GETS ?? "0", 10);
   const readyAfter = Number.isSafeInteger(configuredReadyAfter) && configuredReadyAfter > 0 ? configuredReadyAfter : 0;
   const ready = state.agent_gets_since_start > readyAfter;
+  const startupObservationNoise = process.env.FAKE_HERDR_STARTUP_OBSERVATION_NOISE === "true";
+  const sessionAvailable = !startupObservationNoise || (state.prompt_attempts ?? 0) > 0;
   respond({
     agent: {
       agent_status: "idle",
@@ -99,16 +116,23 @@ if (args[0] === "workspace" && args[1] === "create") {
       workspace_id: "fake-workspace",
       tab_id: "fake-tab",
       terminal_id: "fake-terminal",
-      revision: 1,
-      agent_session: { value: state.session, source: "system-test", kind: "fake" },
+      revision: startupObservationNoise ? state.agent_gets_since_start : 1,
+      ...(sessionAvailable ? { agent_session: { value: state.session, source: "system-test", kind: "fake" } } : {}),
       tokens: {},
     },
   });
 } else if (args[0] === "agent" && args[1] === "read") {
-  process.stdout.write(state.pending_prompt ?? "");
+  process.stdout.write(state.pending_prompt && process.env.FAKE_HERDR_COLLAPSE_STAGED_PROMPT === "true"
+    ? "Claude Code\n[Pasted text #1 +14 lines]" : state.pending_prompt ?? "");
 } else if (args[0] === "agent" && args[1] === "prompt") {
   state.prompt_attempts = (state.prompt_attempts ?? 0) + 1;
   const prompt = args[3] ?? "";
+  if (process.env.FAKE_HERDR_STAGE_TIMEOUT_PROMPT === "true" && state.prompt_attempts === 1) {
+    state.pending_prompt = prompt;
+    writeState(state);
+    console.error(JSON.stringify({ error: { code: "timeout", message: "Fake prompt remained staged until the wait expired" } }));
+    process.exit(1);
+  }
   if (process.env.FAKE_HERDR_STAGE_STALLED_PROMPT === "true" && state.prompt_attempts === 1) {
     state.pending_prompt = prompt;
     writeState(state);
@@ -130,6 +154,10 @@ if (args[0] === "workspace" && args[1] === "create") {
     delete state.pending_prompt;
     writeState(state);
     await completePrompt(prompt, state);
+  }
+  if (args.includes("ctrl+c") && state.pending_prompt) {
+    delete state.pending_prompt;
+    writeState(state);
   }
   respond({ accepted: true });
 } else if (args[0] === "agent" && args[1] === "wait") {

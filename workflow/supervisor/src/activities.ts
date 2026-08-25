@@ -40,6 +40,7 @@ export interface PendingActivityArtifact {
   filename: string;
   content_type: string;
   path: string;
+  presentation?: { title?: string; description?: string; category?: string; featured?: boolean };
 }
 export interface PendingCheckpoint {
   id: string; label: string; kind: "workflow" | "manual" | "pre_restore"; created_at: string;
@@ -379,7 +380,7 @@ export async function runRepositoryActivity(projectRoot: string, ticket: Claimed
       const path = await realpath(candidate);
       const details = await stat(path);
       if (!inside(workingDirectory, path) || !details.isFile()) throw new Error(`Declared artifact ${declaration.name} is not a contained regular file`);
-      pending.push({ key: declaration.name, kind: declaration.interpretation?.kind === "quality_report" ? "quality_report" : "script_artifact", filename: basename(path), content_type: declaration.content_type, path });
+      pending.push({ key: declaration.name, kind: declaration.interpretation?.kind === "quality_report" ? "quality_report" : "script_artifact", filename: basename(path), content_type: declaration.content_type, path, ...(declaration.presentation ? { presentation: declaration.presentation } : {}) });
     } catch (error) {
       if (declaration.required) throw new Error(`Required artifact ${declaration.name} was not produced: ${(error as Error).message}`);
     }

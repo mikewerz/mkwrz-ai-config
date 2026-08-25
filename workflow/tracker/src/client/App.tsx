@@ -6,6 +6,8 @@ const LOG_START = "<!-- tracker:interaction-log:start -->";
 const LOG_END = "<!-- tracker:interaction-log:end -->";
 const THEMES = ["light", "dark", "retro"] as const;
 type Theme = (typeof THEMES)[number];
+const APP_VIEWS = ["attention", "tickets", "intake", "metrics", "supervisors", "configuration", "prompts", "workflows"] as const;
+type AppView = (typeof APP_VIEWS)[number];
 type WorkProvider = "claude" | "codex";
 const ALL_WORK_PROVIDERS: WorkProvider[] = ["claude", "codex"];
 const MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024;
@@ -109,6 +111,26 @@ function storedTheme(): Theme {
     const value = window.localStorage.getItem("agentic-project-tracker.theme");
     return THEMES.includes(value as Theme) ? value as Theme : "dark";
   } catch { return "dark"; }
+}
+
+function storedValue<T>(key: string, fallback: T): T {
+  try {
+    const value = window.localStorage.getItem(key);
+    return value === null ? fallback : JSON.parse(value) as T;
+  } catch { return fallback; }
+}
+
+function useStoredState<T>(key: string, fallback: T): [T, React.Dispatch<React.SetStateAction<T>>] {
+  const [value, setValue] = useState<T>(() => storedValue(key, fallback));
+  useEffect(() => {
+    try { window.localStorage.setItem(key, JSON.stringify(value)); } catch { /* storage may be disabled */ }
+  }, [key, value]);
+  return [value, setValue];
+}
+
+function storedAppView(): AppView {
+  const value = storedValue<string>("agentic-project-tracker.view", "tickets");
+  return APP_VIEWS.includes(value as AppView) ? value as AppView : "tickets";
 }
 
 function isInitialDraft(ticket: TicketFrontmatter): boolean {
@@ -231,23 +253,100 @@ function timeAgo(timestamp: string | null | undefined, now: number): string {
   return `${duration(now - Date.parse(timestamp))} ago`;
 }
 
+function relativeTime(timestamp: string | null | undefined, now: number): string {
+  if (!timestamp || Number.isNaN(Date.parse(timestamp))) return "unknown";
+  const delta = Date.parse(timestamp) - now;
+  return delta >= 0 ? `in ${duration(delta)}` : `${duration(-delta)} ago`;
+}
+
 function fileSize(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
-function StatusPill({ value, subtle = false }: { value: string; subtle?: boolean }) {
-  return <span className={`status-pill status-${value} ${subtle ? "subtle" : ""}`}><i />{humanize(value)}</span>;
+function StatusPill({ value, subtle = false, label }: { value: string; subtle?: boolean; label?: string }) {
+  return <span className={`status-pill status-${value} ${subtle ? "subtle" : ""}`}><i />{label ?? humanize(value)}</span>;
+}
+
+function NextActionSummary({ ticket, workflow }: { ticket: TicketFrontmatter; workflow: WorkflowDocument["definition"] }) {
+  if (!ticket.workflow) return null;
+  const current = workflow.nodes.find((node) => node.id === ticket.workflow?.current_node);
+  if (!current) return null;
+  const pendingQuestions = ticket.questions.filter((question) => question.answer === null).length;
+  const productionResult = ticket.production_result ?? "unassessed";
+  const targetFor = (targetId: string | undefined): string | null => {
+    const target = workflow.nodes.find((node) => node.id === targetId);
+    if (!target) return null;
+    const provider = resolvedWorkflowProvider(ticket, target);
+    return provider ? `${target.name} starts with ${humanize(provider)}` : target.name;
+  };
+  let parts: string[];
+  if (pendingQuestions > 0) parts = ["Waiting for you", `Answer ${pendingQuestions} agent question${pendingQuestions === 1 ? "" : "s"}`, `${current.name} resumes`];
+  else if (ticket.status === "waiting_approval" && current.type === "human_gate") {
+    const approval = current.choices.find((choice) => choice.id === "approved" || /approve/i.test(choice.label)) ?? current.choices[0];
+    parts = ["Waiting for you", current.name, targetFor(approval?.target) ?? "Choose a workflow path"];
+  } else if (ticket.status === "running") parts = [`${ticket.execution?.provider ? humanize(ticket.execution.provider) : "Supervisor"} working`, current.name, "Agent callback selects the next path"];
+  else if (ticket.status === "ready") parts = ["Waiting for a supervisor", current.name, resolvedWorkflowProvider(ticket, current) ? `Starts with ${humanize(resolvedWorkflowProvider(ticket, current)!)} when capacity is available` : "Runs when capacity is available"];
+  else if (ticket.status === "waiting_external") {
+    const wait = Object.values(ticket.workflow.wait_states ?? {}).filter((candidate) => candidate.node_id === current.id).sort((left, right) => right.attempt - left.attempt || right.started_at.localeCompare(left.started_at))[0];
+    parts = ["Waiting on an external condition", wait ? `Check resumes ${new Date(wait.wake_at).toLocaleString()}` : current.name, targetFor(current.next) ?? "Workflow continues after the check"];
+  } else if (ticket.status === "blocked" || ticket.status === "failed") parts = ["Waiting for you", `Review ${humanize(ticket.status)} node`, `Retry ${current.name}`];
+  else if (ticket.status === "completed") parts = ["Workflow complete", "Review the execution recap", productionResult === "unassessed" ? "Record the production outcome or archive" : `Production marked ${humanize(productionResult)}`];
+  else if (ticket.status === "pending") parts = ["Draft ticket", "Review and mark ready", `${current.name} becomes eligible`];
+  else parts = [humanize(ticket.status), current.name];
+  return <div className="next-action-summary" aria-label="What happens next">{parts.map((part, index) => <React.Fragment key={`${index}:${part}`}>{index > 0 && <span aria-hidden="true">→</span>}<strong>{part}</strong></React.Fragment>)}</div>;
 }
 
 function WorkflowMap({ ticket, workflow }: { ticket: TicketFrontmatter; workflow: WorkflowDocument["definition"] | undefined }) {
+  const [storedZoom, setStoredZoom] = useStoredState("agentic-project-tracker.graph.zoom", 1);
+  const zoom = [0.7, 0.85, 1, 1.15, 1.3].includes(storedZoom) ? storedZoom : 1;
+  const zoomIndex = [0.7, 0.85, 1, 1.15, 1.3].indexOf(zoom);
   if (ticket.workflow && workflow) return <section className="workflow-panel" aria-label="Ticket workflow">
-    <div className="section-heading"><div><span>Workflow · {workflow.id}@{ticket.workflow.revision.slice(0, 8)}</span><h2>{workflow.name}</h2></div><StatusPill value={ticket.status} /></div>
-    <WorkflowGraph workflow={workflow} currentNode={ticket.workflow.current_node} ticket={ticket} />
+    <div className="section-heading"><div><span>Workflow · {workflow.id}@{ticket.workflow.revision.slice(0, 8)}</span><h2>{workflow.name}</h2></div><div className="workflow-heading-actions"><div className="graph-zoom" role="group" aria-label="Workflow zoom"><button aria-label="Zoom out" disabled={zoomIndex === 0} onClick={() => setStoredZoom([0.7, 0.85, 1, 1.15, 1.3][zoomIndex - 1] ?? zoom)}>−</button><button aria-label="Reset zoom" onClick={() => setStoredZoom(1)}>{Math.round(zoom * 100)}%</button><button aria-label="Zoom in" disabled={zoomIndex === 4} onClick={() => setStoredZoom([0.7, 0.85, 1, 1.15, 1.3][zoomIndex + 1] ?? zoom)}>＋</button></div></div></div>
+    <NextActionSummary ticket={ticket} workflow={workflow} />
+    <WorkflowGraph workflow={workflow} currentNode={ticket.workflow.current_node} ticket={ticket} zoom={zoom} />
     <div className="workflow-loops"><span>{ticket.workflow.transition_count} / {workflow.max_transitions} transitions</span><span>{ticket.workflow.node_runs.length} durable node runs</span></div>
   </section>;
   return <section className="workflow-panel" aria-label="Ticket workflow"><p className="muted">This ticket has no loadable pinned workflow.</p></section>;
+}
+
+function PendingQuestions({ questions, answers, busy, now, onChange, onAnswer }: {
+  questions: TicketFrontmatter["questions"];
+  answers: Record<string, string>;
+  busy: boolean;
+  now: number;
+  onChange: (questionId: string, answer: string) => void;
+  onAnswer: (questionId: string) => void;
+}) {
+  const pending = questions.filter((question) => !question.answer);
+  if (!pending.length) return null;
+  return <section className="pending-questions-card" aria-label="Agent questions">
+    <header className="pending-questions-heading">
+      <div className="question-symbol" aria-hidden="true">?</div>
+      <div><span>Action required</span><h2>Agent needs your input</h2><p>Your response is saved to the ticket and delivered back to the active workflow conversation.</p></div>
+      <strong>{pending.length} pending</strong>
+    </header>
+    <div className="pending-question-list">{pending.map((question, questionIndex) => {
+      const answer = answers[question.id] ?? "";
+      return <article className="pending-question" key={question.id}>
+        <div className="pending-question-meta"><span>{pending.length > 1 ? `Question ${questionIndex + 1}` : "Question"} · {humanize(question.phase)}</span><time dateTime={question.asked_at}>Asked {timeAgo(question.asked_at, now)}</time></div>
+        <div className="pending-question-copy"><MarkdownContent markdown={question.question} /></div>
+        {(question.options ?? []).length > 0 && <div className="suggested-answer-group"><span>Suggested answers</span><div className="question-options">{question.options.map((option, index) => <button
+          type="button" className={answer === option ? "selected" : ""} aria-pressed={answer === option}
+          key={`${index}:${option}`} onClick={() => onChange(question.id, option)}
+        ><i aria-hidden="true" />{option}</button>)}</div></div>}
+        <label className="question-response"><span>Your response</span><textarea aria-label={`Answer: ${question.question}`} placeholder="Write a response or choose an option above…" value={answer} onChange={(event) => onChange(question.id, event.target.value)} /></label>
+        <footer><small>Freeform answers are always accepted.</small><button className="button-primary" disabled={busy || !answer.trim()} onClick={() => onAnswer(question.id)}>Send response</button></footer>
+      </article>;
+    })}</div>
+  </section>;
+}
+
+function AnsweredQuestions({ questions }: { questions: TicketFrontmatter["questions"] }) {
+  const answered = questions.filter((question) => question.answer);
+  if (!answered.length) return null;
+  return <section className="side-card" aria-label="Question history"><div className="section-heading"><div><span>Conversation</span><h2>Question history</h2></div></div>{answered.map((question) => <div className="question-item" key={question.id}><strong>{question.question}</strong><p>{question.answer}</p></div>)}</section>;
 }
 
 function AgentSessions({ ticket, workflow, onReset }: { ticket: TicketFrontmatter; workflow?: WorkflowDocument["definition"]; onReset?: (key: string) => void }) {
@@ -313,6 +412,106 @@ function MarkdownContent({ markdown }: { markdown: string }) {
     output.push(<p key={`p-${index}`}>{inlineMarkdown(paragraph.join(" "))}</p>);
   }
   return <div className="markdown-content">{output.length ? output : <p className="muted">No description.</p>}</div>;
+}
+
+type TicketArtifact = TicketFrontmatter["artifacts"][number];
+type ArtifactPresentation = { title?: string; description?: string; category?: string; featured?: boolean };
+const MAX_INLINE_ARTIFACT_BYTES = 2 * 1024 * 1024;
+
+function artifactPresentation(artifact: TicketArtifact): ArtifactPresentation {
+  const raw = artifact.metadata?.presentation;
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
+  const record = raw as Record<string, unknown>;
+  return {
+    ...(typeof record.title === "string" ? { title: record.title } : {}),
+    ...(typeof record.description === "string" ? { description: record.description } : {}),
+    ...(typeof record.category === "string" ? { category: record.category } : {}),
+    ...(record.featured === true ? { featured: true } : {}),
+  };
+}
+
+function artifactTitle(artifact: TicketArtifact): string {
+  return artifactPresentation(artifact).title ?? artifact.filename;
+}
+
+function ArtifactPreview({ ticketId, artifact }: { ticketId: string; artifact: TicketArtifact }) {
+  const [content, setContent] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const url = api.artifactUrl(ticketId, artifact.id);
+  const textual = artifact.content_type === "text/markdown" || artifact.content_type.startsWith("text/plain")
+    || ["application/json", "application/yaml", "application/x-yaml", "text/yaml"].includes(artifact.content_type);
+  useEffect(() => {
+    setContent(null); setError(null);
+    if (!textual || artifact.size_bytes > MAX_INLINE_ARTIFACT_BYTES) return;
+    const controller = new AbortController();
+    void fetch(url, { signal: controller.signal }).then(async (response) => {
+      if (!response.ok) throw new Error(`Preview returned HTTP ${response.status}`);
+      return response.text();
+    }).then(setContent).catch((caught) => { if (!controller.signal.aborted) setError((caught as Error).message); });
+    return () => controller.abort();
+  }, [artifact.id, artifact.size_bytes, textual, url]);
+  if (artifact.size_bytes > MAX_INLINE_ARTIFACT_BYTES && textual) return <div className="artifact-preview-fallback"><p>This text artifact is too large for an inline preview.</p><a href={url} target="_blank" rel="noreferrer">Open artifact ↗</a></div>;
+  if (artifact.content_type === "text/html") return <iframe className="artifact-html-preview" src={url} sandbox="allow-scripts" title={artifactTitle(artifact)} />;
+  if (artifact.content_type.startsWith("image/")) return <div className="artifact-image-preview"><img src={url} alt={artifactTitle(artifact)} /></div>;
+  if (artifact.content_type === "application/pdf") return <iframe className="artifact-pdf-preview" src={url} title={artifactTitle(artifact)} />;
+  if (error) return <div className="artifact-preview-fallback"><p>{error}</p><a href={url} target="_blank" rel="noreferrer">Open artifact ↗</a></div>;
+  if (textual && content === null) return <div className="artifact-preview-loading">Loading preview…</div>;
+  if (artifact.content_type === "text/markdown" && content !== null) return <div className="artifact-markdown-preview"><MarkdownContent markdown={content} /></div>;
+  if (content !== null) {
+    let displayed = content;
+    if (artifact.content_type === "application/json") try { displayed = JSON.stringify(JSON.parse(content), null, 2); } catch { /* display invalid JSON as authored */ }
+    else if (["application/yaml", "application/x-yaml", "text/yaml"].includes(artifact.content_type)) try { displayed = stringify(parse(content)); } catch { /* display invalid YAML as authored */ }
+    return <pre className="artifact-text-preview"><code>{displayed}</code></pre>;
+  }
+  return <div className="artifact-preview-fallback"><p>No inline preview is available for {artifact.content_type}.</p><a href={url} target="_blank" rel="noreferrer">Open artifact ↗</a></div>;
+}
+
+function ReviewMaterials({ ticket, workflow, busy, now, onDecide }: {
+  ticket: TicketFrontmatter;
+  workflow?: WorkflowDocument["definition"];
+  busy: boolean;
+  now: number;
+  onDecide: (choice: NonNullable<WorkflowNode["choices"]>[number]) => void;
+}) {
+  const current = ticket.workflow ? workflow?.nodes.find((node) => node.id === ticket.workflow?.current_node) : undefined;
+  const active = current?.type === "human_gate" && ticket.status === "waiting_approval";
+  const sourceNode = ticket.workflow?.incoming?.source_node;
+  const sourceRun = [...(ticket.workflow?.node_runs ?? [])].reverse().find((run) => run.node_id === sourceNode && run.status === "completed");
+  const materials = sourceRun ? (ticket.artifacts ?? []).filter((artifact) => artifact.node_run_id === sourceRun.id
+    && ["evidence", "script_artifact", "quality_report", "script_output"].includes(artifact.kind)) : [];
+  const ordered = [...materials].sort((left, right) => {
+    const featured = Number(Boolean(artifactPresentation(right).featured)) - Number(Boolean(artifactPresentation(left).featured));
+    if (featured) return featured;
+    const rank = (artifact: TicketArtifact) => artifact.content_type === "text/markdown" ? 0 : artifact.content_type === "text/html" ? 1 : artifact.content_type.startsWith("image/") ? 2 : 3;
+    return rank(left) - rank(right) || right.created_at.localeCompare(left.created_at);
+  });
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const selected = ordered.find((artifact) => artifact.id === selectedId) ?? ordered[0];
+  useEffect(() => { if (ordered.length && !ordered.some((artifact) => artifact.id === selectedId)) setSelectedId(ordered[0]!.id); }, [ordered.map((artifact) => artifact.id).join("|"), selectedId]);
+  if (!active) return null;
+  return <section className="review-materials-card" aria-label="Review materials">
+    <header className="review-materials-heading"><div><span>Approval requested</span><h2>{current.name}</h2><p>{sourceRun?.summary ?? ticket.workflow?.incoming?.summary ?? "Review the preceding work and choose how the workflow should continue."}</p></div><strong>{materials.length} artifact{materials.length === 1 ? "" : "s"}</strong></header>
+    {selected ? <div className="review-materials-body">
+      {ordered.length > 1 && <nav className="artifact-tabs" aria-label="Review artifacts">{ordered.map((artifact) => <button className={artifact.id === selected.id ? "active" : ""} key={artifact.id} onClick={() => setSelectedId(artifact.id)}>{artifactTitle(artifact)}</button>)}</nav>}
+      <div className="review-artifact-title"><div><span>{artifactPresentation(selected).category ?? humanize(selected.kind)}</span><h3>{artifactTitle(selected)}</h3>{artifactPresentation(selected).description && <p>{artifactPresentation(selected).description}</p>}</div><small>{fileSize(selected.size_bytes)} · {timeAgo(selected.created_at, now)}</small></div>
+      <ArtifactPreview ticketId={ticket.id} artifact={selected} />
+    </div> : <div className="review-materials-empty"><strong>No review artifact was published.</strong><p>The completion summary above is still available for this decision.</p></div>}
+    <footer className="review-actions"><div><span>Decision</span><p>Choose an outcome to continue this workflow.</p></div>{current.choices.map((choice, index) => <button className={index === 0 ? "button-primary" : "button-secondary"} disabled={busy} key={choice.id} onClick={() => onDecide(choice)}><strong>{choice.label}</strong><small>{choice.description}</small></button>)}</footer>
+  </section>;
+}
+
+function promptForGateComment(choice: NonNullable<WorkflowNode["choices"]>[number]): { message?: string } | null {
+  const requirement = choice.comment_required
+    ? "A comment is required."
+    : "You may add an optional comment for the next node.";
+  const comment = window.prompt(`${choice.label}\n\n${choice.description}\n\n${requirement}\nThe selected answer controls workflow routing; this comment does not.`);
+  if (comment === null) return null;
+  const message = comment.trim();
+  if (choice.comment_required && !message) {
+    window.alert(`${choice.label} requires a comment.`);
+    return null;
+  }
+  return message ? { message } : {};
 }
 
 function runtimeWarning(execution: Pick<Execution, "observed_herdr_state" | "last_heartbeat_at" | "lease_expires_at">, now: number): string | null {
@@ -551,48 +750,138 @@ function TicketQuality({ ticket }: { ticket: TicketFrontmatter }) {
   return <section className="side-card quality-card"><div className="section-heading"><div><span>Evaluation evidence</span><h2>Quality</h2></div><small>{latest.size} attribute{latest.size === 1 ? "" : "s"}</small></div><div className="quality-list">{[...latest.entries()].sort((left, right) => left[1].attribute.label.localeCompare(right[1].attribute.label)).map(([identity, { attribute, artifact, reportName, nodeId, subject }]) => <div className={`quality-item quality-${attribute.status}`} key={identity}><span><i />{attribute.label}<small>{attribute.key} · {humanize(nodeId)}{subject ? ` · ${subject}` : ""}{attribute.registered ? "" : " · unregistered"}</small></span><strong>{String(attribute.value)}{attribute.unit ? ` ${attribute.unit}` : ""}</strong><a href={api.artifactUrl(ticket.id, artifact.id)} target="_blank" rel="noreferrer" title={reportName}>YAML ↗</a></div>)}</div></section>;
 }
 
-type EvidenceTab = "artifacts" | "runs" | "manifests" | "outputs" | "checkpoints" | "attachments";
+type EvidenceTab = "review" | "runs" | "traces" | "technical" | "checkpoints" | "attachments";
+
+interface TraceDisplayEvent {
+  sequence: number; timestamp: string; elapsed_ms: number; event: string; data: Record<string, unknown>;
+}
+
+function traceEventSummary(item: TraceDisplayEvent): string {
+  const command = typeof item.data.command === "string" ? item.data.command : null;
+  if (command) return `${command}${typeof item.data.duration_ms === "number" ? ` · ${duration(item.data.duration_ms)}` : ""}${item.data.error_code ? ` · ${String(item.data.error_code)}` : ""}`;
+  if (item.event === "delivery.evaluated") return item.data.accepted === true
+    ? `Accepted${item.data.confirmation ? ` · ${String(item.data.confirmation)}` : ""}`
+    : `Not confirmed${item.data.composer_evidence ? ` · ${String(item.data.composer_evidence)}` : ""}`;
+  if (item.event === "herdr.observation") return [item.data.state, item.data.interactive_ready === true ? "input ready" : null, item.data.launch_pending === true ? "launch pending" : null, typeof item.data.revision === "number" ? `revision ${item.data.revision}` : null].filter(Boolean).join(" · ");
+  return Object.entries(item.data).slice(0, 3).map(([key, value]) => `${humanize(key)}: ${typeof value === "object" ? JSON.stringify(value) : String(value)}`).join(" · ");
+}
+
+function OperationalTrace({ ticketId, artifacts, run, now, nodeName }: {
+  ticketId: string; artifacts: TicketArtifact[]; run?: TicketNodeRun; now: number; nodeName: (id: string) => string;
+}) {
+  const [open, setOpen] = useState(false);
+  const [events, setEvents] = useState<TraceDisplayEvent[] | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [filter, setFilter] = useState<"all" | "commands" | "decisions" | "errors">("all");
+  const ordered = [...artifacts].sort((left, right) => Number(left.metadata.first_sequence) - Number(right.metadata.first_sequence));
+  useEffect(() => {
+    if (!open || events || error) return;
+    void Promise.all(ordered.map(async (artifact) => {
+      const response = await fetch(api.artifactUrl(ticketId, artifact.id));
+      if (!response.ok) throw new Error(`Trace chunk ${artifact.filename} returned ${response.status}`);
+      return (await response.text()).split(/\r?\n/).filter(Boolean).map((line) => JSON.parse(line) as TraceDisplayEvent);
+    })).then((chunks) => setEvents(chunks.flat().sort((left, right) => left.sequence - right.sequence))).catch((reason) => setError((reason as Error).message));
+  }, [open, events, error, ticketId, ordered.map((artifact) => artifact.id).join("|")]);
+  const visible = (events ?? []).filter((item) => filter === "all"
+    || filter === "commands" && item.event.startsWith("herdr.command")
+    || filter === "decisions" && (item.event.startsWith("delivery.") || item.event.startsWith("execution."))
+    || filter === "errors" && (item.event.endsWith("failed") || item.data.error_code !== null && item.data.error_code !== undefined));
+  const eventCount = ordered.reduce((sum, artifact) => sum + Number(artifact.metadata.event_count ?? 0), 0);
+  const completed = ordered.some((artifact) => artifact.metadata.completed === true);
+  return <details className="run-evidence operational-trace" open={open} onToggle={(event) => setOpen(event.currentTarget.open)}><summary><span><strong>{run ? nodeName(run.node_id) : "Unknown node"}</strong><small>Herdr operational trace · attempt {run?.attempt ?? "?"} · {eventCount} events · {ordered.length} chunk{ordered.length === 1 ? "" : "s"}</small></span><span><StatusPill value={completed ? "completed" : run?.status ?? "running"} subtle /><small>{timeAgo(ordered.at(-1)?.created_at ?? new Date().toISOString(), now)}</small></span></summary>{open && <div className="run-evidence-body"><div className="trace-toolbar"><div>{(["all", "commands", "decisions", "errors"] as const).map((value) => <button className={filter === value ? "active" : ""} key={value} onClick={() => setFilter(value)}>{humanize(value)}</button>)}</div><div>{ordered.map((artifact, index) => <a href={api.artifactUrl(ticketId, artifact.id, true)} key={artifact.id}>JSONL {index + 1}</a>)}</div></div>{error ? <div className="evidence-empty">{error}</div> : !events ? <div className="evidence-empty">Loading operational trace…</div> : <div className="trace-events">{visible.map((item) => <details key={item.sequence} className={`trace-event ${item.event.endsWith("failed") || item.data.error_code ? "trace-error" : ""}`}><summary><code>#{item.sequence}</code><span><strong>{humanize(item.event)}</strong><small>{traceEventSummary(item)}</small></span><time>{new Date(item.timestamp).toLocaleString()} · +{duration(item.elapsed_ms)}</time></summary><pre>{JSON.stringify(item.data, null, 2)}</pre></details>)}</div>}</div>}</details>;
+}
 
 function TicketEvidence({ ticket, workflow, busy, now, onUpload, onRemoveAttachment, onCreateCheckpoint, onRestoreCheckpoint }: {
   ticket: TicketDetail; workflow?: WorkflowDocument["definition"]; busy: boolean; now: number;
   onUpload: (files: File[]) => void; onRemoveAttachment: (id: string) => void;
   onCreateCheckpoint: (nodeId: string) => void; onRestoreCheckpoint: (nodeId: string, checkpointId: string) => void;
 }) {
-  const [tab, setTab] = useState<EvidenceTab>("artifacts");
+  const [storedTab, setStoredTab] = useStoredState<string>("agentic-project-tracker.evidence.tab", "review");
+  const tab: EvidenceTab = ["review", "runs", "traces", "technical", "checkpoints", "attachments"].includes(storedTab) ? storedTab as EvidenceTab : "review";
+  const setTab = (value: EvidenceTab) => setStoredTab(value);
+  const [previewArtifactId, setPreviewArtifactId] = useStoredState<string | null>(`agentic-project-tracker.evidence.preview.${ticket.id}`, null);
+  const [fullscreen, setFullscreen] = useState(false);
+  const [featuredOnly, setFeaturedOnly] = useState(false);
+  const [latestPerNode, setLatestPerNode] = useState(true);
+  const [nodeFilter, setNodeFilter] = useState("");
+  const [categoryFilter, setCategoryFilter] = useState("");
+  const [typeFilter, setTypeFilter] = useState("");
   const frontmatter = ticket.frontmatter!;
   const artifacts = [...(frontmatter.artifacts ?? [])].sort((left, right) => right.created_at.localeCompare(left.created_at));
   const runs = [...(frontmatter.workflow?.node_runs ?? [])].reverse();
-  const manifests = artifacts.filter((artifact) => artifact.kind === "execution_manifest" || artifact.kind === "checkpoint_manifest");
-  const outputArtifacts = artifacts.filter((artifact) => ["script_output", "script_artifact", "quality_report"].includes(artifact.kind));
   const outputRuns = runs.filter((run) => Boolean(run.output_path));
   const checkpoints = [...(frontmatter.checkpoints ?? [])].reverse();
   const attachments = frontmatter.attachments ?? [];
   const runById = new Map(runs.map((run) => [run.id, run]));
   const nodeName = (nodeId: string) => workflow?.nodes.find((node) => node.id === nodeId)?.name ?? humanize(nodeId);
+  const reviewKinds = new Set(["evidence", "script_output", "script_artifact", "quality_report"]);
+  const reviewArtifacts = artifacts.filter((artifact) => reviewKinds.has(artifact.kind));
+  const traceArtifacts = artifacts.filter((artifact) => artifact.kind === "execution_trace");
+  const technicalArtifacts = artifacts.filter((artifact) => !reviewKinds.has(artifact.kind) && artifact.kind !== "execution_trace");
+  const traceGroups = [...traceArtifacts.reduce((groups, artifact) => {
+    const key = String(artifact.metadata.trace_id ?? artifact.id);
+    groups.set(key, [...(groups.get(key) ?? []), artifact]);
+    return groups;
+  }, new Map<string, TicketArtifact[]>()).values()];
+  const nodeOptions = [...new Set(reviewArtifacts.flatMap((artifact) => { const run = artifact.node_run_id ? runById.get(artifact.node_run_id) : null; return run ? [run.node_id] : []; }))].sort();
+  const categoryOptions = [...new Set(reviewArtifacts.map((artifact) => artifactPresentation(artifact).category).filter((value): value is string => Boolean(value)))].sort();
+  const typeOptions = [...new Set(reviewArtifacts.map((artifact) => artifact.content_type))].sort();
+  let filteredReview = reviewArtifacts.filter((artifact) => {
+    const run = artifact.node_run_id ? runById.get(artifact.node_run_id) : null;
+    return (!featuredOnly || artifactPresentation(artifact).featured === true)
+      && (!nodeFilter || run?.node_id === nodeFilter)
+      && (!categoryFilter || artifactPresentation(artifact).category === categoryFilter)
+      && (!typeFilter || artifact.content_type === typeFilter);
+  });
+  if (latestPerNode) {
+    const seen = new Set<string>();
+    filteredReview = filteredReview.filter((artifact) => {
+      const run = artifact.node_run_id ? runById.get(artifact.node_run_id) : null;
+      const key = run?.node_id ?? artifact.node_run_id ?? artifact.id;
+      if (seen.has(key)) return false;
+      seen.add(key); return true;
+    });
+  }
+  filteredReview.sort((left, right) => Number(Boolean(artifactPresentation(right).featured)) - Number(Boolean(artifactPresentation(left).featured)) || right.created_at.localeCompare(left.created_at));
   const tabs: Array<{ id: EvidenceTab; label: string; count: number }> = [
-    { id: "artifacts", label: "All artifacts", count: artifacts.length },
+    { id: "review", label: "Review packet", count: reviewArtifacts.length + outputRuns.length },
     { id: "runs", label: "Run history", count: runs.length },
-    { id: "manifests", label: "Manifests", count: manifests.length },
-    { id: "outputs", label: "Outputs", count: outputArtifacts.length + outputRuns.length },
+    { id: "traces", label: "Operational traces", count: traceGroups.length },
+    { id: "technical", label: "Technical artifacts", count: technicalArtifacts.length },
     { id: "checkpoints", label: "Checkpoints", count: checkpoints.length },
     { id: "attachments", label: "Attachments", count: attachments.length },
   ];
+  const previewItems = tab === "review" ? filteredReview : tab === "technical" ? technicalArtifacts : [];
+  const movePreview = (items: typeof artifacts, delta: number) => {
+    if (!items.length) return;
+    const currentIndex = Math.max(0, items.findIndex((artifact) => artifact.id === previewArtifactId));
+    setPreviewArtifactId(items[(currentIndex + delta + items.length) % items.length]!.id);
+  };
+  useEffect(() => {
+    if (!fullscreen) return;
+    const close = (event: KeyboardEvent) => { if (event.key === "Escape") setFullscreen(false); };
+    window.addEventListener("keydown", close); return () => window.removeEventListener("keydown", close);
+  }, [fullscreen]);
   const artifactList = (items: typeof artifacts) => items.length ? <div className="evidence-list">{items.map((artifact) => {
     const run = artifact.node_run_id ? runById.get(artifact.node_run_id) : undefined;
-    return <article className="evidence-item" key={artifact.id}><div className="evidence-kind"><span>{humanize(artifact.kind)}</span><small>{artifact.content_type}</small></div><div><strong>{artifact.filename}</strong><small>{fileSize(artifact.size_bytes)} · {timeAgo(artifact.created_at, now)}{run ? ` · ${nodeName(run.node_id)} attempt ${run.attempt}` : ""}</small><code>sha256:{artifact.sha256}</code></div><div className="evidence-actions"><a href={api.artifactUrl(frontmatter.id, artifact.id)} target="_blank" rel="noreferrer">Open ↗</a><a href={api.artifactUrl(frontmatter.id, artifact.id, true)}>Download</a></div></article>;
+    const presentation = artifactPresentation(artifact);
+    const previewing = previewArtifactId === artifact.id;
+    const itemIndex = items.findIndex((candidate) => candidate.id === artifact.id);
+    return <article className="evidence-item" key={artifact.id}><div className="evidence-kind"><span>{presentation.category ?? humanize(artifact.kind)}</span><small>{artifact.content_type}</small></div><div><strong>{artifactTitle(artifact)}{presentation.featured ? " · Featured" : ""}</strong>{presentation.description && <p>{presentation.description}</p>}<small>{artifact.filename} · {fileSize(artifact.size_bytes)} · {timeAgo(artifact.created_at, now)}{run ? ` · ${nodeName(run.node_id)} attempt ${run.attempt}` : ""}</small><code>sha256:{artifact.sha256}</code></div><div className="evidence-actions"><button type="button" aria-expanded={previewing} onClick={() => setPreviewArtifactId(previewing ? null : artifact.id)}>{previewing ? "Close preview" : "Preview"}</button><a href={api.artifactUrl(frontmatter.id, artifact.id)} target="_blank" rel="noreferrer">Open ↗</a><a href={api.artifactUrl(frontmatter.id, artifact.id, true)}>Download</a></div>{previewing && <div className="evidence-inline-preview"><div className="artifact-preview-toolbar"><span>{itemIndex + 1} of {items.length}</span><button disabled={items.length < 2} onClick={() => movePreview(items, -1)}>← Previous</button><button disabled={items.length < 2} onClick={() => movePreview(items, 1)}>Next →</button><button onClick={() => setFullscreen(true)}>Fullscreen</button></div><ArtifactPreview ticketId={frontmatter.id} artifact={artifact} /></div>}</article>;
   })}</div> : <div className="evidence-empty">No evidence is available in this category.</div>;
   const runList = runs.length ? <div className="run-evidence-list">{runs.map((run) => <details className="run-evidence" key={run.id}><summary><span><strong>{nodeName(run.node_id)}</strong><small>{humanize(run.node_type)} · visit {run.visit} · attempt {run.attempt}{run.conversation_generation ? ` · conversation g${run.conversation_generation}` : ""}</small></span><span><StatusPill value={run.status} subtle /><small>{run.outcome ? humanize(run.outcome) : "No outcome"}</small></span></summary><div className="run-evidence-body"><NodeTimingDetails run={run} now={now} />{run.telemetry && <TelemetryDetails telemetry={run.telemetry} compact />}{(run.supervisor_id || run.provider) && <p><strong>Executor</strong>{[run.supervisor_id, run.provider && humanize(run.provider)].filter(Boolean).join(" · ")}</p>}{run.lease_id && <p><strong>Lease / run</strong><code>{run.lease_id} · {run.id}</code></p>}<p><strong>Workflow revision</strong><code>{run.workflow_revision}{run.input_revision === undefined ? "" : ` · ticket r${run.input_revision}`}</code></p>{run.wait && <p><strong>Durable wait</strong>Wake {timeAgo(run.wait.wake_at, now)} · deadline {timeAgo(run.wait.deadline_at, now)} · {run.wait.delay_seconds}s delay</p>}{run.summary && <p><strong>Summary</strong>{run.summary}</p>}{run.handoff && <p><strong>Handoff</strong>{run.handoff}</p>}{run.script_path && <p><strong>Script</strong><code>{run.script_path}</code></p>}{run.working_directory && <p><strong>Working directory</strong><code>{run.working_directory}</code></p>}{Object.keys(run.metadata_writes ?? {}).length > 0 && <p><strong>Metadata writes</strong><code>{JSON.stringify(run.metadata_writes)}</code></p>}{(run.external_references ?? []).map((reference) => <p key={`${reference.type}:${reference.id}`}><strong>{humanize(reference.type)}</strong>{reference.url ? <a href={reference.url} target="_blank" rel="noreferrer">{reference.id} ↗</a> : reference.id}</p>)}<div className="evidence-actions">{run.output_path && <a href={`/api/tickets/${encodeURIComponent(frontmatter.id)}/runs/${encodeURIComponent(run.id)}/output`} target="_blank" rel="noreferrer">Full output ({fileSize(run.output_bytes ?? 0)}) ↗</a>}{run.manifest_artifact_id && <a href={api.artifactUrl(frontmatter.id, run.manifest_artifact_id)} target="_blank" rel="noreferrer">Execution manifest ↗</a>}</div></div></details>)}</div> : <div className="evidence-empty">No node runs have been recorded.</div>;
   return <section className="content-card evidence-card" aria-label="Evidence and artifacts">
-    <div className="section-heading"><div><span>Durable execution record</span><h2>Evidence &amp; artifacts</h2><p>Browse tracker-owned files, complete run history, manifests, outputs, checkpoints, and supporting files.</p></div><strong>{artifacts.length} stored</strong></div>
+    <div className="section-heading"><div><span>Durable execution record</span><h2>Evidence &amp; artifacts</h2><p>Review readable evidence first; provenance, manifests, and bundles remain available under Technical artifacts.</p></div><strong>{artifacts.length} stored</strong></div>
     <div className="evidence-tabs" role="tablist" aria-label="Evidence categories">{tabs.map((item) => <button type="button" role="tab" aria-selected={tab === item.id} className={tab === item.id ? "active" : ""} key={item.id} onClick={() => setTab(item.id)}>{item.label}<span>{item.count}</span></button>)}</div>
     <div className="evidence-panel" role="tabpanel">
-      {tab === "artifacts" && artifactList(artifacts)}
+      {tab === "review" && <><div className="artifact-review-filters"><label><input type="checkbox" checked={featuredOnly} onChange={(event) => setFeaturedOnly(event.target.checked)} /> Featured only</label><label><input type="checkbox" checked={latestPerNode} onChange={(event) => setLatestPerNode(event.target.checked)} /> Latest from each node</label><select aria-label="Artifact node" value={nodeFilter} onChange={(event) => setNodeFilter(event.target.value)}><option value="">All nodes</option>{nodeOptions.map((node) => <option value={node} key={node}>{nodeName(node)}</option>)}</select><select aria-label="Artifact category" value={categoryFilter} onChange={(event) => setCategoryFilter(event.target.value)}><option value="">All categories</option>{categoryOptions.map((category) => <option value={category} key={category}>{humanize(category)}</option>)}</select><select aria-label="Artifact type" value={typeFilter} onChange={(event) => setTypeFilter(event.target.value)}><option value="">All types</option>{typeOptions.map((type) => <option value={type} key={type}>{type}</option>)}</select></div>{outputRuns.length > 0 && <div className="persisted-output-list">{outputRuns.map((run) => <a key={run.id} href={`/api/tickets/${encodeURIComponent(frontmatter.id)}/runs/${encodeURIComponent(run.id)}/output`} target="_blank" rel="noreferrer"><span><strong>{nodeName(run.node_id)} output</strong><small>Visit {run.visit} · attempt {run.attempt} · {fileSize(run.output_bytes ?? 0)}</small></span><span>Open ↗</span></a>)}</div>}{artifactList(filteredReview)}</>}
       {tab === "runs" && runList}
-      {tab === "manifests" && artifactList(manifests)}
-      {tab === "outputs" && <>{outputRuns.length > 0 && <div className="persisted-output-list">{outputRuns.map((run) => <a key={run.id} href={`/api/tickets/${encodeURIComponent(frontmatter.id)}/runs/${encodeURIComponent(run.id)}/output`} target="_blank" rel="noreferrer"><span><strong>{nodeName(run.node_id)} output</strong><small>Visit {run.visit} · attempt {run.attempt} · {fileSize(run.output_bytes ?? 0)}</small></span><span>Open ↗</span></a>)}</div>}{outputArtifacts.length > 0 ? artifactList(outputArtifacts) : outputRuns.length === 0 ? <div className="evidence-empty">No persisted outputs have been recorded.</div> : null}</>}
+      {tab === "traces" && (traceGroups.length ? <div className="run-evidence-list">{traceGroups.map((group) => { const run = group[0]?.node_run_id ? runById.get(group[0].node_run_id) : undefined; return <OperationalTrace key={String(group[0]?.metadata.trace_id ?? group[0]?.id)} ticketId={frontmatter.id} artifacts={group} {...(run ? { run } : {})} now={now} nodeName={nodeName} />; })}</div> : <div className="evidence-empty">No Herdr operational traces have been recorded.</div>)}
+      {tab === "technical" && artifactList(technicalArtifacts)}
       {tab === "checkpoints" && <><div className="checkpoint-toolbar">{workflow?.nodes.filter((node) => node.type === "checkpoint").map((node) => <button key={node.id} className="button-secondary button-compact" disabled={busy || Boolean(frontmatter.execution?.interrupt_request)} onClick={() => onCreateCheckpoint(node.id)}>＋ {node.name}</button>)}</div>{checkpoints.length ? <div className="evidence-list">{checkpoints.map((checkpoint) => <article className="checkpoint-evidence" key={checkpoint.id}><header><span><strong>{checkpoint.label}</strong><small>{humanize(checkpoint.kind)} · {timeAgo(checkpoint.created_at, now)} · {checkpoint.id}</small></span><a href={api.artifactUrl(frontmatter.id, checkpoint.manifest_artifact_id)} target="_blank" rel="noreferrer">Manifest ↗</a></header>{checkpoint.repositories.map((repository) => <div key={repository.repository}><span><strong>{repository.repository}</strong><small>{repository.branch ?? "detached"} · {repository.dirty ? "working changes included" : "clean"}</small></span><code>{repository.snapshot_sha}</code><a href={api.artifactUrl(frontmatter.id, repository.bundle_artifact_id, true)}>Bundle</a></div>)}<footer>{workflow?.nodes.filter((node) => node.type === "restore_checkpoint").map((node) => <button key={node.id} className="button-secondary button-compact" disabled={busy || Boolean(frontmatter.execution?.interrupt_request)} onClick={() => { if (window.confirm(`Restore ${checkpoint.label}? Current repository state will first be checkpointed.`)) onRestoreCheckpoint(node.id, checkpoint.id); }}>Restore via {node.name}</button>)}</footer></article>)}</div> : <div className="evidence-empty">No checkpoints have been recorded.</div>}</>}
       {tab === "attachments" && <><div className="attachment-evidence-toolbar"><p>Supporting files are materialized into every new assignment bundle.</p><label className="attachment-picker compact"><input aria-label="Add ticket attachments" type="file" multiple disabled={busy} onChange={(event) => { const files = Array.from(event.target.files ?? []); if (files.length) onUpload(files); event.target.value = ""; }} /><span>＋ Add files</span></label></div>{attachments.length ? <div className="attachment-grid">{attachments.map((attachment) => { const source = api.attachmentUrl(ticket.id, attachment.id); return <article className="attachment-item" key={attachment.id}>{attachment.content_type.startsWith("image/") && <a className="attachment-preview" href={source} target="_blank" rel="noreferrer"><img src={source} alt={attachment.filename} /></a>}<div><a href={api.attachmentUrl(ticket.id, attachment.id, true)}><strong>{attachment.filename}</strong></a><small>{fileSize(attachment.size_bytes)} · {attachment.content_type}</small></div><button className="icon-button" aria-label={`Remove ${attachment.filename}`} disabled={busy} onClick={() => onRemoveAttachment(attachment.id)}>×</button></article>; })}</div> : <div className="evidence-empty">No files are attached to this ticket.</div>}</>}
     </div>
+    {fullscreen && previewArtifactId && artifacts.find((artifact) => artifact.id === previewArtifactId) && <div className="artifact-fullscreen" role="dialog" aria-modal="true" aria-label={`Artifact preview: ${artifactTitle(artifacts.find((artifact) => artifact.id === previewArtifactId)!)}`}><header><div><span>{tab === "technical" ? "Technical artifact" : "Review material"}</span><h2>{artifactTitle(artifacts.find((artifact) => artifact.id === previewArtifactId)!)}</h2></div><div><button disabled={previewItems.length < 2} onClick={() => movePreview(previewItems, -1)}>← Previous</button><button disabled={previewItems.length < 2} onClick={() => movePreview(previewItems, 1)}>Next →</button><button className="button-primary" onClick={() => setFullscreen(false)}>Close</button></div></header><ArtifactPreview ticketId={frontmatter.id} artifact={artifacts.find((artifact) => artifact.id === previewArtifactId)!} /></div>}
   </section>;
 }
 
@@ -815,6 +1104,29 @@ function TicketUsage({ ticket, now, humanDayRate }: { ticket: TicketFrontmatter;
   </section>;
 }
 
+function ExecutionRecap({ ticket, workflow, now }: { ticket: TicketFrontmatter; workflow?: WorkflowDocument["definition"]; now: number }) {
+  if (ticket.status !== "completed" || !ticket.workflow) return null;
+  const runs = ticket.workflow.node_runs;
+  const agentRuns = runs.filter((run) => run.node_type === "agent");
+  const tokenRuns = agentRuns.filter((run) => run.telemetry?.delta.usage);
+  const costRuns = agentRuns.filter((run) => run.telemetry?.delta.cost_usd !== null && run.telemetry?.delta.cost_usd !== undefined);
+  const tokens = tokenRuns.reduce((sum, run) => sum + (run.telemetry?.delta.usage?.total_tokens ?? 0), 0);
+  const cost = costRuns.reduce((sum, run) => sum + (run.telemetry?.delta.cost_usd ?? 0), 0);
+  const elapsed = Math.max(0, Date.parse(ticket.workflow.completed_at ?? new Date(now).toISOString()) - Date.parse(ticket.workflow.started_at));
+  const operationalInterventions = runs.filter((run) => ["delivery_failed", "lease_lost", "operator_interrupt"].includes(run.outcome ?? "")).length;
+  const humanGates = runs.filter((run) => run.node_type === "human_gate" && run.status === "completed").length;
+  const interventions = ticket.questions.length + humanGates + operationalInterventions;
+  const importantArtifacts = [...(ticket.artifacts ?? [])].filter((artifact) => ["evidence", "script_artifact", "quality_report", "script_output"].includes(artifact.kind)).sort((left, right) => Number(Boolean(artifactPresentation(right).featured)) - Number(Boolean(artifactPresentation(left).featured)) || right.created_at.localeCompare(left.created_at)).slice(0, 5);
+  const productionResult = ticket.production_result ?? "unassessed";
+  const nodeName = (id: string) => workflow?.nodes.find((node) => node.id === id)?.name ?? humanize(id);
+  return <section className="execution-recap" aria-label="Execution recap">
+    <div className="section-heading"><div><span>Completed workflow</span><h2>Execution recap</h2><p>A compact summary derived from the immutable node-run ledger and ticket artifacts.</p></div><StatusPill value={productionResult === "unassessed" ? "pending" : productionResult} /></div>
+    <div className="recap-metrics"><div><span>Elapsed</span><strong>{duration(elapsed)}</strong></div><div><span>Tokens</span><strong>{tokenRuns.length ? tokenCount(tokens) : "Unavailable"}</strong><small>{tokenRuns.length}/{agentRuns.length} agent runs</small></div><div><span>Known cost</span><strong>{costRuns.length ? usd(cost) : "Unavailable"}</strong><small>{costRuns.length}/{agentRuns.length} agent runs</small></div><div><span>Interventions</span><strong>{interventions}</strong><small>{ticket.questions.length} questions · {humanGates} gates · {operationalInterventions} operational</small></div></div>
+    <div className="recap-path"><span>Path taken</span><div>{runs.map((run, index) => <React.Fragment key={run.id}><span className={`recap-node recap-${run.status}`}>{nodeName(run.node_id)}<small>{run.outcome ? humanize(run.outcome) : humanize(run.status)}</small></span>{index < runs.length - 1 && <i aria-hidden="true">→</i>}</React.Fragment>)}</div></div>
+    <div className="recap-columns"><div><span>Pull requests</span>{ticket.pull_requests.length ? ticket.pull_requests.map((pr) => <a href={pr.url} target="_blank" rel="noreferrer" key={pr.url}>{pr.repository} · {pr.phase ? humanize(pr.phase) : "PR"} ↗</a>) : <small>No PRs were reported.</small>}</div><div><span>Important evidence</span>{importantArtifacts.length ? importantArtifacts.map((artifact) => <a href={api.artifactUrl(ticket.id, artifact.id)} target="_blank" rel="noreferrer" key={artifact.id}>{artifactTitle(artifact)} ↗</a>) : <small>No review artifacts were published.</small>}</div><div><span>Production</span><strong>{humanize(productionResult)}</strong>{ticket.production_assessment_note && <small>{ticket.production_assessment_note}</small>}</div></div>
+  </section>;
+}
+
 function RuntimePanel({ execution, now }: { execution: Execution; now: number }) {
   const activity = isDeterministicActivity(execution.node_type);
   const herdr = execution.herdr_observation;
@@ -823,14 +1135,16 @@ function RuntimePanel({ execution, now }: { execution: Execution; now: number })
   const state = activity || deliveryStatus === "delivered" ? "running" : "starting";
   const warning = runtimeWarning(execution, now);
   const title = herdr?.terminal_title_stripped ?? herdr?.terminal_title;
+  const runtimeName = activity ? humanize(execution.node_id ?? execution.node_type ?? "activity") : herdr?.display_name ?? execution.provider ?? "Agent";
+  const runtimeLabel = state === "running" ? (activity ? "Executing" : "Active") : "Starting";
   return <section className="side-card runtime-panel">
-    <div className="section-heading"><div><span>{activity ? "Deterministic activity" : "Herdr runtime"}</span><h2>{activity ? humanize(execution.node_id ?? execution.node_type ?? "activity") : herdr?.display_name ?? execution.provider}</h2></div><StatusPill value={state} /></div>
+    <div className="section-heading runtime-heading"><div><span>{activity ? "Deterministic activity" : "Herdr runtime"}</span><h2 title={runtimeName}>{runtimeName}</h2></div><StatusPill value={state} label={runtimeLabel} /></div>
     {title && <p className="activity-title">{title}</p>}
     {!activity && deliveryStatus === "starting" && <p className="activity-title">Preparing the agent and confirming assignment delivery.</p>}
     {execution.interrupt_request && <div className="attention-banner"><strong>Interrupt requested</strong><span>Waiting for {activity ? "the running script" : "Herdr"} to stop before {execution.interrupt_request.terminal_status ? `marking the ticket ${execution.interrupt_request.terminal_status}` : `restarting at ${humanize(execution.interrupt_request.target_phase)}`}.</span></div>}
     {warning && <div className="attention-banner"><strong>Attention</strong><span>{warning}</span></div>}
     <div className="metric-grid">
-      <div><span>Running</span><strong>{duration(now - Date.parse(execution.claimed_at))}</strong></div>
+      <div><span>Elapsed</span><strong>{duration(now - Date.parse(execution.claimed_at))}</strong></div>
       <div><span>Herdr state for</span><strong>{herdr ? duration(now - Date.parse(herdr.state_changed_at)) : "—"}</strong></div>
       <div><span>Heartbeat</span><strong>{timeAgo(execution.last_heartbeat_at, now)}</strong></div>
       <div><span>Lease left</span><strong>{duration(Date.parse(execution.lease_expires_at) - now)}</strong></div>
@@ -976,8 +1290,8 @@ function replaceNodeTargets(node: WorkflowNode, from: string, to: string): Workf
   };
 }
 
-function WorkflowGraph({ workflow, currentNode, selectedNode, onSelect, ticket }: {
-  workflow: WorkflowDocument["definition"]; currentNode?: string; selectedNode?: string; onSelect?: (nodeId: string) => void; ticket?: TicketFrontmatter;
+function WorkflowGraph({ workflow, currentNode, selectedNode, onSelect, ticket, zoom = 1 }: {
+  workflow: WorkflowDocument["definition"]; currentNode?: string; selectedNode?: string; onSelect?: (nodeId: string) => void; ticket?: TicketFrontmatter; zoom?: number;
 }) {
   const markerId = useId().replaceAll(":", "");
   const columns = Math.min(3, Math.max(1, workflow.nodes.length));
@@ -998,7 +1312,8 @@ function WorkflowGraph({ workflow, currentNode, selectedNode, onSelect, ticket }
   const loopBase = 55 + rows * 226 - 35;
   const height = loopBase + Math.max(1, backward.length) * 34 + 26;
   return <div className="factory-graph-scroll" aria-label="Workflow graph">
-    <div className="factory-graph" style={{ width, height }}>
+    <div className="factory-graph-scale" style={{ width: width * zoom, height: height * zoom }}>
+    <div className="factory-graph" style={{ width, height, transform: `scale(${zoom})`, transformOrigin: "top left" }}>
       <svg className="factory-connectors" width={width} height={height} aria-hidden="true">
         <defs><marker id={markerId} markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" /></marker></defs>
         {edges.map((edge) => {
@@ -1045,7 +1360,7 @@ function WorkflowGraph({ workflow, currentNode, selectedNode, onSelect, ticket }
           {ticket && <footer className="factory-node-metrics"><span>{runs.length} visit{runs.length === 1 ? "" : "s"}</span><span>{runs.length ? `${duration(totalWall)} wall · ${duration(totalActive)} active` : "Not run"}</span><span>{runs.some((run) => run.telemetry?.delta.usage) ? `${tokenCount(totalTokens)} tok` : "Tokens —"} · {costRuns.length ? `${usd(totalCost)}${hasEstimatedCost ? " est" : ""}` : "Cost —"}</span></footer>}
         </button>;
       })}
-    </div>
+    </div></div>
   </div>;
 }
 
@@ -1272,7 +1587,7 @@ function WorkflowNodeInspector({ workflow, node, prompts, agentProfiles, workflo
         patchNode({ inline: { language, code: !node.inline!.code.trim() || isDefaultInlineCode(node.inline!.code) ? defaultInlineCode(language) : node.inline!.code } });
       }}><option value="shell">Shell</option><option value="python">Python</option><option value="javascript">JavaScript</option></select></label><label className="inline-code-field"><span>Inline code</span><textarea aria-label="Inline code" spellCheck={false} value={node.inline.code} onChange={(event) => patchNode({ inline: { ...node.inline!, code: event.target.value } })} /></label><p className="field-warning">Trusted configuration: this code runs with the supervisor process credentials from the configured working directory.</p></> : <><label><span>Script path source</span><select aria-label="Script path source" value={node.script_file?.path_input ? "input" : "path"} onChange={(event) => setPathSource("script_file", event.target.value as "path" | "input")}><option value="path">Workflow path</option><option value="input">Ticket input</option></select></label><label><span>Script path base</span><select aria-label="Script path base" value={node.script_file?.relative_to ?? "selected_repository"} onChange={(event) => patchPathReference("script_file", { relative_to: event.target.value as NonNullable<WorkflowNode["script_file"]>["relative_to"] })}><option value="selected_repository">Selected repository</option><option value="primary_repository">Primary repository</option><option value="project_root">Supervisor project root</option></select></label>{node.script_file?.path_input !== undefined ? <label><span>Ticket input</span><select aria-label="Script path input" value={node.script_file.path_input} onChange={(event) => patchPathReference("script_file", { path_input: event.target.value })}><option value="">Choose an input</option>{workflow.inputs.filter((input) => input.type !== "boolean").map((input) => <option key={input.id} value={input.id}>{input.label}</option>)}</select></label> : <label><span>Relative script path</span><input aria-label="Script path" value={node.script_file?.path ?? ""} onChange={(event) => patchPathReference("script_file", { path: event.target.value })} /></label>}</>}<label><span>Working-directory source</span><select aria-label="Working directory source" value={node.working_directory?.path_input ? "input" : "path"} onChange={(event) => setPathSource("working_directory", event.target.value as "path" | "input")}><option value="path">Workflow path</option><option value="input">Ticket input</option></select></label><label><span>Working-directory base</span><select aria-label="Working directory base" value={node.working_directory?.relative_to ?? "selected_repository"} onChange={(event) => patchPathReference("working_directory", { relative_to: event.target.value as NonNullable<WorkflowNode["working_directory"]>["relative_to"] })}><option value="selected_repository">Selected repository</option><option value="primary_repository">Primary repository</option><option value="project_root">Supervisor project root</option></select></label>{node.working_directory?.path_input !== undefined ? <label><span>Ticket input</span><select aria-label="Working directory input" value={node.working_directory.path_input} onChange={(event) => patchPathReference("working_directory", { path_input: event.target.value })}><option value="">Choose an input</option>{workflow.inputs.filter((input) => input.type !== "boolean").map((input) => <option key={input.id} value={input.id}>{input.label}</option>)}</select></label> : <label><span>Relative working directory</span><input aria-label="Working directory path" value={node.working_directory?.path ?? "."} onChange={(event) => patchPathReference("working_directory", { path: event.target.value })} /></label>}<p className="field-warning">Resolution preview: {node.inline ? "inline program" : `${humanize(node.script_file?.relative_to ?? "selected_repository")} / ${node.script_file?.path ?? `ticket input ${node.script_file?.path_input ?? "not selected"}`}`} runs from {humanize(node.working_directory?.relative_to ?? "selected_repository")} / {node.working_directory?.path ?? `ticket input ${node.working_directory?.path_input ?? "not selected"}`}. Paths are contained beneath their selected base.</p><p className="field-warning">Scripts receive the resolved script path and working directory, selected and primary repository paths, branches, SHAs, PRs, ticket repositories, and workflow context through AGENTIC_* variables. Script files also receive matching CLI flags.</p></>}
       {node.type === "script" && <><label className="toggle"><input aria-label="Persist script stdout" type="checkbox" checked={node.script_output?.persist_stdout !== false} onChange={(event) => patchNode({ script_output: { persist_stdout: event.target.checked, prompt_tail_lines: node.script_output?.prompt_tail_lines ?? 0 } })} /><span><strong>Persist stdout log</strong><small>The next agent receives a tracker URL.</small></span></label><label><span>Pass last lines to next prompt</span><input aria-label="Script prompt tail lines" type="number" min="0" max="500" value={node.script_output?.prompt_tail_lines ?? 0} onChange={(event) => patchNode({ script_output: { persist_stdout: node.script_output?.persist_stdout !== false, prompt_tail_lines: Number(event.target.value) } })} /></label></>}
-      {node.type === "script" && <label><span>Artifacts (name:path:MIME:required|optional:file|quality:required keys)</span><textarea aria-label="Script artifacts" value={(node.artifacts ?? []).map((artifact) => `${artifact.name}:${artifact.path}:${artifact.content_type}:${artifact.required ? "required" : "optional"}:${artifact.interpretation ? "quality" : "file"}:${artifact.interpretation?.required_attributes.join(",") ?? ""}`).join("\n")} onChange={(event) => patchNode({ artifacts: event.target.value.split(/\r?\n/).filter(Boolean).map((line) => { const [name = "", path = "", content_type = "application/octet-stream", requirement = "optional", interpretation = "file", required = ""] = line.split(":"); return { name, path, content_type, required: requirement === "required", ...(interpretation === "quality" ? { interpretation: { kind: "quality_report" as const, schema: "agentic-quality/v1" as const, required_attributes: required.split(",").map((item) => item.trim()).filter(Boolean) } } : {}) }; }) })} /><small>Quality artifacts are YAML validated against agentic-quality/v1. Required keys are comma-separated.</small></label>}
+      {node.type === "script" && <label><span>Artifacts (name:path:MIME:required|optional:file|quality:required keys:title:category:featured|normal)</span><textarea aria-label="Script artifacts" value={(node.artifacts ?? []).map((artifact) => `${artifact.name}:${artifact.path}:${artifact.content_type}:${artifact.required ? "required" : "optional"}:${artifact.interpretation ? "quality" : "file"}:${artifact.interpretation?.required_attributes.join(",") ?? ""}:${artifact.presentation?.title ?? ""}:${artifact.presentation?.category ?? ""}:${artifact.presentation?.featured ? "featured" : "normal"}`).join("\n")} onChange={(event) => patchNode({ artifacts: event.target.value.split(/\r?\n/).filter(Boolean).map((line) => { const [name = "", path = "", content_type = "application/octet-stream", requirement = "optional", interpretation = "file", required = "", title = "", category = "", featured = "normal"] = line.split(":"); return { name, path, content_type, required: requirement === "required", ...(interpretation === "quality" ? { interpretation: { kind: "quality_report" as const, schema: "agentic-quality/v1" as const, required_attributes: required.split(",").map((item) => item.trim()).filter(Boolean) } } : {}), ...((title || category || featured === "featured") ? { presentation: { ...(title ? { title } : {}), ...(category ? { category } : {}), ...(featured === "featured" ? { featured: true } : {}) } } : {}) }; }) })} /><small>Presentation hints are optional. Quality artifacts are YAML validated against agentic-quality/v1; all other contents remain unrestricted.</small></label>}
       {node.type === "checkpoint" && <label><span>Checkpoint label</span><input aria-label="Checkpoint label" value={node.checkpoint_label ?? ""} onChange={(event) => patchNode({ checkpoint_label: event.target.value })} /></label>}
       {node.type === "restore_checkpoint" && <><label><span>Checkpoint source</span><select aria-label="Checkpoint source" value={node.checkpoint_source?.mode ?? "latest"} onChange={(event) => patchNode({ checkpoint_source: { mode: event.target.value as "latest" | "id" | "metadata", ...(event.target.value === "id" ? { checkpoint_id: "checkpoint-id" } : event.target.value === "metadata" ? { metadata_key: "checkpoint.restore_id" } : {}) } })}><option value="latest">Latest checkpoint</option><option value="id">Fixed checkpoint ID</option><option value="metadata">Ticket metadata key</option></select></label>{node.checkpoint_source?.mode === "id" && <label><span>Checkpoint ID</span><input aria-label="Checkpoint ID" value={node.checkpoint_source.checkpoint_id ?? ""} onChange={(event) => patchNode({ checkpoint_source: { mode: "id", checkpoint_id: event.target.value } })} /></label>}{node.checkpoint_source?.mode === "metadata" && <label><span>Metadata key</span><input aria-label="Checkpoint metadata key" value={node.checkpoint_source.metadata_key ?? ""} onChange={(event) => patchNode({ checkpoint_source: { mode: "metadata", metadata_key: event.target.value } })} /></label>}</>}
       {node.type === "wait" && <><label><span>Initial wait (seconds)</span><input aria-label="Wait initial seconds" type="number" min="1" value={node.wait_schedule?.initial_seconds ?? 30} onChange={(event) => patchNode({ wait_schedule: { ...(node.wait_schedule ?? { initial_seconds: 30, multiplier: 1.5, maximum_seconds: 300, jitter_percent: 10, deadline_seconds: 3600 }), initial_seconds: Number(event.target.value) } })} /></label><label><span>Backoff multiplier</span><input aria-label="Wait multiplier" type="number" min="1" max="10" step="0.1" value={node.wait_schedule?.multiplier ?? 1.5} onChange={(event) => patchNode({ wait_schedule: { ...(node.wait_schedule ?? { initial_seconds: 30, multiplier: 1.5, maximum_seconds: 300, jitter_percent: 10, deadline_seconds: 3600 }), multiplier: Number(event.target.value) } })} /></label><label><span>Maximum interval (seconds)</span><input aria-label="Wait maximum seconds" type="number" min="1" value={node.wait_schedule?.maximum_seconds ?? 300} onChange={(event) => patchNode({ wait_schedule: { ...(node.wait_schedule ?? { initial_seconds: 30, multiplier: 1.5, maximum_seconds: 300, jitter_percent: 10, deadline_seconds: 3600 }), maximum_seconds: Number(event.target.value) } })} /></label><label><span>Jitter percent</span><input aria-label="Wait jitter percent" type="number" min="0" max="50" value={node.wait_schedule?.jitter_percent ?? 10} onChange={(event) => patchNode({ wait_schedule: { ...(node.wait_schedule ?? { initial_seconds: 30, multiplier: 1.5, maximum_seconds: 300, jitter_percent: 10, deadline_seconds: 3600 }), jitter_percent: Number(event.target.value) } })} /></label><label><span>Deadline (seconds)</span><input aria-label="Wait deadline seconds" type="number" min="1" value={node.wait_schedule?.deadline_seconds ?? 3600} onChange={(event) => patchNode({ wait_schedule: { ...(node.wait_schedule ?? { initial_seconds: 30, multiplier: 1.5, maximum_seconds: 300, jitter_percent: 10, deadline_seconds: 3600 }), deadline_seconds: Number(event.target.value) } })} /></label><label><span>After interval</span><select aria-label="Wait next node" value={node.next ?? ""} onChange={(event) => patchNode({ next: event.target.value })}>{workflow.nodes.filter((item) => item.id !== node.id).map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label><label><span>On deadline</span><select aria-label="Wait timeout node" value={node.timeout_to ?? ""} onChange={(event) => patchNode({ timeout_to: event.target.value })}>{workflow.nodes.filter((item) => item.id !== node.id).map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label><p className="field-warning">Pair this with a Script node whose “not ready” exit loops back here. The tracker owns the timer, so no supervisor slot or process remains active while waiting.</p></>}
@@ -1772,9 +2087,72 @@ function IntakePage({ repositories, workflows, onOpenTicket, onError }: { reposi
   </main>;
 }
 
+type AttentionKind = TicketSummary["attention"]["kinds"][number];
+function visibleAttentionKinds(ticket: TicketSummary, now: number): AttentionKind[] {
+  return ticket.attention.kinds.filter((kind) => {
+    if (kind !== "expiring_wait") return true;
+    const wake = ticket.attention.wait_wake_at ? Date.parse(ticket.attention.wait_wake_at) : Number.POSITIVE_INFINITY;
+    const deadline = ticket.attention.wait_deadline_at ? Date.parse(ticket.attention.wait_deadline_at) : Number.POSITIVE_INFINITY;
+    return wake <= now + 15 * 60_000 || deadline <= now + 24 * 60 * 60_000;
+  });
+}
+
+function AttentionPage({ tickets, now, onOpen, onChanged, onError }: { tickets: TicketSummary[]; now: number; onOpen: (id: string) => void; onChanged: () => Promise<void>; onError: (message: string | null) => void }) {
+  const candidates = tickets.filter((ticket) => ticket.valid && !ticket.archived_at && visibleAttentionKinds(ticket, now).length > 0)
+    .sort((left, right) => right.priority - left.priority || left.updated_at.localeCompare(right.updated_at));
+  const candidateKey = candidates.map((ticket) => `${ticket.id}:${ticket.revision}`).join("|");
+  const [details, setDetails] = useState<Record<string, TicketDetail>>({});
+  const [answers, setAnswers] = useState<Record<string, string>>({});
+  const [busyTicket, setBusyTicket] = useState<string | null>(null);
+  useEffect(() => {
+    let active = true;
+    void Promise.all(candidates.map((ticket) => api.get(ticket.id))).then((loaded) => {
+      if (active) setDetails(Object.fromEntries(loaded.map((ticket) => [ticket.id, ticket])));
+    }).catch((error: Error) => { if (active) onError(error.message); });
+    return () => { active = false; };
+  }, [candidateKey]);
+  const mutate = async (ticket: TicketDetail, work: () => Promise<TicketDetail>) => {
+    setBusyTicket(ticket.id); onError(null);
+    try {
+      const next = await work(); setDetails((current) => ({ ...current, [next.id]: next })); await onChanged();
+    } catch (error) { onError((error as Error).message); }
+    finally { setBusyTicket(null); }
+  };
+  const decide = (ticket: TicketDetail, choice: NonNullable<WorkflowNode["choices"]>[number]) => {
+    const comment = promptForGateComment(choice);
+    if (comment === null) return;
+    void mutate(ticket, () => api.action(ticket, "decide", { decision: choice.id, ...comment }));
+  };
+  return <main className="attention-page">
+    <div className="health-heading"><div><span>Operator inbox</span><h1>Attention</h1><p>Questions, gates, failures, feedback, repository conflicts, and time-sensitive waits that need a human decision or awareness.</p></div><div className="health-summary"><strong>{candidates.length}</strong><span>tickets need attention</span></div></div>
+    {!candidates.length && <section className="attention-empty"><strong>Inbox zero</strong><p>No ticket currently needs operator attention.</p></section>}
+    <div className="attention-list">{candidates.map((summary) => {
+      const ticket = details[summary.id];
+      const kinds = visibleAttentionKinds(summary, now);
+      const currentNode = ticket?.workflow_node ?? (ticket?.frontmatter?.workflow ? ticket.workflow_definition?.nodes.find((node) => node.id === ticket.frontmatter?.workflow?.current_node) : undefined);
+      const pending = ticket?.frontmatter?.questions.filter((question) => question.answer === null) ?? [];
+      const busy = busyTicket === summary.id;
+      return <article className="attention-ticket" key={summary.id}>
+        <header><div><span>{summary.id} · P{summary.priority}</span><h2>{summary.title}</h2><small>{summary.workflow_stage_name ?? humanize(summary.phase)} · {summary.workflow_node_name ?? "Workflow unavailable"}</small></div><div className="attention-kind-list">{kinds.map((kind) => <span key={kind}>{humanize(kind)}</span>)}</div></header>
+        <div className="attention-reasons">
+          {summary.attention.delivery_failure_summary && kinds.includes("delivery_failure") && <p><strong>Assignment delivery failed</strong>{summary.attention.delivery_failure_summary}<small>The node remains eligible for its bounded automatic retry.</small></p>}
+          {summary.attention.github_feedback_summary && kinds.includes("github_feedback") && <p><strong>GitHub feedback arrived</strong>{summary.attention.github_feedback_summary}</p>}
+          {kinds.includes("blocked") && <p><strong>Workflow is blocked</strong>Review the latest node result, then retry when the underlying issue is resolved.</p>}
+          {kinds.includes("failed") && <p><strong>Workflow failed</strong>The current node requires an operator retry or another state action.</p>}
+          {kinds.includes("expiring_wait") && <p><strong>External wait is ready soon</strong>Next check {relativeTime(summary.attention.wait_wake_at, now)} · deadline {relativeTime(summary.attention.wait_deadline_at, now)}.</p>}
+          {summary.claim_blockers.map((blocker) => <p key={`${blocker.hostname}:${blocker.ticket_id}`}><strong>Repository reserved on {blocker.hostname}</strong>{blocker.repositories.join(", ")} is in use by <button className="link-button" onClick={() => onOpen(blocker.ticket_id)}>{blocker.ticket_id}</button>.</p>)}
+        </div>
+        {ticket && pending.length > 0 && <div className="attention-questions">{pending.map((question) => <div key={question.id}><MarkdownContent markdown={question.question} />{(question.options ?? []).length > 0 && <div className="question-options">{(question.options ?? []).map((option) => <button key={option} className={answers[question.id] === option ? "selected" : ""} onClick={() => setAnswers((current) => ({ ...current, [question.id]: option }))}>{option}</button>)}</div>}<textarea aria-label={`Inbox answer: ${question.question}`} placeholder="Freeform answer…" value={answers[question.id] ?? ""} onChange={(event) => setAnswers((current) => ({ ...current, [question.id]: event.target.value }))} /><button className="button-primary" disabled={busy || !(answers[question.id] ?? "").trim()} onClick={() => void mutate(ticket, () => api.action(ticket, `questions/${encodeURIComponent(question.id)}/answer`, { answer: answers[question.id]!.trim() }))}>Send response</button></div>)}</div>}
+        {ticket && ticket.frontmatter?.status === "waiting_approval" && currentNode?.type === "human_gate" && <div className="attention-gate-actions">{currentNode.choices.map((choice) => <button className={choice.metric_class === "failure" ? "button-danger" : "button-primary"} disabled={busy} key={choice.id} onClick={() => decide(ticket, choice)}><strong>{choice.label}</strong><small>{choice.description}</small></button>)}</div>}
+        <footer><button className="button-secondary" onClick={() => onOpen(summary.id)}>Open ticket</button>{ticket && (summary.status === "blocked" || summary.status === "failed") && pending.length === 0 && <button className="button-primary" disabled={busy} onClick={() => void mutate(ticket, () => api.action(ticket, "retry"))}>Retry node</button>}{ticket && summary.status === "waiting_external" && <button className="button-primary" disabled={busy} onClick={() => void mutate(ticket, () => api.action(ticket, "wake"))}>Check now</button>}</footer>
+      </article>;
+    })}</div>
+  </main>;
+}
+
 function QueuePage({ tickets, includeArchived, setIncludeArchived, now, onOpen }: { tickets: TicketSummary[]; includeArchived: boolean; setIncludeArchived: (value: boolean) => void; now: number; onOpen: (id: string) => void }) {
-  const [query, setQuery] = useState("");
-  const [status, setStatus] = useState("");
+  const [query, setQuery] = useStoredState("agentic-project-tracker.queue.query", "");
+  const [status, setStatus] = useStoredState("agentic-project-tracker.queue.status", "");
   const normalizedQuery = query.trim().toLowerCase();
   const filtered = [...tickets].filter((ticket) => (!status || ticket.status === status) && (!normalizedQuery || [ticket.id, ticket.title, ticket.workflow_node_name ?? "", ...(ticket.labels ?? []), ...(ticket.repositories ?? [])].some((value) => value.toLowerCase().includes(normalizedQuery))))
     .sort((left, right) => (QUEUE_STATUS_RANK[left.status] ?? 9) - (QUEUE_STATUS_RANK[right.status] ?? 9) || right.priority - left.priority || (left.updated_at ?? left.created_at).localeCompare(right.updated_at ?? right.created_at) || left.id.localeCompare(right.id));
@@ -1796,7 +2174,7 @@ export function App() {
   const [prompts, setPrompts] = useState<PromptDocument[]>([]);
   const [workflows, setWorkflows] = useState<WorkflowDocument[]>([]);
   const [workflowReleases, setWorkflowReleases] = useState<WorkflowReleaseCatalog | null>(null);
-  const [view, setView] = useState<"tickets" | "intake" | "metrics" | "supervisors" | "configuration" | "prompts" | "workflows">("tickets");
+  const [view, setView] = useState<AppView>(storedAppView);
   const [selected, setSelected] = useState<TicketDetail | null>(null);
   const [creating, setCreating] = useState(false);
   const [draft, setDraft] = useState<TicketDraft>(emptyDraft);
@@ -1808,12 +2186,16 @@ export function App() {
   const [questionAnswers, setQuestionAnswers] = useState<Record<string, string>>({});
   const [descriptionEdit, setDescriptionEdit] = useState<null | { text: string; targetNode: string }>(null);
   const [now, setNow] = useState(Date.now());
-  const [includeArchived, setIncludeArchived] = useState(false);
+  const [includeArchived, setIncludeArchived] = useStoredState("agentic-project-tracker.queue.archived", false);
+  const [restoredTicketId] = useState(() => storedValue<string | null>("agentic-project-tracker.selected-ticket", null));
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
     try { window.localStorage.setItem("agentic-project-tracker.theme", theme); } catch { /* storage may be disabled */ }
   }, [theme]);
+  useEffect(() => {
+    try { window.localStorage.setItem("agentic-project-tracker.view", JSON.stringify(view)); } catch { /* storage may be disabled */ }
+  }, [view]);
 
   const refresh = useCallback(async () => {
     const [list, live, health, operational, configured, promptLibrary, workflowLibrary, releases] = await Promise.all([api.list(includeArchived), api.runtime(), api.supervisors(), api.operations().catch(() => null), api.config(), api.prompts(), api.workflows().catch(() => ({ workflows: [] })), api.workflowReleases().catch(() => null)]);
@@ -1854,7 +2236,16 @@ export function App() {
     setError(null); const ticket = await api.get(id); setSelected(ticket); setDraft(draftFromTicket(ticket));
     if (ticket.integration_warnings?.length) setError(ticket.integration_warnings.join(" · "));
     setRawDraft(ticket.markdown); setDirty(false); setCreating(false); setComposer(null); setDescriptionEdit(null); setQuestionAnswers({});
+    try { window.localStorage.setItem("agentic-project-tracker.selected-ticket", JSON.stringify(id)); } catch { /* storage may be disabled */ }
   };
+
+  useEffect(() => {
+    if (view !== "tickets" || !restoredTicketId) return;
+    void open(restoredTicketId).catch((caught: Error) => {
+      try { window.localStorage.removeItem("agentic-project-tracker.selected-ticket"); } catch { /* storage may be disabled */ }
+      setError(caught.message);
+    });
+  }, []);
 
   const run = async (work: () => Promise<TicketDetail>): Promise<boolean> => {
     setBusy(true); setError(null);
@@ -1876,6 +2267,7 @@ export function App() {
         : await api.edit(selected!, selected!.valid ? ticketMarkdown(draft, selected!) : rawDraft);
       for (const file of draft.attachmentFiles) { next = await api.uploadAttachment(next, file); uploadedFiles += 1; }
       setSelected(next); setDraft(draftFromTicket(next)); setRawDraft(next.markdown); setDirty(false); setComposer(null); setCreating(false);
+      try { window.localStorage.setItem("agentic-project-tracker.selected-ticket", JSON.stringify(next.id)); } catch { /* storage may be disabled */ }
       await refresh();
     } catch (caught) {
       if (next) { setSelected(next); setDraft({ ...draftFromTicket(next), attachmentFiles: draft.attachmentFiles.slice(uploadedFiles) }); setRawDraft(next.markdown); setCreating(false); await refresh(); }
@@ -1968,6 +2360,13 @@ export function App() {
     finally { setBusy(false); }
   };
 
+  const decideGate = (choice: NonNullable<WorkflowNode["choices"]>[number]) => {
+    if (!selected) return;
+    const comment = promptForGateComment(choice);
+    if (comment === null) return;
+    void run(() => api.action(selected, "decide", { decision: choice.id, ...comment }));
+  };
+
   const saveConfig = async (update: Pick<TrackerConfig, "providers" | "agent_profiles" | "pricing" | "metrics" | "quality" | "artifacts" | "repositories" | "jira" | "github">) => {
     if (!config) return;
     setBusy(true); setError(null);
@@ -1997,6 +2396,7 @@ export function App() {
         workflowInputs: Object.fromEntries(release?.definition.inputs.map((input) => [input.id, input.default]) ?? []),
         stageEnabled: Object.fromEntries(release?.definition.stages.map((stage) => [stage.id, stage.skippable ? stage.default_enabled : true]) ?? []),
       }); setDirty(false);
+      try { window.localStorage.removeItem("agentic-project-tracker.selected-ticket"); } catch { /* storage may be disabled */ }
     } catch (caught) { setError((caught as Error).message); }
   };
 
@@ -2007,6 +2407,7 @@ export function App() {
     try {
       const imported = (await api.jiraImport(key.trim())).draft;
       setView("tickets"); setCreating(true); setSelected(null);
+      try { window.localStorage.removeItem("agentic-project-tracker.selected-ticket"); } catch { /* storage may be disabled */ }
       const initial = emptyDraft(imported.id, false);
       const workflowId = workflowReleases?.catalog.default_workflow_id ?? initial.workflowId;
       const release = workflowReleases?.releases.find((item) => item.workflow_id === workflowId && item.is_default);
@@ -2031,11 +2432,16 @@ export function App() {
   const activeAttempt = frontmatter && currentWorkflowNode && frontmatter.workflow
     ? frontmatter.workflow.node_attempts?.[frontmatter.workflow.active_workflow_id && frontmatter.workflow.active_workflow_id !== frontmatter.workflow.id ? `${frontmatter.workflow.active_workflow_id}/${currentWorkflowNode.id}` : currentWorkflowNode.id] ?? null
     : null;
+  const attentionCount = tickets.filter((ticket) => visibleAttentionKinds(ticket, now).length > 0).length;
+  const showQueue = () => {
+    setView("tickets"); setSelected(null); setCreating(false);
+    try { window.localStorage.removeItem("agentic-project-tracker.selected-ticket"); } catch { /* storage may be disabled */ }
+  };
   return <div className="app-shell">
-    <header className="topbar"><div className="brand"><div className="brand-mark">{theme === "retro" ? ">_" : "A"}</div><div><span>Agentic operations</span><strong>Project Tracker</strong></div></div><nav className="topnav"><button className={view === "tickets" ? "active" : ""} onClick={() => { setView("tickets"); setSelected(null); setCreating(false); }}>Queue</button><button className={view === "intake" ? "active" : ""} onClick={() => setView("intake")}>Intake</button><button className={view === "metrics" ? "active" : ""} onClick={() => setView("metrics")}>Metrics</button><button className={view === "supervisors" ? "active" : ""} onClick={() => setView("supervisors")}>Operations <span>{supervisors.filter((item) => item.status === "online").length}</span></button><button className={view === "workflows" ? "active" : ""} onClick={() => setView("workflows")}>Workflows</button><button className={view === "prompts" ? "active" : ""} onClick={() => setView("prompts")}>Prompts</button><button className={view === "configuration" ? "active" : ""} onClick={() => setView("configuration")}>Configuration</button></nav><ThemeSelector theme={theme} onChange={setTheme} />{config?.jira?.enabled && <button className="button-secondary" disabled={busy} onClick={() => void beginJiraTicket()}>Import Jira</button>}<button className="button-primary" onClick={() => void beginLocalTicket()}>＋ New ticket</button></header>
+    <header className="topbar"><div className="brand"><div className="brand-mark">{theme === "retro" ? ">_" : "A"}</div><div><span>Agentic operations</span><strong>Project Tracker</strong></div></div><nav className="topnav"><button className={view === "attention" ? "active" : ""} onClick={() => setView("attention")}>Inbox <span>{attentionCount}</span></button><button className={view === "tickets" ? "active" : ""} onClick={showQueue}>Queue</button><button className={view === "intake" ? "active" : ""} onClick={() => setView("intake")}>Intake</button><button className={view === "metrics" ? "active" : ""} onClick={() => setView("metrics")}>Metrics</button><button className={view === "supervisors" ? "active" : ""} onClick={() => setView("supervisors")}>Operations <span>{supervisors.filter((item) => item.status === "online").length}</span></button><button className={view === "workflows" ? "active" : ""} onClick={() => setView("workflows")}>Workflows</button><button className={view === "prompts" ? "active" : ""} onClick={() => setView("prompts")}>Prompts</button><button className={view === "configuration" ? "active" : ""} onClick={() => setView("configuration")}>Configuration</button></nav><ThemeSelector theme={theme} onChange={setTheme} />{config?.jira?.enabled && <button className="button-secondary" disabled={busy} onClick={() => void beginJiraTicket()}>Import Jira</button>}<button className="button-primary" onClick={() => void beginLocalTicket()}>＋ New ticket</button></header>
     {view === "tickets" && <AgentFleet agents={runtime} now={now} onOpen={(id) => void open(id)} />}
     {error && <div className="error" role="alert"><strong>Something needs attention</strong><span>{error}</span><button onClick={() => setError(null)}>×</button></div>}
-    {view === "intake" ? <IntakePage repositories={config?.repositories ?? []} workflows={workflows} onOpenTicket={(id) => void open(id)} onError={setError} /> : view === "metrics" ? <MetricsPage releases={workflowReleases} onError={setError} /> : view === "workflows" ? <WorkflowEditorPage workflows={workflows} releases={workflowReleases} prompts={prompts} agentProfiles={config?.agent_profiles} onChanged={setWorkflows} onReleasesChanged={setWorkflowReleases} onError={setError} /> : view === "prompts" ? <PromptEditorPage prompts={prompts} onUpdated={(prompt) => setPrompts((current) => [...current.filter((item) => item.name !== prompt.name), prompt])} onError={setError} /> : view === "configuration" ? <ConfigurationPage config={config} quota={quotaReport} busy={busy} onSave={(update) => void saveConfig(update)} onRestoreDefaults={() => void restoreDefaults()} /> : view === "supervisors" ? <SupervisorHealthPage supervisors={supervisors} operations={operations} now={now} onOpenTicket={(id) => void open(id)} /> : !selected && !creating ? <QueuePage tickets={tickets} includeArchived={includeArchived} setIncludeArchived={setIncludeArchived} now={now} onOpen={(id) => void open(id)} /> : <main className="dashboard-layout detail-only">
+    {view === "attention" ? <AttentionPage tickets={tickets} now={now} onOpen={(id) => void open(id)} onChanged={refresh} onError={setError} /> : view === "intake" ? <IntakePage repositories={config?.repositories ?? []} workflows={workflows} onOpenTicket={(id) => void open(id)} onError={setError} /> : view === "metrics" ? <MetricsPage releases={workflowReleases} onError={setError} /> : view === "workflows" ? <WorkflowEditorPage workflows={workflows} releases={workflowReleases} prompts={prompts} agentProfiles={config?.agent_profiles} onChanged={setWorkflows} onReleasesChanged={setWorkflowReleases} onError={setError} /> : view === "prompts" ? <PromptEditorPage prompts={prompts} onUpdated={(prompt) => setPrompts((current) => [...current.filter((item) => item.name !== prompt.name), prompt])} onError={setError} /> : view === "configuration" ? <ConfigurationPage config={config} quota={quotaReport} busy={busy} onSave={(update) => void saveConfig(update)} onRestoreDefaults={() => void restoreDefaults()} /> : view === "supervisors" ? <SupervisorHealthPage supervisors={supervisors} operations={operations} now={now} onOpenTicket={(id) => void open(id)} /> : !selected && !creating ? <QueuePage tickets={tickets} includeArchived={includeArchived} setIncludeArchived={setIncludeArchived} now={now} onOpen={(id) => void open(id)} /> : <main className="dashboard-layout detail-only">
       <section className="ticket-workspace">
         {creating ? <TicketEditor draft={draft} setDraft={(value) => { setDirty(true); setDraft(value); }} existing={false} busy={busy} repositories={config?.repositories ?? []} workflows={workflows} {...(workflowReleases ? { workflowReleases } : {})} onSave={() => void save()} onCancel={() => setCreating(false)} /> : selected ? !selected.valid ? <div className="invalid-editor">
           <div className="issue-heading"><div><span className="issue-key">Recovery editor</span><h1>{selected.relative_path}</h1><p>Repair the invalid Markdown before this ticket can be scheduled.</p></div></div>
@@ -2050,6 +2456,9 @@ export function App() {
             </div>
           </div>
           <WorkflowMap ticket={frontmatter} workflow={selectedWorkflow} />
+          <ExecutionRecap ticket={frontmatter} {...(selectedWorkflow ? { workflow: selectedWorkflow } : {})} now={now} />
+          <ReviewMaterials ticket={frontmatter} {...(selectedWorkflow ? { workflow: selectedWorkflow } : {})} busy={busy} now={now} onDecide={decideGate} />
+          <PendingQuestions questions={frontmatter.questions ?? []} answers={questionAnswers} busy={busy} now={now} onChange={(questionId, answer) => setQuestionAnswers((current) => ({ ...current, [questionId]: answer }))} onAnswer={(questionId) => void answerQuestion(questionId)} />
           <RepositoryBlockers blockers={selectedSummary?.claim_blockers ?? []} />
           {composer && <section className="composer"><div><strong>{composer.kind === "guidance" ? "Guide the active or next agent" : "Add an operator comment"}</strong><small>{composer.kind === "guidance" ? "Guidance is persisted before delivery." : "Comments are added to the durable timeline."}</small></div><textarea autoFocus aria-label={composer.kind === "guidance" ? "Agent guidance" : "Ticket comment"} value={composer.text} onChange={(event) => setComposer({ ...composer, text: event.target.value })} /><div><button className="button-secondary" onClick={() => setComposer(null)}>Cancel</button><button className="button-primary" disabled={busy || !composer.text.trim()} onClick={() => void submitComposer()}>Send</button></div></section>}
           <div className="issue-grid">
@@ -2067,7 +2476,7 @@ export function App() {
                   <div className="live-edit-actions"><button className="button-secondary" onClick={() => setDescriptionEdit(null)}>Cancel</button><button className="button-secondary" disabled={busy || !descriptionEdit.text.trim() || Boolean(frontmatter.execution?.interrupt_request)} onClick={() => void saveLiveDescription(false)}>Save and continue</button><button className="button-primary" disabled={busy || !descriptionEdit.text.trim() || Boolean(frontmatter.execution?.interrupt_request)} onClick={() => void saveLiveDescription(true)}>Save and restart</button></div>
                 </div> : <MarkdownContent markdown={descriptionFromBody(selected.body)} />}
               </section>
-              <TicketEvidence ticket={selected} {...(selectedWorkflow ? { workflow: selectedWorkflow } : {})} busy={busy} now={now} onUpload={(files) => void uploadAttachments(files)} onRemoveAttachment={(id) => void removeAttachment(id)} onCreateCheckpoint={(nodeId) => void run(() => api.checkpointAction(selected, "create", nodeId))} onRestoreCheckpoint={(nodeId, checkpointId) => void run(() => api.checkpointAction(selected, "restore", nodeId, checkpointId))} />
+              <TicketEvidence key={selected.id} ticket={selected} {...(selectedWorkflow ? { workflow: selectedWorkflow } : {})} busy={busy} now={now} onUpload={(files) => void uploadAttachments(files)} onRemoveAttachment={(id) => void removeAttachment(id)} onCreateCheckpoint={(nodeId) => void run(() => api.checkpointAction(selected, "create", nodeId))} onRestoreCheckpoint={(nodeId, checkpointId) => void run(() => api.checkpointAction(selected, "restore", nodeId, checkpointId))} />
               <Timeline body={selected.body} />
             </div>
             <aside className="issue-sidebar">
@@ -2092,14 +2501,9 @@ export function App() {
                 const prs = frontmatter.pull_requests.filter((candidate) => candidate.repository === repository.id);
                 return <div className="repo-item" key={repository.id}><div><strong>{repository.id}</strong>{repository.primary && <span>Primary</span>}</div>{prs.length ? <div>{prs.map((pr) => <a key={pr.url} href={pr.url} target="_blank" rel="noreferrer">Open {pr.phase ? humanize(pr.phase) : "draft"} PR ↗</a>)}</div> : <small>No PR reported</small>}</div>;
               })}</section>
-              {(frontmatter.questions ?? []).length > 0 && <section className="side-card"><div className="section-heading"><div><span>Conversation</span><h2>Questions & answers</h2></div></div>{(frontmatter.questions ?? []).map((question) => <div className="question-item" key={question.id}><strong>{question.question}</strong>{question.answer ? <p>{question.answer}</p> : <div className="question-answer"><div className="question-options">{(question.options ?? []).map((option, index) => <button className="button-secondary" key={`${index}:${option}`} onClick={() => setQuestionAnswers((current) => ({ ...current, [question.id]: option }))}>{option}</button>)}</div><textarea aria-label={`Answer: ${question.question}`} placeholder="Type any answer…" value={questionAnswers[question.id] ?? ""} onChange={(event) => setQuestionAnswers((current) => ({ ...current, [question.id]: event.target.value }))} /><button className="button-primary" disabled={busy || !questionAnswers[question.id]?.trim()} onClick={() => void answerQuestion(question.id)}>Send answer</button></div>}</div>)}</section>}
+              <AnsweredQuestions questions={frontmatter.questions ?? []} />
               <AgentSessions ticket={frontmatter} {...(selectedWorkflow ? { workflow: selectedWorkflow } : {})} onReset={(key) => { if (window.confirm(`Reset ${humanize(key)}? The next visit will start a new Herdr conversation.`)) void run(() => api.resetConversation(selected, key)); }} />
               <section className="side-card action-card"><div className="section-heading"><div><span>Controls</span><h2>State actions</h2></div></div><div className="control-buttons">
-                {currentWorkflowNode?.type === "human_gate" && frontmatter.status === "waiting_approval" && currentWorkflowNode.choices.map((choice, index) => <div className="gate-choice" key={choice.id}><ActionButton primary={index === 0} onClick={() => {
-                  const note = choice.comment_required ? window.prompt(`${choice.label}\n\n${choice.description}\n\nA comment is required:`) : "";
-                  if (choice.comment_required && note === null) return;
-                  void run(() => api.action(selected, "decide", { decision: choice.id, ...(note?.trim() ? { message: note.trim() } : {}) }));
-                }}>{choice.label}</ActionButton><small>{choice.description} → {selectedWorkflow?.nodes.find((node) => node.id === choice.target)?.name ?? choice.target}{choice.comment_required ? " · comment required" : ""}</small></div>)}
                 {frontmatter.status === "ready" && <ActionButton onClick={() => void run(() => api.action(selected, "draft"))}>Return to draft</ActionButton>}
                 {(frontmatter.status === "failed" || frontmatter.status === "blocked") && <ActionButton primary onClick={() => void run(() => api.action(selected, "retry"))}>Retry node</ActionButton>}
                 {frontmatter.status === "waiting_external" && <ActionButton primary onClick={() => void run(() => api.action(selected, "wake"))}>Check now</ActionButton>}

@@ -110,7 +110,7 @@ test("tracker exposes readiness, its Markdown index, and background operation st
     assert.equal(readiness.body.background_operations.artifact_maintenance.in_progress, false);
     assert.equal(readiness.body.background_operations.intake_scheduling.in_progress, false);
     const capabilities = await jsonRequest(tracker.baseUrl, "/api/capabilities");
-    assert.deepEqual(capabilities.body.supervisor_protocol_versions, [1, 2]);
+    assert.deepEqual(capabilities.body.supervisor_protocol_versions, [1, 2, 3]);
     assert.deepEqual(capabilities.body.intake_protocol_versions, [1]);
     assert.ok(capabilities.body.activity_capabilities.includes("git_checkpoint"));
     assert.ok(capabilities.body.activity_capabilities.includes("git_restore"));
@@ -518,7 +518,7 @@ test("an Agent node uses only fake Herdr and advances through its declared callb
     await configureTracker(tracker, null);
     const workflow = await publishWorkflow(tracker, agentWorkflow("system-fake-agent"));
     await createReadyTicket(tracker, "SYSTEM-FAKE-AGENT", workflow.definition.id);
-    supervisor = await startSupervisor(tracker);
+    supervisor = await startSupervisor(tracker, { fakeHerdrPublishEvidence: true });
 
     const ticket = await completedTicket(tracker, "SYSTEM-FAKE-AGENT");
     assert.equal(ticket.frontmatter.workflow.current_node, "done");
@@ -527,6 +527,30 @@ test("an Agent node uses only fake Herdr and advances through its declared callb
     assert.match(ticket.frontmatter.workflow.node_runs[0].summary, /Deterministic fake agent/);
     assert.equal(ticket.frontmatter.conversations.work.provider, "claude");
     assert.equal(ticket.frontmatter.conversations.work.session_ref, "fake-session-1");
+    const tracedTicket = await waitFor("completed operational trace", async () => {
+      const current = (await jsonRequest(tracker.baseUrl, "/api/tickets/SYSTEM-FAKE-AGENT")).body;
+      return current.frontmatter.artifacts.some((artifact) => artifact.kind === "execution_trace" && artifact.metadata.completed === true) ? current : null;
+    });
+    const traceChunks = tracedTicket.frontmatter.artifacts.filter((artifact) => artifact.kind === "execution_trace");
+    assert.ok(traceChunks.length >= 1, "the supervisor must stream a tracker-owned operational trace");
+    const traceEvents = [];
+    for (const chunk of traceChunks.sort((left, right) => left.metadata.first_sequence - right.metadata.first_sequence)) {
+      const response = await fetch(`${tracker.baseUrl}/api/tickets/SYSTEM-FAKE-AGENT/artifacts/${chunk.id}/content`);
+      assert.equal(response.status, 200);
+      traceEvents.push(...(await response.text()).trim().split("\n").filter(Boolean).map((line) => JSON.parse(line)));
+    }
+    assert.deepEqual(traceEvents.map((event) => event.sequence), traceEvents.map((_event, index) => index + 1));
+    assert.ok(traceEvents.some((event) => event.event === "herdr.command_started" && event.data.command === "agent.prompt"));
+    assert.ok(traceEvents.some((event) => event.event === "delivery.confirmed"));
+    assert.ok(traceEvents.some((event) => event.event === "execution.trace_finished"));
+    assert.ok(traceEvents.every((event) => !JSON.stringify(event).includes("You are assigned ticket SYSTEM-FAKE-AGENT")), "trace records hashes and paths instead of duplicating prompt bodies");
+    const evidence = ticket.frontmatter.artifacts.find((artifact) => artifact.kind === "evidence");
+    assert.deepEqual(evidence?.metadata?.presentation, {
+      title: "System-test review", description: "Evidence published through the generated assignment helper.", category: "approval", featured: true,
+    });
+    const evidenceResponse = await fetch(`${tracker.baseUrl}/api/tickets/SYSTEM-FAKE-AGENT/artifacts/${evidence.id}/content`);
+    assert.equal(evidenceResponse.status, 200);
+    assert.match(await evidenceResponse.text(), /deterministic system-test agent published this evidence/);
 
     const invocations = await waitFor("fake Herdr callback cleanup", async () => {
       const observed = await readHerdrInvocations(supervisor);
@@ -543,6 +567,7 @@ test("an Agent node uses only fake Herdr and advances through its declared callb
     const startHere = await readFile(active.start_here, "utf8");
     assert.match(startHere, /Before becoming idle/);
     assert.match(startHere, /callback/);
+    assert.match(startHere, /publish-artifact/);
   } finally {
     await stopProcess(supervisor?.process);
     await stopProcess(tracker?.process);
@@ -582,6 +607,39 @@ test("a prompt staged in the agent composer is submitted without duplicating the
   }
 });
 
+test("a timed-out prompt staged in the agent composer is recovered before delivery is confirmed", { timeout: 45_000 }, async () => {
+  let tracker;
+  let supervisor;
+  try {
+    tracker = await startTracker({ leaseTtlMs: 1_500 });
+    await configureTracker(tracker, null);
+    const workflow = await publishWorkflow(tracker, agentWorkflow("system-agent-timeout-staged-prompt"));
+    await createReadyTicket(tracker, "SYSTEM-TIMEOUT-STAGED-PROMPT", workflow.definition.id);
+    supervisor = await startSupervisor(tracker, {
+      fakeHerdrStageTimeoutPrompt: true, fakeHerdrCollapseStagedPrompt: true, fakeHerdrReadyAfterGets: 3,
+      heartbeatIntervalMs: 100, idlePollMs: 50,
+    });
+
+    const ticket = await completedTicket(tracker, "SYSTEM-TIMEOUT-STAGED-PROMPT", 30_000);
+    assert.equal(ticket.frontmatter.workflow.current_node, "done");
+
+    const invocations = await readHerdrInvocations(supervisor);
+    assert.equal(invocations.filter(({ args }) => args[0] === "agent" && args[1] === "prompt").length, 1, "the timed-out assignment must not be pasted twice");
+    assert.ok(invocations.some(({ args }) => args[0] === "agent" && args[1] === "read"), "the timed-out pane must be inspected");
+    assert.ok(invocations.some(({ args }) => args[0] === "agent" && args[1] === "send-keys" && args.includes("enter")), "the staged timeout prompt must be submitted with Enter");
+    const supervisorLogs = await waitFor("staged timeout recovery log", () => {
+      const logs = Object.values(supervisor.process.logs()).join("\n");
+      return logs.includes('"recovery":"submitted_staged_prompt"') ? logs : null;
+    });
+    assert.match(supervisorLogs, /"event":"assignment\.prompt_delivery_uncertain_recovery_started"/);
+    assert.match(supervisorLogs, /"recovery":"submitted_staged_prompt"/);
+  } finally {
+    await stopProcess(supervisor?.process);
+    await stopProcess(tracker?.process);
+    await cleanup([supervisor?.projectRoot, supervisor?.assignmentRoot, tracker?.ticketRoot]);
+  }
+});
+
 test("an unseen assignment prompt fails closed and retries on a new lease without taking a workflow edge", { timeout: 45_000 }, async () => {
   let tracker;
   let supervisor;
@@ -590,7 +648,10 @@ test("an unseen assignment prompt fails closed and retries on a new lease withou
     await configureTracker(tracker, null);
     const workflow = await publishWorkflow(tracker, agentWorkflow("system-agent-delivery-retry"));
     await createReadyTicket(tracker, "SYSTEM-DELIVERY-RETRY", workflow.definition.id);
-    supervisor = await startSupervisor(tracker, { fakeHerdrPromptStalls: 2, assignmentPromptRecoveryMs: 100, heartbeatIntervalMs: 100, idlePollMs: 50 });
+    supervisor = await startSupervisor(tracker, {
+      fakeHerdrPromptStalls: 2, fakeHerdrStartupObservationNoise: true,
+      assignmentPromptRecoveryMs: 100, heartbeatIntervalMs: 100, idlePollMs: 50,
+    });
 
     const ticket = await completedTicket(tracker, "SYSTEM-DELIVERY-RETRY", 30_000);
     assert.equal(ticket.frontmatter.workflow.current_node, "done");
@@ -602,11 +663,14 @@ test("an unseen assignment prompt fails closed and retries on a new lease withou
     assert.equal(ticket.frontmatter.workflow.node_attempts["fake-work"].total, 3);
     assert.equal(ticket.frontmatter.workflow.node_attempts["fake-work"].consecutive_lease_losses, 0);
     assert.equal(ticket.frontmatter.conversations.work.session_ref, "fake-session-1");
+    assert.ok(ticket.body.includes("Assignment delivery failed before agent execution started"));
 
     const invocations = await readHerdrInvocations(supervisor);
     assert.equal(invocations.filter(({ args }) => args[0] === "agent" && args[1] === "start").length, 1, "the retry must reuse the existing pane");
     assert.equal(invocations.filter(({ args }) => args[0] === "agent" && args[1] === "prompt").length, 3, "each lease submits the full assignment at most once");
-    assert.match(`${supervisor.process.logs().stdout}\n${supervisor.process.logs().stderr}`, /work\.assignment_delivery_failed/);
+    const supervisorLogs = `${supervisor.process.logs().stdout}\n${supervisor.process.logs().stderr}`;
+    assert.match(supervisorLogs, /work\.assignment_delivery_failed/);
+    assert.doesNotMatch(supervisorLogs, /assignment\.callback_reminder_sent/, "an undelivered assignment must never arm the callback reminder");
   } finally {
     await stopProcess(supervisor?.process);
     await stopProcess(tracker?.process);

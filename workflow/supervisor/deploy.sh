@@ -93,7 +93,7 @@ try {
   const intakeProtocols = Array.isArray(body.intake_protocol_versions) ? body.intake_protocol_versions : [];
   const supported = new Set(Array.isArray(body.activity_capabilities) ? body.activity_capabilities : []);
   const missing = required.filter((capability) => !supported.has(capability));
-  if (!protocols.includes(2) || !intakeProtocols.includes(1) || missing.length) {
+  if (!protocols.includes(3) || !intakeProtocols.includes(1) || missing.length) {
     console.error(`Tracker is incompatible with this supervisor. Protocols=${protocols.join(", ") || "none"}; intake protocols=${intakeProtocols.join(", ") || "none"}; missing capabilities=${missing.join(", ") || "none"}. Deploy the tracker first.`);
     process.exit(1);
   }

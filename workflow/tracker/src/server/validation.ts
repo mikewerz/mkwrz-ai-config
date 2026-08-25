@@ -518,7 +518,7 @@ export function normalizeTicket(raw: Record<string, unknown>, now = new Date().t
   if (raw.artifacts !== undefined && !Array.isArray(raw.artifacts)) errors.push("artifacts must be an array");
   else if (Array.isArray(raw.artifacts)) raw.artifacts.forEach((item, index) => {
     if (!isRecord(item)) { errors.push(`artifacts[${index}] must be an object`); return; }
-    const kind = ["attachment", "script_output", "script_artifact", "quality_report", "checkpoint_bundle", "checkpoint_manifest", "execution_manifest"].includes(String(item.kind))
+    const kind = ["attachment", "evidence", "script_output", "script_artifact", "quality_report", "checkpoint_bundle", "checkpoint_manifest", "execution_manifest", "execution_trace"].includes(String(item.kind))
       ? item.kind as TicketFrontmatter["artifacts"][number]["kind"]
       : (errors.push(`artifacts[${index}].kind is invalid`), "script_artifact" as const);
     const metadata = isRecord(item.metadata) ? jsonValue(item.metadata, `artifacts[${index}].metadata`, errors) : {};
