@@ -22,6 +22,10 @@ const configuredHerdrExecutable = process.env.HERDR_EXECUTABLE?.trim();
 const herdrTestDouble = process.env.HERDR_TEST_DOUBLE === "true";
 const herdrCommandTimeoutMs = Number(process.env.HERDR_COMMAND_TIMEOUT_MS ?? 45_000);
 if (!Number.isFinite(herdrCommandTimeoutMs) || herdrCommandTimeoutMs < 1_000) throw new Error("HERDR_COMMAND_TIMEOUT_MS must be at least 1000");
+const herdrTranscriptLines = Number(process.env.HERDR_TRANSCRIPT_LINES ?? 5_000);
+if (!Number.isSafeInteger(herdrTranscriptLines) || herdrTranscriptLines < 120 || herdrTranscriptLines > 100_000) throw new Error("HERDR_TRANSCRIPT_LINES must be an integer between 120 and 100000");
+const sessionEvidenceMaxBytes = Number(process.env.SESSION_EVIDENCE_MAX_BYTES ?? 64 * 1024 * 1024);
+if (!Number.isSafeInteger(sessionEvidenceMaxBytes) || sessionEvidenceMaxBytes < 1_048_576) throw new Error("SESSION_EVIDENCE_MAX_BYTES must be an integer of at least 1048576");
 if (configuredHerdrExecutable && !configuredHerdrExecutable.startsWith("/")) throw new Error("HERDR_EXECUTABLE must be an absolute path");
 if (configuredHerdrExecutable) accessSync(configuredHerdrExecutable, constants.X_OK);
 if (herdrTestDouble && process.env.NODE_ENV !== "test") throw new Error("HERDR_TEST_DOUBLE is permitted only when NODE_ENV=test");
@@ -47,6 +51,10 @@ const supervisor = new Supervisor(herdr, {
   trackerArtifactTimeoutMs: Number(process.env.TRACKER_ARTIFACT_TIMEOUT_MS ?? 300_000),
   callbackReminderGraceMs: Number(process.env.CALLBACK_REMINDER_GRACE_MS ?? 60_000),
   assignmentPromptRecoveryMs: Number(process.env.ASSIGNMENT_PROMPT_RECOVERY_MS ?? 30_000),
+  sessionEvidenceEnabled: process.env.SESSION_EVIDENCE_ENABLED !== "false",
+  nativeSessionEvidenceEnabled: process.env.NATIVE_SESSION_EVIDENCE_ENABLED !== "false",
+  herdrTranscriptLines,
+  sessionEvidenceMaxBytes,
   ...(process.env.CALLBACK_BASE_URL ? { callbackBaseUrl: process.env.CALLBACK_BASE_URL } : {}),
   presence: {
     instanceId: randomUUID(),

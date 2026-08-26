@@ -106,6 +106,30 @@ export class TrackerClient {
     return (await response.json() as { artifact: ArtifactRecord }).artifact;
   }
 
+  async uploadSessionEvidence(lease: string, input: {
+    kind: "agent_transcript" | "harness_session_log"; filename: string; contentType: string; content: Buffer;
+    source: "herdr" | "harness"; completeness: "full" | "bounded" | "partial"; disposition: string;
+    evidenceKey: string; provider?: string | null; paneId?: string | null; sessionRef?: string | null;
+    lineCount?: number | null; role?: string | null; originalFilename?: string | null;
+  }): Promise<ArtifactRecord> {
+    const query = new URLSearchParams({
+      kind: input.kind, filename: input.filename, content_type: input.contentType,
+      source: input.source, completeness: input.completeness, disposition: input.disposition,
+      evidence_key: input.evidenceKey,
+    });
+    if (input.provider) query.set("provider", input.provider);
+    if (input.paneId) query.set("pane_id", input.paneId);
+    if (input.sessionRef) query.set("session_ref", input.sessionRef);
+    if (input.lineCount !== undefined && input.lineCount !== null) query.set("line_count", String(input.lineCount));
+    if (input.role) query.set("role", input.role);
+    if (input.originalFilename) query.set("original_filename", input.originalFilename);
+    const response = await this.fetch(`/api/work/${lease}/session-evidence?${query}`, {
+      method: "POST", headers: { "Content-Type": "application/octet-stream" }, body: new Uint8Array(input.content),
+    }, this.artifactTimeoutMs);
+    if (!response.ok) { const body = await response.json().catch(() => ({})) as { error?: string; code?: string }; throw new TrackerError(response.status, body.error ?? response.statusText, body.code ?? null); }
+    return (await response.json() as { artifact: ArtifactRecord }).artifact;
+  }
+
   async downloadArtifact(ticketId: string, artifactId: string): Promise<Buffer> {
     const response = await this.fetch(`/api/tickets/${encodeURIComponent(ticketId)}/artifacts/${encodeURIComponent(artifactId)}/content`, undefined, this.artifactTimeoutMs);
     if (!response.ok) { const body = await response.json().catch(() => ({})) as { error?: string; code?: string }; throw new TrackerError(response.status, body.error ?? response.statusText, body.code ?? null); }

@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useId, useMemo, useState } from "react";
 import { parse, stringify } from "yaml";
-import { api, type Execution, type HarnessTelemetryRecord, type IntakeCampaign, type IntakeLimits, type IntakeOverview, type IntakeSource, type MetricsReport, type NumberSummary, type OperationalStatus, type PromptDocument, type QuotaReport, type RepositoryClaimBlocker, type RepositoryConfig, type RuntimeAgent, type SupervisorHealth, type TicketDetail, type TicketFrontmatter, type TicketSummary, type TrackerConfig, type WorkflowComparisonReport, type WorkflowDocument, type WorkflowNode, type WorkflowReleaseCatalog } from "./api.js";
+import { api, type Execution, type HarnessTelemetryRecord, type IntakeCampaign, type IntakeLimits, type IntakeOverview, type IntakeSource, type MetricsReport, type NumberSummary, type OperationalStatus, type PromptDocument, type QuotaReport, type RepositoryClaimBlocker, type RepositoryConfig, type RuntimeAgent, type SupervisorHealth, type TicketDetail, type TicketFrontmatter, type TicketSummary, type TokenUsage, type TrackerConfig, type WorkflowComparisonReport, type WorkflowDocument, type WorkflowNode, type WorkflowReleaseCatalog } from "./api.js";
 
 const LOG_START = "<!-- tracker:interaction-log:start -->";
 const LOG_END = "<!-- tracker:interaction-log:end -->";
@@ -230,6 +230,28 @@ function humanize(value: string): string {
   return value.replaceAll(/[_./-]+/g, " ").replace(/\b\w/g, (letter) => letter.toUpperCase());
 }
 
+function releaseDisplayLabel(release: Pick<WorkflowReleaseCatalog["releases"][number], "version" | "label" | "is_default" | "status">): string {
+  const version = `v${release.version}`;
+  const label = release.label.trim();
+  const distinctLabel = label && label.toLowerCase() !== version.toLowerCase() ? ` · ${label}` : "";
+  const role = release.is_default ? "Default revision" : release.status === "trial" ? "Trial revision" : "Revision";
+  return `${role} ${version}${distinctLabel}`;
+}
+
+function useCompactNavigation(): boolean {
+  const query = "(max-width: 980px)";
+  const [compact, setCompact] = useState(() => window.matchMedia?.(query).matches ?? false);
+  useEffect(() => {
+    const media = window.matchMedia?.(query);
+    if (!media) return;
+    const update = () => setCompact(media.matches);
+    update();
+    media.addEventListener?.("change", update);
+    return () => media.removeEventListener?.("change", update);
+  }, []);
+  return compact;
+}
+
 function resolvedWorkflowProvider(ticket: TicketFrontmatter, node: WorkflowNode | undefined): string | null {
   if (!node || node.type !== "agent") return null;
   const profiles = ticket.workflow?.resolved_agent_profiles ?? {};
@@ -303,7 +325,7 @@ function WorkflowMap({ ticket, workflow }: { ticket: TicketFrontmatter; workflow
   const zoom = [0.7, 0.85, 1, 1.15, 1.3].includes(storedZoom) ? storedZoom : 1;
   const zoomIndex = [0.7, 0.85, 1, 1.15, 1.3].indexOf(zoom);
   if (ticket.workflow && workflow) return <section className="workflow-panel" aria-label="Ticket workflow">
-    <div className="section-heading"><div><span>Workflow · {workflow.id}@{ticket.workflow.revision.slice(0, 8)}</span><h2>{workflow.name}</h2></div><div className="workflow-heading-actions"><div className="graph-zoom" role="group" aria-label="Workflow zoom"><button aria-label="Zoom out" disabled={zoomIndex === 0} onClick={() => setStoredZoom([0.7, 0.85, 1, 1.15, 1.3][zoomIndex - 1] ?? zoom)}>−</button><button aria-label="Reset zoom" onClick={() => setStoredZoom(1)}>{Math.round(zoom * 100)}%</button><button aria-label="Zoom in" disabled={zoomIndex === 4} onClick={() => setStoredZoom([0.7, 0.85, 1, 1.15, 1.3][zoomIndex + 1] ?? zoom)}>＋</button></div></div></div>
+    <div className="section-heading"><div><h2>Workflow · {workflow.name} · v{ticket.workflow_assignment?.version ?? 1}</h2></div><div className="workflow-heading-actions"><div className="graph-zoom" role="group" aria-label="Workflow zoom"><button aria-label="Zoom out" disabled={zoomIndex === 0} onClick={() => setStoredZoom([0.7, 0.85, 1, 1.15, 1.3][zoomIndex - 1] ?? zoom)}>−</button><button aria-label="Reset zoom" onClick={() => setStoredZoom(1)}>{Math.round(zoom * 100)}%</button><button aria-label="Zoom in" disabled={zoomIndex === 4} onClick={() => setStoredZoom([0.7, 0.85, 1, 1.15, 1.3][zoomIndex + 1] ?? zoom)}>＋</button></div></div></div>
     <NextActionSummary ticket={ticket} workflow={workflow} />
     <WorkflowGraph workflow={workflow} currentNode={ticket.workflow.current_node} ticket={ticket} zoom={zoom} />
     <div className="workflow-loops"><span>{ticket.workflow.transition_count} / {workflow.max_transitions} transitions</span><span>{ticket.workflow.node_runs.length} durable node runs</span></div>
@@ -439,7 +461,7 @@ function ArtifactPreview({ ticketId, artifact }: { ticketId: string; artifact: T
   const [error, setError] = useState<string | null>(null);
   const url = api.artifactUrl(ticketId, artifact.id);
   const textual = artifact.content_type === "text/markdown" || artifact.content_type.startsWith("text/plain")
-    || ["application/json", "application/yaml", "application/x-yaml", "text/yaml"].includes(artifact.content_type);
+    || ["application/json", "application/x-ndjson", "application/yaml", "application/x-yaml", "text/yaml"].includes(artifact.content_type);
   useEffect(() => {
     setContent(null); setError(null);
     if (!textual || artifact.size_bytes > MAX_INLINE_ARTIFACT_BYTES) return;
@@ -543,10 +565,10 @@ function AgentFleet({ agents, now, onOpen }: { agents: RuntimeAgent[]; now: numb
   </section>;
 }
 
-function SupervisorHealthPage({ supervisors, operations, now, onOpenTicket }: { supervisors: SupervisorHealth[]; operations: OperationalStatus | null; now: number; onOpenTicket: (id: string) => void }) {
+function SupervisorHealthPage({ supervisors, operations, githubObservationEnabled, now, onOpenTicket }: { supervisors: SupervisorHealth[]; operations: OperationalStatus | null; githubObservationEnabled: boolean; now: number; onOpenTicket: (id: string) => void }) {
   const online = supervisors.filter((supervisor) => supervisor.status === "online").length;
   return <main className="supervisors-page">
-    <div className="health-heading"><div><span>Infrastructure</span><h1>System operations</h1><p>Tracker readiness, background maintenance, and supervisor capacity.</p></div><div className="health-summary"><strong>{online}/{supervisors.length}</strong><span>supervisors online</span></div></div>
+    <div className="health-heading"><div><span>Infrastructure</span><h1>System operations</h1><p>Tracker readiness, background maintenance, and supervisor capacity.</p></div><div className="health-summary"><strong>{supervisors.length ? `${online}/${supervisors.length}` : "None"}</strong><span>{supervisors.length ? "supervisors online" : "supervisors registered"}</span></div></div>
     <section className="operations-grid">
       <article className={`supervisor-card operations-card operations-${operations?.status ?? "unknown"}`}>
         <div className="supervisor-card-heading"><div><span className={`agent-dot state-${operations?.ready ? "working" : "blocked"}`} /><div><h2>Tracker readiness</h2><small>{operations ? humanize(operations.status) : "Unavailable"}</small></div></div><StatusPill value={operations?.status ?? "unknown"} /></div>
@@ -562,7 +584,12 @@ function SupervisorHealthPage({ supervisors, operations, now, onOpenTicket }: { 
       </article>
       <article className="supervisor-card operations-card">
         <div className="supervisor-card-heading"><div><span className="agent-dot state-working" /><div><h2>Background operations</h2><small>Last observed scheduler results</small></div></div></div>
-        <div className="operation-list">{operations ? Object.entries(operations.background_operations).map(([name, operation]) => <div key={name}><div><strong>{humanize(name)}</strong><StatusPill value={operation.in_progress ? "running" : operation.last_error ? "failed" : operation.last_succeeded_at ? "completed" : "pending"} subtle /></div><small>{operation.in_progress ? "In progress" : operation.last_error ? operation.last_error : operation.last_succeeded_at ? `Succeeded ${timeAgo(operation.last_succeeded_at, now)} in ${duration(operation.last_duration_ms ?? 0)}` : "Not run yet"}</small></div>) : <p>Operational status is unavailable.</p>}</div>
+        <div className="operation-list">{operations ? Object.entries(operations.background_operations).map(([name, operation]) => {
+          const disabled = name === "github_observation" && !githubObservationEnabled;
+          const state = disabled ? "disabled" : operation.in_progress ? "running" : operation.last_error ? "failed" : operation.last_succeeded_at ? "healthy" : "never_run";
+          const detail = disabled ? "Disabled in Configuration → Integrations" : operation.in_progress ? "In progress" : operation.last_error ? operation.last_error : operation.last_succeeded_at ? `Last succeeded ${timeAgo(operation.last_succeeded_at, now)} in ${duration(operation.last_duration_ms ?? 0)}` : "Enabled, but no run has completed yet";
+          return <div key={name}><div><strong>{humanize(name)}</strong><StatusPill value={state} subtle /></div><small>{detail}</small></div>;
+        }) : <p>Operational status is unavailable.</p>}</div>
       </article>
     </section>
     <div className="health-subheading"><span>Execution capacity</span><h2>Supervisors</h2><p>Each supervisor owns an isolated project root and one ticket end-to-end.</p></div>
@@ -581,7 +608,10 @@ function SupervisorHealthPage({ supervisors, operations, now, onOpenTicket }: { 
   </main>;
 }
 
+type ConfigurationTab = "general" | "agents" | "cost" | "quality" | "integrations" | "maintenance";
+
 function ConfigurationPage({ config, quota, busy, onSave, onRestoreDefaults }: { config: TrackerConfig | null; quota: QuotaReport | null; busy: boolean; onSave: (update: Pick<TrackerConfig, "providers" | "agent_profiles" | "pricing" | "metrics" | "quality" | "artifacts" | "repositories" | "jira" | "github">) => void; onRestoreDefaults: () => void }) {
+  const [tab, setTab] = useStoredState<ConfigurationTab>("agentic-project-tracker.configuration.tab", "general");
   const [enabledProviders, setEnabledProviders] = useState<WorkProvider[]>(config?.providers?.enabled ?? ALL_WORK_PROVIDERS);
   const [repositories, setRepositories] = useState<RepositoryConfig[]>(config?.repositories ?? []);
   const [jira, setJira] = useState(config?.jira ?? { enabled: false, site_url: "", project_key: "", issue_type: "Task" });
@@ -597,7 +627,18 @@ function ConfigurationPage({ config, quota, busy, onSave, onRestoreDefaults }: {
       { id: "codex", label: "Codex Sol", provider: "codex" as const, model: "gpt-5.6-sol", reasoning: "high" },
     ],
   });
-  useEffect(() => { setEnabledProviders(config?.providers?.enabled ?? ALL_WORK_PROVIDERS); setRepositories(config?.repositories ?? []); if (config?.jira) setJira(config.jira); if (config?.github) setGithub(config.github); if (config?.agent_profiles) setAgentProfiles(config.agent_profiles); if (config?.pricing) setPricing(config.pricing); if (config?.metrics) setMetrics(config.metrics); if (config?.quality) setQuality(config.quality); if (config?.artifacts) setArtifacts(config.artifacts); }, [config?.revision]);
+  const applyConfig = (source: TrackerConfig | null) => {
+    setEnabledProviders(source?.providers?.enabled ?? ALL_WORK_PROVIDERS);
+    setRepositories(source?.repositories ?? []);
+    setJira(source?.jira ?? { enabled: false, site_url: "", project_key: "", issue_type: "Task" });
+    setGithub(source?.github ?? { observation_enabled: false, observation_interval_minutes: 30, ignored_logins: [] });
+    setPricing(source?.pricing ?? { estimate_missing_costs: true, models: [] });
+    setMetrics(source?.metrics ?? { human_day_rate_usd: 1_000, quota_account_aliases: {} });
+    setQuality(source?.quality ?? { attributes: [] });
+    setArtifacts(source?.artifacts ?? { max_total_bytes: 50 * 1024 ** 3, max_ticket_bytes: 5 * 1024 ** 3, orphan_grace_hours: 24, retention_days: 365, auto_gc_enabled: true, gc_interval_minutes: 60 });
+    setAgentProfiles(source?.agent_profiles ?? { default: "claude", profiles: [{ id: "claude", label: "Claude Opus", provider: "claude", model: "claude-opus-4-8", reasoning: "high" }, { id: "codex", label: "Codex Sol", provider: "codex", model: "gpt-5.6-sol", reasoning: "high" }] });
+  };
+  useEffect(() => { applyConfig(config); }, [config?.revision]);
   const errors: string[] = [];
   if (enabledProviders.length === 0) errors.push("Enable at least one work agent.");
   if (repositories.some((repository) => !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(repository.id) || repository.id === "." || repository.id === "..")) errors.push("Repository IDs must be safe directory names.");
@@ -635,9 +676,34 @@ function ConfigurationPage({ config, quota, busy, onSave, onRestoreDefaults }: {
     if (provider === "codex") delete quota_account_aliases[supervisorId];
     return { ...current, quota_account_aliases };
   });
+  const savePayload = {
+    providers: { enabled: enabledProviders }, agent_profiles: agentProfiles, pricing, metrics, quality, artifacts,
+    repositories: repositories.map((repository) => ({ id: repository.id.trim(), url: repository.url.trim() })),
+    jira: { ...jira, site_url: jira.site_url.replace(/\/$/, ""), project_key: jira.project_key.trim(), issue_type: jira.issue_type.trim() }, github,
+  };
+  const baselinePayload = config ? {
+    providers: { enabled: config.providers?.enabled ?? ALL_WORK_PROVIDERS },
+    agent_profiles: config.agent_profiles ?? { default: "claude", profiles: [{ id: "claude", label: "Claude Opus", provider: "claude" as const, model: "claude-opus-4-8", reasoning: "high" }, { id: "codex", label: "Codex Sol", provider: "codex" as const, model: "gpt-5.6-sol", reasoning: "high" }] },
+    pricing: config.pricing ?? { estimate_missing_costs: true, models: [] }, metrics: config.metrics ?? { human_day_rate_usd: 1_000, quota_account_aliases: {} }, quality: config.quality ?? { attributes: [] },
+    artifacts: config.artifacts ?? { max_total_bytes: 50 * 1024 ** 3, max_ticket_bytes: 5 * 1024 ** 3, orphan_grace_hours: 24, retention_days: 365, auto_gc_enabled: true, gc_interval_minutes: 60 },
+    repositories: (config.repositories ?? []).map((repository) => ({ id: repository.id.trim(), url: repository.url.trim() })),
+    jira: { ...(config.jira ?? { enabled: false, site_url: "", project_key: "", issue_type: "Task" }), site_url: (config.jira?.site_url ?? "").replace(/\/$/, ""), project_key: (config.jira?.project_key ?? "").trim(), issue_type: (config.jira?.issue_type ?? "Task").trim() },
+    github: config.github ?? { observation_enabled: false, observation_interval_minutes: 30, ignored_logins: [] },
+  } : null;
+  const dirty = Boolean(baselinePayload && JSON.stringify(savePayload) !== JSON.stringify(baselinePayload));
+  const tabs: Array<{ id: ConfigurationTab; label: string; description: string }> = [
+    { id: "general", label: "General & repositories", description: "Clone sources and project scope" },
+    { id: "agents", label: "Agents & models", description: "Harnesses and reusable profiles" },
+    { id: "cost", label: "Cost & metrics", description: "Pricing, quotas, and assumptions" },
+    { id: "quality", label: "Quality & artifacts", description: "Evaluation fields and retention" },
+    { id: "integrations", label: "Integrations", description: "Jira Cloud and GitHub" },
+    { id: "maintenance", label: "Maintenance", description: "Restore built-in artifacts" },
+  ];
   return <main className="configuration-page">
-    <div className="health-heading"><div><span>Local configuration</span><h1>Repository catalog</h1><p>Every supervisor clones missing repositories into its own project root.</p></div>{config && <div className="health-summary"><strong>r{config.revision}</strong><span>tracker-config.yaml</span></div>}</div>
+    <div className="health-heading"><div><span>Local configuration</span><h1>Tracker configuration</h1><p>Configure repository sources, agent profiles, accounting, evidence, and optional integrations.</p></div>{config && <div className="health-summary"><strong>r{config.revision}</strong><span>tracker-config.yaml</span></div>}</div>
+    <nav className="configuration-tabs" role="tablist" aria-label="Configuration sections">{tabs.map((item) => <button role="tab" aria-selected={tab === item.id} className={tab === item.id ? "active" : ""} key={item.id} onClick={() => setTab(item.id)}><strong>{item.label}</strong><small>{item.description}</small></button>)}</nav>
     <section className="configuration-card">
+      {tab === "general" && <>
       <div className="section-heading"><div><span>Repositories</span><h2>Configured clone sources</h2></div><button className="button-secondary" onClick={() => setRepositories((current) => [...current, { id: "", url: "" }])}>Add repository</button></div>
       <div className="config-column-labels"><span>Directory ID</span><span>Git clone URL</span><span /></div>
       {repositories.map((repository, index) => <div className="config-repository-row" key={index}>
@@ -646,6 +712,8 @@ function ConfigurationPage({ config, quota, busy, onSave, onRestoreDefaults }: {
         <button className="icon-button" aria-label={`Remove configured repository ${index + 1}`} onClick={() => setRepositories((current) => current.filter((_, candidate) => candidate !== index))}>×</button>
       </div>)}
       {!repositories.length && <div className="config-empty"><strong>No repositories configured</strong><span>Add the repositories that should exist beneath every supervisor project root.</span></div>}
+      </>}
+      {tab === "agents" && <>
       <div className="section-heading"><div><span>Agent runtime</span><h2>Enabled harnesses</h2></div></div>
       <p className="config-help">Choose which harnesses may be used by workflow agent profiles. Supervisor availability is reported separately.</p>
       <div className="provider-config-grid">{ALL_WORK_PROVIDERS.map((provider) => <label className="toggle" key={provider}><input aria-label={`Enable ${humanize(provider)}`} type="checkbox" checked={enabledProviders.includes(provider)} onChange={(event) => toggleProvider(provider, event.target.checked)} /><span><strong>{humanize(provider)}</strong><small>{enabledProviders.includes(provider) ? "Available to workflow profiles" : "Hidden from workflow profiles"}</small></span></label>)}</div>
@@ -658,11 +726,13 @@ function ConfigurationPage({ config, quota, busy, onSave, onRestoreDefaults }: {
         <button className="icon-button" disabled={agentProfiles.profiles.length === 1} onClick={() => setAgentProfiles((current) => { const profiles = current.profiles.filter((_, candidate) => candidate !== index); return { default: current.default === profile.id ? profiles[0]!.id : current.default, profiles }; })}>×</button>
       </div>)}
       <label>Default profile<select aria-label="Default agent profile" value={agentProfiles.default} onChange={(event) => setAgentProfiles({ ...agentProfiles, default: event.target.value })}>{agentProfiles.profiles.map((profile) => <option key={profile.id} value={profile.id}>{profile.label} ({profile.id})</option>)}</select></label>
+      </>}
+      {tab === "cost" && <>
       <div className="section-heading"><div><span>Cost accounting</span><h2>Model pricing</h2></div><button className="button-secondary" onClick={() => setPricing((current) => ({ ...current, models: [...current.models, { id: `custom-price-${current.models.length + 1}`, provider: enabledProviders[0] ?? "codex", model: "", input_per_million_usd: 0, cached_input_per_million_usd: 0, cache_write_input_per_million_usd: 0, output_per_million_usd: 0, source_url: "https://", effective_at: new Date().toISOString() }] }))}>Add price</button></div>
       <label className="toggle"><input type="checkbox" checked={pricing.estimate_missing_costs} onChange={(event) => setPricing({ ...pricing, estimate_missing_costs: event.target.checked })} /><span><strong>Estimate missing harness costs</strong><small>Reported cost wins. These rates are used only when the harness supplies tokens but no USD total.</small></span></label>
       <div className="pricing-table"><div className="pricing-header"><span>Provider / model</span><span>Per million tokens</span><span>Source / effective date</span><span /></div>{pricing.models.map((entry, index) => {
         const updatePrice = (patch: Partial<typeof entry>) => setPricing((current) => ({ ...current, models: current.models.map((item, candidate) => candidate === index ? { ...item, ...patch } : item) }));
-        return <div className="pricing-row" key={`${entry.id}:${index}`}><div><input aria-label={`Pricing ID ${index + 1}`} value={entry.id} onChange={(event) => updatePrice({ id: event.target.value.toLowerCase().replace(/[^a-z0-9-]/g, "-") })} /><select aria-label={`Pricing provider ${index + 1}`} value={entry.provider} onChange={(event) => updatePrice({ provider: event.target.value as WorkProvider })}>{enabledProviders.map((provider) => <option key={provider} value={provider}>{humanize(provider)}</option>)}</select><input aria-label={`Pricing model ${index + 1}`} value={entry.model} onChange={(event) => updatePrice({ model: event.target.value })} /></div><div className="price-inputs"><label>Input<input type="number" min="0" step="0.01" value={entry.input_per_million_usd} onChange={(event) => updatePrice({ input_per_million_usd: Number(event.target.value) })} /></label><label>Cached<input type="number" min="0" step="0.01" value={entry.cached_input_per_million_usd} onChange={(event) => updatePrice({ cached_input_per_million_usd: Number(event.target.value) })} /></label><label>Write<input type="number" min="0" step="0.01" value={entry.cache_write_input_per_million_usd} onChange={(event) => updatePrice({ cache_write_input_per_million_usd: Number(event.target.value) })} /></label><label>Output<input type="number" min="0" step="0.01" value={entry.output_per_million_usd} onChange={(event) => updatePrice({ output_per_million_usd: Number(event.target.value) })} /></label></div><div><input aria-label={`Pricing source ${index + 1}`} value={entry.source_url} onChange={(event) => updatePrice({ source_url: event.target.value })} /><input aria-label={`Pricing effective date ${index + 1}`} type="date" value={entry.effective_at.slice(0, 10)} onChange={(event) => updatePrice({ effective_at: new Date(`${event.target.value}T00:00:00.000Z`).toISOString() })} /></div><button className="icon-button" aria-label={`Remove pricing entry ${index + 1}`} onClick={() => setPricing((current) => ({ ...current, models: current.models.filter((_, candidate) => candidate !== index) }))}>×</button></div>;
+        return <div className="pricing-row" key={`${entry.id}:${index}`}><div><input aria-label={`Pricing ID ${index + 1}`} value={entry.id} onChange={(event) => updatePrice({ id: event.target.value.toLowerCase().replace(/[^a-z0-9-]/g, "-") })} /><select aria-label={`Pricing provider ${index + 1}`} value={entry.provider} onChange={(event) => updatePrice({ provider: event.target.value as WorkProvider })}>{enabledProviders.map((provider) => <option key={provider} value={provider}>{humanize(provider)}</option>)}</select><input aria-label={`Pricing model ${index + 1}`} value={entry.model} onChange={(event) => updatePrice({ model: event.target.value })} /></div><div className="price-inputs"><label>Uncached<input type="number" min="0" step="0.01" value={entry.input_per_million_usd} onChange={(event) => updatePrice({ input_per_million_usd: Number(event.target.value) })} /></label><label>Cached<input type="number" min="0" step="0.01" value={entry.cached_input_per_million_usd} onChange={(event) => updatePrice({ cached_input_per_million_usd: Number(event.target.value) })} /></label><label>Write<input type="number" min="0" step="0.01" value={entry.cache_write_input_per_million_usd} onChange={(event) => updatePrice({ cache_write_input_per_million_usd: Number(event.target.value) })} /></label><label>Output<input type="number" min="0" step="0.01" value={entry.output_per_million_usd} onChange={(event) => updatePrice({ output_per_million_usd: Number(event.target.value) })} /></label></div><div><input aria-label={`Pricing source ${index + 1}`} value={entry.source_url} onChange={(event) => updatePrice({ source_url: event.target.value })} /><input aria-label={`Pricing effective date ${index + 1}`} type="date" value={entry.effective_at.slice(0, 10)} onChange={(event) => updatePrice({ effective_at: new Date(`${event.target.value}T00:00:00.000Z`).toISOString() })} /></div><button className="icon-button" aria-label={`Remove pricing entry ${index + 1}`} onClick={() => setPricing((current) => ({ ...current, models: current.models.filter((_, candidate) => candidate !== index) }))}>×</button></div>;
       })}</div>
       <div className="section-heading"><div><span>Subscription observation</span><h2>Weekly allowances</h2></div></div>
       <p className="config-help">When Claude or Codex reports a seven-day percentage window, the tracker compares that change with completed node usage. The result is an observed-workload estimate, not a contractual token quota. API-key billing and some plans may not report a weekly allowance at all.</p>
@@ -680,6 +750,8 @@ function ConfigurationPage({ config, quota, busy, onSave, onRestoreDefaults }: {
       <div className="section-heading"><div><span>Human comparison</span><h2>Metrics assumptions</h2></div></div>
       <div className="field-row"><label>Human day rate (USD)<input aria-label="Human day rate" type="number" min="0" step="1" value={metrics.human_day_rate_usd} onChange={(event) => setMetrics({ ...metrics, human_day_rate_usd: Number(event.target.value) })} /></label></div>
       <p className="config-help">Tickets may record estimated human days. Metrics compare that estimate at this rate with factory cost for tickets that have complete cost coverage.</p>
+      </>}
+      {tab === "quality" && <>
       <div className="section-heading"><div><span>Evaluation vocabulary</span><h2>Quality registry</h2></div><button className="button-secondary" onClick={() => setQuality((current) => ({ attributes: [...current.attributes, { key: `quality.attribute-${current.attributes.length + 1}`, label: "New quality attribute", type: "number", unit: "", direction: "higher_is_better", minimum: null, maximum: null }] }))}>Add attribute</button></div>
       <p className="config-help">Registered keys provide stable types, units, and direction for workflow comparisons. Unregistered report attributes remain visible on their ticket but are excluded from aggregate evaluations.</p>
       <div className="quality-registry"><div className="quality-registry-header"><span>Key / label</span><span>Type / unit / direction</span><span>Bounds</span><span /></div>{quality.attributes.map((attribute, index) => {
@@ -696,16 +768,22 @@ function ConfigurationPage({ config, quota, busy, onSave, onRestoreDefaults }: {
         <label>Maintenance interval (minutes)<input aria-label="Artifact maintenance interval" type="number" min="1" step="1" value={artifacts.gc_interval_minutes} onChange={(event) => setArtifacts({ ...artifacts, gc_interval_minutes: Number(event.target.value) })} /></label>
       </div>
       <p className="config-help">Run <code>npm run artifacts:diagnose -- /path/to/tickets</code> for a read-only orphan and integrity report.</p>
+      </>}
+      {tab === "integrations" && <>
       <div className="section-heading"><div><span>Optional integration</span><h2>Jira Cloud</h2></div></div>
       <label className="toggle"><input type="checkbox" checked={jira.enabled} onChange={(event) => setJira({ ...jira, enabled: event.target.checked })} /><span><strong>Enable Jira</strong><small>Disabled personal installs make no Jira requests.</small></span></label>
       {jira.enabled && <div className="field-row"><label>Atlassian site<input aria-label="Jira site" placeholder="https://company.atlassian.net" value={jira.site_url} onChange={(event) => setJira({ ...jira, site_url: event.target.value })} /></label><label>Project key<input aria-label="Jira project key" value={jira.project_key} onChange={(event) => setJira({ ...jira, project_key: event.target.value })} /></label><label>Issue type<input aria-label="Jira issue type" value={jira.issue_type} onChange={(event) => setJira({ ...jira, issue_type: event.target.value })} /></label></div>}
       <div className="section-heading"><div><span>Review follow-up</span><h2>GitHub PR observation</h2></div></div>
       <label className="toggle"><input type="checkbox" checked={github.observation_enabled} onChange={(event) => setGithub({ ...github, observation_enabled: event.target.checked })} /><span><strong>Check reviewable tickets periodically</strong><small>GitHub feedback follows the explicit outcome or target configured on the current workflow node.</small></span></label>
       <div className="field-row"><label>Interval (minutes)<input aria-label="GitHub observation interval" type="number" min="1" value={github.observation_interval_minutes} onChange={(event) => setGithub({ ...github, observation_interval_minutes: Number(event.target.value) })} /></label><label>Ignored GitHub logins<input aria-label="Ignored GitHub logins" value={github.ignored_logins.join(", ")} onChange={(event) => setGithub({ ...github, ignored_logins: event.target.value.split(",").map((item) => item.trim()).filter(Boolean) })} /></label></div>
-      {errors.length > 0 && <div className="draft-validation" role="alert"><strong>Configuration needs attention</strong><ul>{errors.map((item) => <li key={item}>{item}</li>)}</ul></div>}
+      </>}
+      {tab === "maintenance" && <>
       <div className="section-heading"><div><span>Built-in artifacts</span><h2>Restore defaults</h2></div><button className="button-danger" disabled={busy} onClick={onRestoreDefaults}>Restore prompts & workflows</button></div><p className="config-help">Custom artifacts are preserved. Built-in prompts and workflows return to their shipped content revision; tickets pinned to other revisions do not change.</p>
-      <div className="config-footer"><p>Credentials stay in environment variables: JIRA_EMAIL, JIRA_API_TOKEN, and GITHUB_TOKEN.</p><button className="button-primary" disabled={!config || busy || errors.length > 0} onClick={() => onSave({ providers: { enabled: enabledProviders }, agent_profiles: agentProfiles, pricing, metrics, quality, artifacts, repositories: repositories.map((repository) => ({ id: repository.id.trim(), url: repository.url.trim() })), jira: { ...jira, site_url: jira.site_url.replace(/\/$/, ""), project_key: jira.project_key.trim(), issue_type: jira.issue_type.trim() }, github })}>Save configuration</button></div>
+      <div className="maintenance-note"><strong>Credentials are not stored here</strong><p>JIRA_EMAIL, JIRA_API_TOKEN, and GITHUB_TOKEN remain environment variables.</p></div>
+      </>}
     </section>
+    {errors.length > 0 && <div className="draft-validation configuration-validation" role="alert"><strong>Configuration needs attention</strong><ul>{errors.map((item) => <li key={item}>{item}</li>)}</ul></div>}
+    <div className="config-save-bar"><div><span className={`agent-dot state-${dirty ? "starting" : "working"}`} /><span><strong>{dirty ? "Unsaved changes" : "Configuration saved"}</strong><small>{dirty ? "Review validation, then save or revert your edits." : `tracker-config.yaml revision ${config?.revision ?? "—"}`}</small></span></div><div><button className="button-secondary" disabled={!dirty || busy} onClick={() => applyConfig(config)}>Revert changes</button><button className="button-primary" disabled={!config || !dirty || busy || errors.length > 0} onClick={() => onSave(savePayload)}>Save configuration</button></div></div>
   </main>;
 }
 
@@ -750,7 +828,7 @@ function TicketQuality({ ticket }: { ticket: TicketFrontmatter }) {
   return <section className="side-card quality-card"><div className="section-heading"><div><span>Evaluation evidence</span><h2>Quality</h2></div><small>{latest.size} attribute{latest.size === 1 ? "" : "s"}</small></div><div className="quality-list">{[...latest.entries()].sort((left, right) => left[1].attribute.label.localeCompare(right[1].attribute.label)).map(([identity, { attribute, artifact, reportName, nodeId, subject }]) => <div className={`quality-item quality-${attribute.status}`} key={identity}><span><i />{attribute.label}<small>{attribute.key} · {humanize(nodeId)}{subject ? ` · ${subject}` : ""}{attribute.registered ? "" : " · unregistered"}</small></span><strong>{String(attribute.value)}{attribute.unit ? ` ${attribute.unit}` : ""}</strong><a href={api.artifactUrl(ticket.id, artifact.id)} target="_blank" rel="noreferrer" title={reportName}>YAML ↗</a></div>)}</div></section>;
 }
 
-type EvidenceTab = "review" | "runs" | "traces" | "technical" | "checkpoints" | "attachments";
+type EvidenceTab = "review" | "provenance" | "runs" | "traces" | "technical" | "checkpoints" | "attachments";
 
 interface TraceDisplayEvent {
   sequence: number; timestamp: string; elapsed_ms: number; event: string; data: Record<string, unknown>;
@@ -797,7 +875,7 @@ function TicketEvidence({ ticket, workflow, busy, now, onUpload, onRemoveAttachm
   onCreateCheckpoint: (nodeId: string) => void; onRestoreCheckpoint: (nodeId: string, checkpointId: string) => void;
 }) {
   const [storedTab, setStoredTab] = useStoredState<string>("agentic-project-tracker.evidence.tab", "review");
-  const tab: EvidenceTab = ["review", "runs", "traces", "technical", "checkpoints", "attachments"].includes(storedTab) ? storedTab as EvidenceTab : "review";
+  const tab: EvidenceTab = ["review", "provenance", "runs", "traces", "technical", "checkpoints", "attachments"].includes(storedTab) ? storedTab as EvidenceTab : "review";
   const setTab = (value: EvidenceTab) => setStoredTab(value);
   const [previewArtifactId, setPreviewArtifactId] = useStoredState<string | null>(`agentic-project-tracker.evidence.preview.${ticket.id}`, null);
   const [fullscreen, setFullscreen] = useState(false);
@@ -815,9 +893,13 @@ function TicketEvidence({ ticket, workflow, busy, now, onUpload, onRemoveAttachm
   const runById = new Map(runs.map((run) => [run.id, run]));
   const nodeName = (nodeId: string) => workflow?.nodes.find((node) => node.id === nodeId)?.name ?? humanize(nodeId);
   const reviewKinds = new Set(["evidence", "script_output", "script_artifact", "quality_report"]);
+  const provenanceKinds = new Set(["agent_transcript", "harness_session_log"]);
   const reviewArtifacts = artifacts.filter((artifact) => reviewKinds.has(artifact.kind));
+  const provenanceArtifacts = artifacts.filter((artifact) => provenanceKinds.has(artifact.kind));
   const traceArtifacts = artifacts.filter((artifact) => artifact.kind === "execution_trace");
-  const technicalArtifacts = artifacts.filter((artifact) => !reviewKinds.has(artifact.kind) && artifact.kind !== "execution_trace");
+  const technicalArtifacts = artifacts.filter((artifact) => !reviewKinds.has(artifact.kind) && !provenanceKinds.has(artifact.kind) && artifact.kind !== "execution_trace");
+  const agentRuns = agentExecutionRuns(runs);
+  const provenanceRunIds = new Set(provenanceArtifacts.filter((artifact) => artifact.kind === "agent_transcript" && artifact.node_run_id).map((artifact) => artifact.node_run_id));
   const traceGroups = [...traceArtifacts.reduce((groups, artifact) => {
     const key = String(artifact.metadata.trace_id ?? artifact.id);
     groups.set(key, [...(groups.get(key) ?? []), artifact]);
@@ -845,13 +927,14 @@ function TicketEvidence({ ticket, workflow, busy, now, onUpload, onRemoveAttachm
   filteredReview.sort((left, right) => Number(Boolean(artifactPresentation(right).featured)) - Number(Boolean(artifactPresentation(left).featured)) || right.created_at.localeCompare(left.created_at));
   const tabs: Array<{ id: EvidenceTab; label: string; count: number }> = [
     { id: "review", label: "Review packet", count: reviewArtifacts.length + outputRuns.length },
+    { id: "provenance", label: "Provenance", count: provenanceArtifacts.length },
     { id: "runs", label: "Run history", count: runs.length },
     { id: "traces", label: "Operational traces", count: traceGroups.length },
     { id: "technical", label: "Technical artifacts", count: technicalArtifacts.length },
     { id: "checkpoints", label: "Checkpoints", count: checkpoints.length },
     { id: "attachments", label: "Attachments", count: attachments.length },
   ];
-  const previewItems = tab === "review" ? filteredReview : tab === "technical" ? technicalArtifacts : [];
+  const previewItems = tab === "review" ? filteredReview : tab === "provenance" ? provenanceArtifacts : tab === "technical" ? technicalArtifacts : [];
   const movePreview = (items: typeof artifacts, delta: number) => {
     if (!items.length) return;
     const currentIndex = Math.max(0, items.findIndex((artifact) => artifact.id === previewArtifactId));
@@ -871,17 +954,18 @@ function TicketEvidence({ ticket, workflow, busy, now, onUpload, onRemoveAttachm
   })}</div> : <div className="evidence-empty">No evidence is available in this category.</div>;
   const runList = runs.length ? <div className="run-evidence-list">{runs.map((run) => <details className="run-evidence" key={run.id}><summary><span><strong>{nodeName(run.node_id)}</strong><small>{humanize(run.node_type)} · visit {run.visit} · attempt {run.attempt}{run.conversation_generation ? ` · conversation g${run.conversation_generation}` : ""}</small></span><span><StatusPill value={run.status} subtle /><small>{run.outcome ? humanize(run.outcome) : "No outcome"}</small></span></summary><div className="run-evidence-body"><NodeTimingDetails run={run} now={now} />{run.telemetry && <TelemetryDetails telemetry={run.telemetry} compact />}{(run.supervisor_id || run.provider) && <p><strong>Executor</strong>{[run.supervisor_id, run.provider && humanize(run.provider)].filter(Boolean).join(" · ")}</p>}{run.lease_id && <p><strong>Lease / run</strong><code>{run.lease_id} · {run.id}</code></p>}<p><strong>Workflow revision</strong><code>{run.workflow_revision}{run.input_revision === undefined ? "" : ` · ticket r${run.input_revision}`}</code></p>{run.wait && <p><strong>Durable wait</strong>Wake {timeAgo(run.wait.wake_at, now)} · deadline {timeAgo(run.wait.deadline_at, now)} · {run.wait.delay_seconds}s delay</p>}{run.summary && <p><strong>Summary</strong>{run.summary}</p>}{run.handoff && <p><strong>Handoff</strong>{run.handoff}</p>}{run.script_path && <p><strong>Script</strong><code>{run.script_path}</code></p>}{run.working_directory && <p><strong>Working directory</strong><code>{run.working_directory}</code></p>}{Object.keys(run.metadata_writes ?? {}).length > 0 && <p><strong>Metadata writes</strong><code>{JSON.stringify(run.metadata_writes)}</code></p>}{(run.external_references ?? []).map((reference) => <p key={`${reference.type}:${reference.id}`}><strong>{humanize(reference.type)}</strong>{reference.url ? <a href={reference.url} target="_blank" rel="noreferrer">{reference.id} ↗</a> : reference.id}</p>)}<div className="evidence-actions">{run.output_path && <a href={`/api/tickets/${encodeURIComponent(frontmatter.id)}/runs/${encodeURIComponent(run.id)}/output`} target="_blank" rel="noreferrer">Full output ({fileSize(run.output_bytes ?? 0)}) ↗</a>}{run.manifest_artifact_id && <a href={api.artifactUrl(frontmatter.id, run.manifest_artifact_id)} target="_blank" rel="noreferrer">Execution manifest ↗</a>}</div></div></details>)}</div> : <div className="evidence-empty">No node runs have been recorded.</div>;
   return <section className="content-card evidence-card" aria-label="Evidence and artifacts">
-    <div className="section-heading"><div><span>Durable execution record</span><h2>Evidence &amp; artifacts</h2><p>Review readable evidence first; provenance, manifests, and bundles remain available under Technical artifacts.</p></div><strong>{artifacts.length} stored</strong></div>
+    <div className="section-heading"><div><span>Durable execution record</span><h2>Evidence &amp; artifacts</h2><p>Review readable evidence first; transcripts and native session records are grouped as execution provenance.</p></div><strong>{provenanceRunIds.size}/{agentRuns.length} executed agent runs captured · {artifacts.length} stored</strong></div>
     <div className="evidence-tabs" role="tablist" aria-label="Evidence categories">{tabs.map((item) => <button type="button" role="tab" aria-selected={tab === item.id} className={tab === item.id ? "active" : ""} key={item.id} onClick={() => setTab(item.id)}>{item.label}<span>{item.count}</span></button>)}</div>
     <div className="evidence-panel" role="tabpanel">
       {tab === "review" && <><div className="artifact-review-filters"><label><input type="checkbox" checked={featuredOnly} onChange={(event) => setFeaturedOnly(event.target.checked)} /> Featured only</label><label><input type="checkbox" checked={latestPerNode} onChange={(event) => setLatestPerNode(event.target.checked)} /> Latest from each node</label><select aria-label="Artifact node" value={nodeFilter} onChange={(event) => setNodeFilter(event.target.value)}><option value="">All nodes</option>{nodeOptions.map((node) => <option value={node} key={node}>{nodeName(node)}</option>)}</select><select aria-label="Artifact category" value={categoryFilter} onChange={(event) => setCategoryFilter(event.target.value)}><option value="">All categories</option>{categoryOptions.map((category) => <option value={category} key={category}>{humanize(category)}</option>)}</select><select aria-label="Artifact type" value={typeFilter} onChange={(event) => setTypeFilter(event.target.value)}><option value="">All types</option>{typeOptions.map((type) => <option value={type} key={type}>{type}</option>)}</select></div>{outputRuns.length > 0 && <div className="persisted-output-list">{outputRuns.map((run) => <a key={run.id} href={`/api/tickets/${encodeURIComponent(frontmatter.id)}/runs/${encodeURIComponent(run.id)}/output`} target="_blank" rel="noreferrer"><span><strong>{nodeName(run.node_id)} output</strong><small>Visit {run.visit} · attempt {run.attempt} · {fileSize(run.output_bytes ?? 0)}</small></span><span>Open ↗</span></a>)}</div>}{artifactList(filteredReview)}</>}
+      {tab === "provenance" && artifactList(provenanceArtifacts)}
       {tab === "runs" && runList}
       {tab === "traces" && (traceGroups.length ? <div className="run-evidence-list">{traceGroups.map((group) => { const run = group[0]?.node_run_id ? runById.get(group[0].node_run_id) : undefined; return <OperationalTrace key={String(group[0]?.metadata.trace_id ?? group[0]?.id)} ticketId={frontmatter.id} artifacts={group} {...(run ? { run } : {})} now={now} nodeName={nodeName} />; })}</div> : <div className="evidence-empty">No Herdr operational traces have been recorded.</div>)}
       {tab === "technical" && artifactList(technicalArtifacts)}
       {tab === "checkpoints" && <><div className="checkpoint-toolbar">{workflow?.nodes.filter((node) => node.type === "checkpoint").map((node) => <button key={node.id} className="button-secondary button-compact" disabled={busy || Boolean(frontmatter.execution?.interrupt_request)} onClick={() => onCreateCheckpoint(node.id)}>＋ {node.name}</button>)}</div>{checkpoints.length ? <div className="evidence-list">{checkpoints.map((checkpoint) => <article className="checkpoint-evidence" key={checkpoint.id}><header><span><strong>{checkpoint.label}</strong><small>{humanize(checkpoint.kind)} · {timeAgo(checkpoint.created_at, now)} · {checkpoint.id}</small></span><a href={api.artifactUrl(frontmatter.id, checkpoint.manifest_artifact_id)} target="_blank" rel="noreferrer">Manifest ↗</a></header>{checkpoint.repositories.map((repository) => <div key={repository.repository}><span><strong>{repository.repository}</strong><small>{repository.branch ?? "detached"} · {repository.dirty ? "working changes included" : "clean"}</small></span><code>{repository.snapshot_sha}</code><a href={api.artifactUrl(frontmatter.id, repository.bundle_artifact_id, true)}>Bundle</a></div>)}<footer>{workflow?.nodes.filter((node) => node.type === "restore_checkpoint").map((node) => <button key={node.id} className="button-secondary button-compact" disabled={busy || Boolean(frontmatter.execution?.interrupt_request)} onClick={() => { if (window.confirm(`Restore ${checkpoint.label}? Current repository state will first be checkpointed.`)) onRestoreCheckpoint(node.id, checkpoint.id); }}>Restore via {node.name}</button>)}</footer></article>)}</div> : <div className="evidence-empty">No checkpoints have been recorded.</div>}</>}
       {tab === "attachments" && <><div className="attachment-evidence-toolbar"><p>Supporting files are materialized into every new assignment bundle.</p><label className="attachment-picker compact"><input aria-label="Add ticket attachments" type="file" multiple disabled={busy} onChange={(event) => { const files = Array.from(event.target.files ?? []); if (files.length) onUpload(files); event.target.value = ""; }} /><span>＋ Add files</span></label></div>{attachments.length ? <div className="attachment-grid">{attachments.map((attachment) => { const source = api.attachmentUrl(ticket.id, attachment.id); return <article className="attachment-item" key={attachment.id}>{attachment.content_type.startsWith("image/") && <a className="attachment-preview" href={source} target="_blank" rel="noreferrer"><img src={source} alt={attachment.filename} /></a>}<div><a href={api.attachmentUrl(ticket.id, attachment.id, true)}><strong>{attachment.filename}</strong></a><small>{fileSize(attachment.size_bytes)} · {attachment.content_type}</small></div><button className="icon-button" aria-label={`Remove ${attachment.filename}`} disabled={busy} onClick={() => onRemoveAttachment(attachment.id)}>×</button></article>; })}</div> : <div className="evidence-empty">No files are attached to this ticket.</div>}</>}
     </div>
-    {fullscreen && previewArtifactId && artifacts.find((artifact) => artifact.id === previewArtifactId) && <div className="artifact-fullscreen" role="dialog" aria-modal="true" aria-label={`Artifact preview: ${artifactTitle(artifacts.find((artifact) => artifact.id === previewArtifactId)!)}`}><header><div><span>{tab === "technical" ? "Technical artifact" : "Review material"}</span><h2>{artifactTitle(artifacts.find((artifact) => artifact.id === previewArtifactId)!)}</h2></div><div><button disabled={previewItems.length < 2} onClick={() => movePreview(previewItems, -1)}>← Previous</button><button disabled={previewItems.length < 2} onClick={() => movePreview(previewItems, 1)}>Next →</button><button className="button-primary" onClick={() => setFullscreen(false)}>Close</button></div></header><ArtifactPreview ticketId={frontmatter.id} artifact={artifacts.find((artifact) => artifact.id === previewArtifactId)!} /></div>}
+    {fullscreen && previewArtifactId && artifacts.find((artifact) => artifact.id === previewArtifactId) && <div className="artifact-fullscreen" role="dialog" aria-modal="true" aria-label={`Artifact preview: ${artifactTitle(artifacts.find((artifact) => artifact.id === previewArtifactId)!)}`}><header><div><span>{tab === "technical" ? "Technical artifact" : tab === "provenance" ? "Execution provenance" : "Review material"}</span><h2>{artifactTitle(artifacts.find((artifact) => artifact.id === previewArtifactId)!)}</h2></div><div><button disabled={previewItems.length < 2} onClick={() => movePreview(previewItems, -1)}>← Previous</button><button disabled={previewItems.length < 2} onClick={() => movePreview(previewItems, 1)}>Next →</button><button className="button-primary" onClick={() => setFullscreen(false)}>Close</button></div></header><ArtifactPreview ticketId={frontmatter.id} artifact={artifacts.find((artifact) => artifact.id === previewArtifactId)!} /></div>}
   </section>;
 }
 
@@ -890,6 +974,7 @@ function TicketEditor({ draft, setDraft, existing, busy, onSave, onCancel, onRea
   onSave: () => void; onCancel: () => void; onReady?: () => void; onCustomizeWorkflow?: () => void; onMigrateWorkflow?: () => void; readyDisabled?: boolean; repositories?: RepositoryConfig[]; workflows?: WorkflowDocument[]; workflowReleases?: WorkflowReleaseCatalog;
   existingAttachments?: TicketFrontmatter["attachments"]; onRemoveAttachment?: (id: string) => void;
 }) {
+  const [showValidation, setShowValidation] = useState(false);
   const validationErrors = draftErrors(draft);
   const availableReleases = workflowReleases?.releases.filter((release) => release.workflow_id === draft.workflowId && release.status !== "retired") ?? [];
   const selectedRelease = availableReleases.find((release) => release.revision === draft.workflowRevision)
@@ -920,9 +1005,16 @@ function TicketEditor({ draft, setDraft, existing, busy, onSave, onCancel, onRea
     ...current,
     repositories: current.repositories.map((repository, candidate) => candidate === index ? { ...repository, ...patch } : patch.primary ? { ...repository, primary: false } : repository),
   }));
+  const attempt = (action: () => void) => {
+    if (validationErrors.length) {
+      setShowValidation(true);
+      return;
+    }
+    action();
+  };
   return <div className="editor-page">
-    <div className="issue-heading"><div><span className="issue-key">{existing ? draft.id : "New ticket"}</span><h1>{existing ? "Edit work ticket" : "Create work ticket"}</h1><p>Ticket fields become read-only in the dashboard once work begins.</p></div></div>
-    {validationErrors.length > 0 && <div className="draft-validation" role="alert"><strong>Finish these fields before saving</strong><ul>{validationErrors.map((validationError) => <li key={validationError}>{validationError}</li>)}</ul></div>}
+    <div className="issue-heading"><div><span className="issue-key">{existing ? draft.id : "New ticket"}</span><h1>{existing ? "Edit work ticket" : "Create work ticket"}</h1><p>Core fields are editable while pending. A live ticket's description can still be updated with guidance or a workflow restart.</p></div></div>
+    {showValidation && validationErrors.length > 0 && <div className="draft-validation" role="alert"><strong>Finish these fields before saving</strong><ul>{validationErrors.map((validationError) => <li key={validationError}>{validationError}</li>)}</ul></div>}
     <div className="form-grid">
       <section className="form-card form-main">
         <label>Title<input aria-label="Title" value={draft.title} onChange={(event) => update("title", event.target.value)} /></label>
@@ -939,11 +1031,11 @@ function TicketEditor({ draft, setDraft, existing, busy, onSave, onCancel, onRea
       </section>
       <aside className="form-card form-properties">
         <h2>Work settings</h2>
-        <label>Priority<input aria-label="Priority" type="number" value={draft.priority} onChange={(event) => update("priority", Number(event.target.value))} /></label>
+        <label>Ticket priority <span>Higher numbers are scheduled first</span><input aria-label="Ticket priority" title="Higher numbers are scheduled before lower numbers" type="number" value={draft.priority} onChange={(event) => update("priority", Number(event.target.value))} /></label>
         <label>Estimated human days <span>Optional comparison baseline</span><input aria-label="Estimated human days" type="number" min="0" step="0.25" value={draft.estimatedHumanDays ?? ""} onChange={(event) => update("estimatedHumanDays", event.target.value === "" ? null : Number(event.target.value))} /></label>
         <label>Labels <span>Comma separated</span><input aria-label="Labels" value={draft.labels} onChange={(event) => update("labels", event.target.value)} /></label>
         <label>Workflow<select aria-label="Workflow" disabled={existing} value={draft.workflowId} onChange={(event) => selectWorkflow(event.target.value)}>{workflows.filter((workflow) => workflow.valid).map((workflow) => <option key={workflow.definition.id} value={workflow.definition.id}>{workflow.definition.name}</option>)}</select><span>{existing ? "Pinned when the ticket was created" : "A versioned workflow revision will be pinned"}</span></label>
-        {!existing && availableReleases.length > 0 && <label>Workflow revision<select aria-label="Workflow revision" value={selectedRelease?.revision ?? ""} onChange={(event) => selectRevision(event.target.value)}>{availableReleases.map((release) => <option key={release.revision} value={release.revision}>v{release.version} · {release.label}{release.is_default ? " · Default" : " · Trial"}</option>)}</select><span>Trials are pinned only to this ticket.</span></label>}
+        {!existing && availableReleases.length > 0 && <label>Workflow revision<select aria-label="Workflow revision" value={selectedRelease?.revision ?? ""} onChange={(event) => selectRevision(event.target.value)}>{availableReleases.map((release) => <option key={release.revision} value={release.revision}>{releaseDisplayLabel(release)}</option>)}</select><span>Default revisions are used automatically; trial revisions are pinned only to this ticket.</span></label>}
       </aside>
       {selectedWorkflow && (selectedWorkflow.inputs.length > 0 || selectedWorkflow.stages.length > 0) && <section className="form-card workflow-ticket-options"><div className="section-heading"><div><span>Workflow</span><h2>Ticket path</h2></div></div>
         {selectedWorkflow.stages.length > 0 && <div className="ticket-stage-options"><h3>Stages</h3>{selectedWorkflow.stages.map((stage) => <label className="toggle" key={stage.id}><input type="checkbox" disabled={!stage.skippable} checked={stage.skippable ? draft.stageEnabled[stage.id] ?? stage.default_enabled : true} onChange={(event) => setStageEnabled(stage, event.target.checked)} /><span><strong>{stage.name}</strong><small>{stage.skippable ? `Configurable · bypasses to ${selectedWorkflow.nodes.find((node) => node.id === stage.bypass_to)?.name ?? stage.bypass_to}` : "Required stage"}</small></span></label>)}</div>}
@@ -960,7 +1052,7 @@ function TicketEditor({ draft, setDraft, existing, busy, onSave, onCancel, onRea
         <datalist id="configured-repositories">{repositories?.map((repository) => <option key={repository.id} value={repository.id}>{repository.url}</option>)}</datalist>
       </section>
     </div>
-    <div className="sticky-actions"><button className="button-secondary" onClick={onCancel}>Cancel</button>{existing && onCustomizeWorkflow && <button className="button-secondary" disabled={busy || readyDisabled} onClick={onCustomizeWorkflow}>Customize workflow</button>}{existing && onMigrateWorkflow && <button className="button-secondary" disabled={busy || readyDisabled} onClick={onMigrateWorkflow}>Pin workflow revision</button>}<button className="button-secondary" disabled={busy || validationErrors.length > 0} onClick={onSave}>{existing ? "Save ticket" : "Create ticket"}</button>{existing && onReady && <button className="button-primary" title={readyDisabled ? "Save changes before marking ready" : undefined} disabled={busy || readyDisabled || validationErrors.length > 0} onClick={onReady}>Mark ready</button>}</div>
+    <div className="sticky-actions"><button className="button-secondary" onClick={onCancel}>Cancel</button>{existing && onCustomizeWorkflow && <button className="button-secondary" disabled={busy || readyDisabled} onClick={onCustomizeWorkflow}>Customize workflow</button>}{existing && onMigrateWorkflow && <button className="button-secondary" disabled={busy || readyDisabled} onClick={onMigrateWorkflow}>Pin workflow revision</button>}<button className="button-secondary" disabled={busy} onClick={() => attempt(onSave)}>{existing ? "Save ticket" : "Create ticket"}</button>{existing && onReady && <button className="button-primary" title={readyDisabled ? "Save changes before marking ready" : undefined} disabled={busy || readyDisabled} onClick={() => attempt(onReady)}>Mark ready</button>}</div>
   </div>;
 }
 
@@ -997,10 +1089,46 @@ function tokenCount(value: number | null | undefined): string {
 
 function usd(value: number | null | undefined): string {
   if (value === null || value === undefined) return "Unavailable";
-  return `$${value.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: value < 0.01 ? 6 : 4 })}`;
+  return value.toLocaleString("en-US", {
+    style: "currency",
+    currency: "USD",
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  });
+}
+
+function aggregateTokenUsage(runs: TicketNodeRun[]): TokenUsage | null {
+  const usage = runs.flatMap((run) => run.telemetry?.delta.usage ? [run.telemetry.delta.usage] : []);
+  if (!usage.length) return null;
+  return usage.reduce<TokenUsage>((total, item) => ({
+    input_tokens: total.input_tokens + item.input_tokens,
+    cached_input_tokens: total.cached_input_tokens + item.cached_input_tokens,
+    cache_write_input_tokens: total.cache_write_input_tokens + item.cache_write_input_tokens,
+    output_tokens: total.output_tokens + item.output_tokens,
+    reasoning_output_tokens: total.reasoning_output_tokens + item.reasoning_output_tokens,
+    total_tokens: total.total_tokens + item.total_tokens,
+  }), { input_tokens: 0, cached_input_tokens: 0, cache_write_input_tokens: 0, output_tokens: 0, reasoning_output_tokens: 0, total_tokens: 0 });
+}
+
+function compactTokenBreakdown(usage: TokenUsage | null | undefined): string {
+  if (!usage) return "Tokens unavailable";
+  return `Uncached ${tokenCount(usage.input_tokens)} · Cached ${tokenCount(usage.cached_input_tokens)} · Write ${tokenCount(usage.cache_write_input_tokens)} · Output ${tokenCount(usage.output_tokens)}${usage.reasoning_output_tokens > 0 ? ` · Reasoning ${tokenCount(usage.reasoning_output_tokens)}` : ""}`;
+}
+
+function costLabel(kinds: Array<HarnessTelemetryRecord["latest"]["cost"]["kind"]>): string {
+  const available = kinds.filter((kind) => kind !== "unavailable");
+  if (!available.length) return "Cost";
+  if (available.length && available.every((kind) => kind === "estimated")) return "Estimated cost";
+  if (available.length && available.every((kind) => kind === "reported")) return "Reported cost";
+  return "Known cost";
 }
 
 type TicketNodeRun = NonNullable<TicketFrontmatter["workflow"]>["node_runs"][number];
+
+function agentExecutionRuns(runs: TicketNodeRun[]): TicketNodeRun[] {
+  return runs.filter((run) => run.node_type === "agent"
+    && run.attempt > 0 && run.outcome !== "bypassed" && run.outcome !== "delivery_failed");
+}
 
 function nodeTiming(run: TicketNodeRun, now: number) {
   let activeMs = run.timing.active_ms;
@@ -1043,24 +1171,25 @@ function TelemetryDetails({ telemetry, compact = false }: { telemetry: HarnessTe
     ? `${latest.reasoning.effort}${latest.reasoning.source === "current_configuration" ? " (current config)" : ""}`
     : latest.reasoning.enabled === true ? "Enabled" : latest.reasoning.enabled === false ? "Disabled" : "Unavailable";
   if (compact) return <small className="run-telemetry">
-    {[latest.model.id ?? latest.harness, reasoning, delta.usage ? `${tokenCount(delta.usage.total_tokens)} tokens` : "tokens unavailable", delta.cost_usd !== null ? usd(delta.cost_usd) : "cost unavailable"].join(" · ")}
+    {[latest.model.id ?? latest.harness, reasoning, compactTokenBreakdown(delta.usage), delta.cost_usd !== null ? `${costLabel([latest.cost.kind])} ${usd(delta.cost_usd)}` : "Cost unavailable"].join(" · ")}
   </small>;
   const attributes = Object.entries(latest.attributes).filter(([, value]) => value !== null).slice(0, 6);
   return <div className="telemetry-details">
     <div className="telemetry-heading"><span>Harness telemetry</span><small>{latest.cost.kind === "unavailable" ? "Cost not reported by harness" : `${humanize(latest.cost.kind)} cost`}</small></div>
     <div className="metric-grid telemetry-metrics">
-      <div><span>Node tokens</span><strong>{tokenCount(delta.usage?.total_tokens)}</strong></div>
-      <div><span>Node cost</span><strong>{usd(delta.cost_usd)}</strong></div>
-      <div><span>Input</span><strong>{tokenCount(delta.usage?.input_tokens)}</strong></div>
-      <div><span>Output</span><strong>{tokenCount(delta.usage?.output_tokens)}</strong></div>
+      <div><span>Uncached input</span><strong>{tokenCount(delta.usage?.input_tokens)}</strong></div>
+      <div><span>Cached input</span><strong>{tokenCount(delta.usage?.cached_input_tokens)}</strong></div>
+      <div><span>Cache write</span><strong>{tokenCount(delta.usage?.cache_write_input_tokens)}</strong></div>
+      <div><span>Output tokens</span><strong>{tokenCount(delta.usage?.output_tokens)}</strong></div>
+      <div><span>Reasoning output</span><strong>{tokenCount(delta.usage?.reasoning_output_tokens)}</strong></div>
+      <div><span>{costLabel([latest.cost.kind])}</span><strong>{usd(delta.cost_usd)}</strong></div>
     </div>
     <dl className="details-list">
       <DetailRow label="Harness">{humanize(latest.harness)}</DetailRow>
       <DetailRow label="Exact model"><code>{latest.model.id ?? "Unavailable"}</code></DetailRow>
       {latest.model.observed_ids.length > 1 && <DetailRow label="Models used">{latest.model.observed_ids.map((model) => <code key={model}>{model} </code>)}</DetailRow>}
       <DetailRow label="Reasoning">{reasoning}</DetailRow>
-      {delta.usage && <DetailRow label="Cached input">{tokenCount(delta.usage.cached_input_tokens)} read · {tokenCount(delta.usage.cache_write_input_tokens)} written</DetailRow>}
-      {delta.usage && delta.usage.reasoning_output_tokens > 0 && <DetailRow label="Reasoning tokens">{tokenCount(delta.usage.reasoning_output_tokens)}</DetailRow>}
+      {delta.usage && <DetailRow label="Total observed tokens">{tokenCount(delta.usage.total_tokens)}</DetailRow>}
       {latest.cost.pricing_id && <DetailRow label="Pricing"><a href={latest.cost.source ?? undefined} target="_blank" rel="noreferrer"><code>{latest.cost.pricing_id}</code>{latest.cost.effective_at ? ` · ${latest.cost.effective_at.slice(0, 10)}` : ""}</a></DetailRow>}
       {latest.context.window_tokens !== null && <DetailRow label="Context">{tokenCount(latest.context.used_tokens)} / {tokenCount(latest.context.window_tokens)}{latest.context.used_percent !== null ? ` (${latest.context.used_percent.toFixed(1)}%)` : ""}</DetailRow>}
       <DetailRow label="Observed">{timeAgo(latest.observed_at, Date.now())}</DetailRow>
@@ -1071,9 +1200,9 @@ function TelemetryDetails({ telemetry, compact = false }: { telemetry: HarnessTe
 }
 
 function TicketUsage({ ticket, now, humanDayRate }: { ticket: TicketFrontmatter; now: number; humanDayRate: number }) {
-  const agentRuns = ticket.workflow?.node_runs.filter((run) => run.node_type === "agent") ?? [];
+  const agentRuns = agentExecutionRuns(ticket.workflow?.node_runs ?? []);
   const measured = agentRuns.filter((run) => run.telemetry);
-  const totalTokens = measured.reduce((sum, run) => sum + (run.telemetry?.delta.usage?.total_tokens ?? 0), 0);
+  const usage = aggregateTokenUsage(measured);
   const tokenCoverage = measured.filter((run) => run.telemetry?.delta.usage).length;
   const costRuns = measured.filter((run) => run.telemetry?.delta.cost_usd !== null);
   const totalCost = costRuns.reduce((sum, run) => sum + (run.telemetry?.delta.cost_usd ?? 0), 0);
@@ -1090,8 +1219,12 @@ function TicketUsage({ ticket, now, humanDayRate }: { ticket: TicketFrontmatter;
   return <section className="side-card" aria-label="Ticket usage">
     <div className="section-heading"><div><span>Accounting</span><h2>Ticket totals</h2></div></div>
     <div className="metric-grid telemetry-metrics">
-      <div><span>Tokens</span><strong>{tokenCoverage ? tokenCount(totalTokens) : "Unavailable"}</strong></div>
-      <div><span>Known cost</span><strong>{costRuns.length ? usd(totalCost) : "Unavailable"}</strong></div>
+      <div><span>Uncached input</span><strong>{tokenCount(usage?.input_tokens)}</strong></div>
+      <div><span>Cached input</span><strong>{tokenCount(usage?.cached_input_tokens)}</strong></div>
+      <div><span>Cache write</span><strong>{tokenCount(usage?.cache_write_input_tokens)}</strong></div>
+      <div><span>Output tokens</span><strong>{tokenCount(usage?.output_tokens)}</strong></div>
+      <div><span>Reasoning output</span><strong>{tokenCount(usage?.reasoning_output_tokens)}</strong></div>
+      <div><span>{costLabel(costRuns.map((run) => run.telemetry!.latest.cost.kind))}</span><strong>{costRuns.length ? usd(totalCost) : "Unavailable"}</strong></div>
       <div><span>Workflow elapsed</span><strong>{duration(workflowElapsed)}</strong></div>
       <div><span>Active runtime</span><strong>{duration(activeMs)}</strong></div>
       <div><span>Quota paused</span><strong>{duration(quotaPausedMs)}</strong></div>
@@ -1099,7 +1232,7 @@ function TicketUsage({ ticket, now, humanDayRate }: { ticket: TicketFrontmatter;
       <div><span>Human estimate</span><strong>{ticket.estimated_human_days === null ? "Not set" : `${ticket.estimated_human_days}d · ${usd(humanCost)}`}</strong></div>
       <div><span>Estimated savings</span><strong>{humanCost !== null && completeCost ? usd(humanCost - totalCost) : "Unavailable"}</strong></div>
     </div>
-    <p className="telemetry-coverage">Token coverage: {tokenCoverage}/{agentRuns.length} agent runs · Cost coverage: {costRuns.length}/{agentRuns.length}{estimatedCostRuns ? ` (${estimatedCostRuns} estimated)` : ""}. Subscription-backed harnesses may not expose per-ticket USD cost. Quota-pause accounting requires harness rate-limit telemetry; wall time does not.</p>
+    <p className="telemetry-coverage">Token coverage: {tokenCoverage}/{agentRuns.length} executed agent runs · Cost coverage: {costRuns.length}/{agentRuns.length}{estimatedCostRuns ? ` (${estimatedCostRuns} estimated)` : ""}. Bypassed nodes and assignment delivery failures are excluded. Subscription-backed harnesses may not expose per-ticket USD cost. Quota-pause accounting requires harness rate-limit telemetry; wall time does not.</p>
     {models.length > 0 && <div className="model-list">{models.map((model) => <code key={model}>{model}</code>)}</div>}
   </section>;
 }
@@ -1107,21 +1240,22 @@ function TicketUsage({ ticket, now, humanDayRate }: { ticket: TicketFrontmatter;
 function ExecutionRecap({ ticket, workflow, now }: { ticket: TicketFrontmatter; workflow?: WorkflowDocument["definition"]; now: number }) {
   if (ticket.status !== "completed" || !ticket.workflow) return null;
   const runs = ticket.workflow.node_runs;
-  const agentRuns = runs.filter((run) => run.node_type === "agent");
+  const agentRuns = agentExecutionRuns(runs);
   const tokenRuns = agentRuns.filter((run) => run.telemetry?.delta.usage);
   const costRuns = agentRuns.filter((run) => run.telemetry?.delta.cost_usd !== null && run.telemetry?.delta.cost_usd !== undefined);
-  const tokens = tokenRuns.reduce((sum, run) => sum + (run.telemetry?.delta.usage?.total_tokens ?? 0), 0);
+  const usage = aggregateTokenUsage(tokenRuns);
   const cost = costRuns.reduce((sum, run) => sum + (run.telemetry?.delta.cost_usd ?? 0), 0);
   const elapsed = Math.max(0, Date.parse(ticket.workflow.completed_at ?? new Date(now).toISOString()) - Date.parse(ticket.workflow.started_at));
   const operationalInterventions = runs.filter((run) => ["delivery_failed", "lease_lost", "operator_interrupt"].includes(run.outcome ?? "")).length;
   const humanGates = runs.filter((run) => run.node_type === "human_gate" && run.status === "completed").length;
   const interventions = ticket.questions.length + humanGates + operationalInterventions;
+  const provenanceAgentRuns = new Set((ticket.artifacts ?? []).filter((artifact) => artifact.kind === "agent_transcript" && artifact.node_run_id).map((artifact) => artifact.node_run_id)).size;
   const importantArtifacts = [...(ticket.artifacts ?? [])].filter((artifact) => ["evidence", "script_artifact", "quality_report", "script_output"].includes(artifact.kind)).sort((left, right) => Number(Boolean(artifactPresentation(right).featured)) - Number(Boolean(artifactPresentation(left).featured)) || right.created_at.localeCompare(left.created_at)).slice(0, 5);
   const productionResult = ticket.production_result ?? "unassessed";
   const nodeName = (id: string) => workflow?.nodes.find((node) => node.id === id)?.name ?? humanize(id);
   return <section className="execution-recap" aria-label="Execution recap">
     <div className="section-heading"><div><span>Completed workflow</span><h2>Execution recap</h2><p>A compact summary derived from the immutable node-run ledger and ticket artifacts.</p></div><StatusPill value={productionResult === "unassessed" ? "pending" : productionResult} /></div>
-    <div className="recap-metrics"><div><span>Elapsed</span><strong>{duration(elapsed)}</strong></div><div><span>Tokens</span><strong>{tokenRuns.length ? tokenCount(tokens) : "Unavailable"}</strong><small>{tokenRuns.length}/{agentRuns.length} agent runs</small></div><div><span>Known cost</span><strong>{costRuns.length ? usd(cost) : "Unavailable"}</strong><small>{costRuns.length}/{agentRuns.length} agent runs</small></div><div><span>Interventions</span><strong>{interventions}</strong><small>{ticket.questions.length} questions · {humanGates} gates · {operationalInterventions} operational</small></div></div>
+    <div className="recap-metrics"><div><span>Elapsed</span><strong>{duration(elapsed)}</strong></div><div><span>Uncached input</span><strong>{tokenCount(usage?.input_tokens)}</strong><small>{tokenRuns.length}/{agentRuns.length} executed agent runs</small></div><div><span>Cached input</span><strong>{tokenCount(usage?.cached_input_tokens)}</strong></div><div><span>Cache write</span><strong>{tokenCount(usage?.cache_write_input_tokens)}</strong></div><div><span>Output tokens</span><strong>{tokenCount(usage?.output_tokens)}</strong></div><div><span>Reasoning output</span><strong>{tokenCount(usage?.reasoning_output_tokens)}</strong></div><div><span>{costLabel(costRuns.map((run) => run.telemetry!.latest.cost.kind))}</span><strong>{costRuns.length ? usd(cost) : "Unavailable"}</strong><small>{costRuns.length}/{agentRuns.length} executed agent runs</small></div><div><span>Provenance</span><strong>{provenanceAgentRuns}/{agentRuns.length}</strong><small>executed agent runs captured</small></div><div><span>Interventions</span><strong>{interventions}</strong><small>{ticket.questions.length} questions · {humanGates} gates · {operationalInterventions} operational</small></div></div>
     <div className="recap-path"><span>Path taken</span><div>{runs.map((run, index) => <React.Fragment key={run.id}><span className={`recap-node recap-${run.status}`}>{nodeName(run.node_id)}<small>{run.outcome ? humanize(run.outcome) : humanize(run.status)}</small></span>{index < runs.length - 1 && <i aria-hidden="true">→</i>}</React.Fragment>)}</div></div>
     <div className="recap-columns"><div><span>Pull requests</span>{ticket.pull_requests.length ? ticket.pull_requests.map((pr) => <a href={pr.url} target="_blank" rel="noreferrer" key={pr.url}>{pr.repository} · {pr.phase ? humanize(pr.phase) : "PR"} ↗</a>) : <small>No PRs were reported.</small>}</div><div><span>Important evidence</span>{importantArtifacts.length ? importantArtifacts.map((artifact) => <a href={api.artifactUrl(ticket.id, artifact.id)} target="_blank" rel="noreferrer" key={artifact.id}>{artifactTitle(artifact)} ↗</a>) : <small>No review artifacts were published.</small>}</div><div><span>Production</span><strong>{humanize(productionResult)}</strong>{ticket.production_assessment_note && <small>{ticket.production_assessment_note}</small>}</div></div>
   </section>;
@@ -1138,7 +1272,7 @@ function RuntimePanel({ execution, now }: { execution: Execution; now: number })
   const runtimeName = activity ? humanize(execution.node_id ?? execution.node_type ?? "activity") : herdr?.display_name ?? execution.provider ?? "Agent";
   const runtimeLabel = state === "running" ? (activity ? "Executing" : "Active") : "Starting";
   return <section className="side-card runtime-panel">
-    <div className="section-heading runtime-heading"><div><span>{activity ? "Deterministic activity" : "Herdr runtime"}</span><h2 title={runtimeName}>{runtimeName}</h2></div><StatusPill value={state} label={runtimeLabel} /></div>
+    <div className="section-heading runtime-heading"><div><span>{activity ? "Deterministic activity" : "Agent runtime"}</span><h2 title={runtimeName}>{runtimeName}</h2></div><StatusPill value={state} label={runtimeLabel} /></div>
     {title && <p className="activity-title">{title}</p>}
     {!activity && deliveryStatus === "starting" && <p className="activity-title">Preparing the agent and confirming assignment delivery.</p>}
     {execution.interrupt_request && <div className="attention-banner"><strong>Interrupt requested</strong><span>Waiting for {activity ? "the running script" : "Herdr"} to stop before {execution.interrupt_request.terminal_status ? `marking the ticket ${execution.interrupt_request.terminal_status}` : `restarting at ${humanize(execution.interrupt_request.target_phase)}`}.</span></div>}
@@ -1191,6 +1325,56 @@ function ThemeSelector({ theme, onChange }: { theme: Theme; onChange: (theme: Th
     title={`${option.label} theme`}
     onClick={() => onChange(option.value)}
   ><span aria-hidden="true">{option.mark}</span></button>)}</div>;
+}
+
+function TopNavigation({ view, attentionCount, onlineSupervisors, jiraEnabled, busy, theme, onView, onQueue, onNewTicket, onImportJira, onTheme }: {
+  view: AppView;
+  attentionCount: number;
+  onlineSupervisors: number;
+  jiraEnabled: boolean;
+  busy: boolean;
+  theme: Theme;
+  onView: (view: AppView) => void;
+  onQueue: () => void;
+  onNewTicket: () => void;
+  onImportJira: () => void;
+  onTheme: (theme: Theme) => void;
+}) {
+  const compact = useCompactNavigation();
+  const navigateFromMenu = (target: AppView, event: React.MouseEvent<HTMLButtonElement>) => {
+    onView(target);
+    event.currentTarget.closest("details")?.removeAttribute("open");
+  };
+  const overflowActive = ["intake", "metrics", "supervisors", "workflows", "prompts", "configuration"].includes(view);
+  return <header className="topbar">
+    <button className="brand" aria-label="Open ticket queue" onClick={onQueue}><div className="brand-mark">{theme === "retro" ? ">_" : "A"}</div><div><span>Agentic operations</span><strong>Project Tracker</strong></div></button>
+    <nav className="topnav" aria-label="Primary navigation">
+      <button className={view === "attention" ? "active" : ""} onClick={() => onView("attention")}>Inbox <span>{attentionCount}</span></button>
+      <button className={view === "tickets" ? "active" : ""} onClick={onQueue}>Queue</button>
+      {!compact && <>
+        <button className={view === "intake" ? "active" : ""} onClick={() => onView("intake")}>Intake</button>
+        <button className={view === "metrics" ? "active" : ""} onClick={() => onView("metrics")}>Metrics</button>
+        <button className={view === "supervisors" ? "active" : ""} onClick={() => onView("supervisors")}>Operations <span>{onlineSupervisors}</span></button>
+        <button className={view === "workflows" ? "active" : ""} onClick={() => onView("workflows")}>Workflows</button>
+        <button className={view === "prompts" ? "active" : ""} onClick={() => onView("prompts")}>Prompts</button>
+        <button className={view === "configuration" ? "active" : ""} onClick={() => onView("configuration")}>Configuration</button>
+      </>}
+      {compact && <details className={`nav-dropdown nav-overflow ${overflowActive ? "active" : ""}`}><summary aria-label="More navigation">•••</summary><div>
+        <button onClick={(event) => navigateFromMenu("intake", event)}><strong>Intake</strong><small>Automated ticket sources</small></button>
+        <button onClick={(event) => navigateFromMenu("metrics", event)}><strong>Metrics</strong><small>Factory performance</small></button>
+        <button onClick={(event) => navigateFromMenu("supervisors", event)}><strong>Operations</strong><small>{onlineSupervisors} supervisors online</small></button>
+        <button onClick={(event) => navigateFromMenu("workflows", event)}><strong>Workflows</strong><small>Design execution paths</small></button>
+        <button onClick={(event) => navigateFromMenu("prompts", event)}><strong>Prompts</strong><small>Edit agent instructions</small></button>
+        <button onClick={(event) => navigateFromMenu("configuration", event)}><strong>Configuration</strong><small>Tracker settings</small></button>
+        {jiraEnabled && <button disabled={busy} onClick={(event) => { onImportJira(); event.currentTarget.closest("details")?.removeAttribute("open"); }}><strong>Import Jira</strong><small>Create a ticket from Jira Cloud</small></button>}
+      </div></details>}
+    </nav>
+    <div className="topbar-actions">
+      <ThemeSelector theme={theme} onChange={onTheme} />
+      {!compact && jiraEnabled && <button className="button-secondary topbar-jira" disabled={busy} onClick={onImportJira}>Import Jira</button>}
+      <button className="button-primary topbar-new-ticket" aria-label="New ticket" onClick={onNewTicket}><span aria-hidden="true">＋</span><strong>New ticket</strong></button>
+    </div>
+  </header>;
 }
 
 function PromptEditorPage({ prompts, onUpdated, onError }: {
@@ -1254,7 +1438,7 @@ function PromptEditorPage({ prompts, onUpdated, onError }: {
 }
 
 const GRAPH_NODE_WIDTH = 208;
-const GRAPH_NODE_HEIGHT = 148;
+const GRAPH_NODE_HEIGHT = 166;
 const GRAPH_COLUMN_GAP = 92;
 
 type WorkflowRoute = WorkflowNode["outcomes"][number];
@@ -1345,10 +1529,9 @@ function WorkflowGraph({ workflow, currentNode, selectedNode, onSelect, ticket, 
         const runs = ticket?.workflow?.node_runs.filter((run) => run.node_id === node.id && run.workflow_revision === ticket.workflow?.revision && (run.workflow_id ?? ticket.workflow?.id) === workflow.id) ?? [];
         const totalWall = runs.reduce((sum, run) => sum + nodeTiming(run, Date.now()).wallMs, 0);
         const totalActive = runs.reduce((sum, run) => sum + nodeTiming(run, Date.now()).activeMs, 0);
-        const totalTokens = runs.reduce((sum, run) => sum + (run.telemetry?.delta.usage?.total_tokens ?? 0), 0);
+        const usage = aggregateTokenUsage(runs);
         const costRuns = runs.filter((run) => run.telemetry?.delta.cost_usd !== null && run.telemetry?.delta.cost_usd !== undefined);
         const totalCost = costRuns.reduce((sum, run) => sum + (run.telemetry?.delta.cost_usd ?? 0), 0);
-        const hasEstimatedCost = costRuns.some((run) => run.telemetry?.latest.cost.kind === "estimated");
         return <button type="button" key={node.id} style={{ left: position.x, top: position.y, width: GRAPH_NODE_WIDTH, height: GRAPH_NODE_HEIGHT }} onClick={() => onSelect?.(node.id)} aria-pressed={selectedNode === node.id} className={`factory-node node-kind-${node.type} ${currentNode === node.id ? "current" : ""} ${selectedNode === node.id ? "selected" : ""}`}>
           <header><span>{humanize(node.type)}</span>{currentNode === node.id && <em>Current</em>}</header>
           <strong>{node.name}</strong><code>{node.id}</code>
@@ -1357,7 +1540,7 @@ function WorkflowGraph({ workflow, currentNode, selectedNode, onSelect, ticket, 
           {node.script_file && <p>Script: <b>{node.script_file.path ?? `ticket:${node.script_file.path_input}`}</b></p>}
           {node.inline && <p>Inline: <b>{humanize(node.inline.language)}</b></p>}
           {node.github_watch && <p>GitHub feedback: <b>{humanize(node.github_watch.feedback_outcome ?? node.github_watch.feedback_target ?? "configured")}</b></p>}
-          {ticket && <footer className="factory-node-metrics"><span>{runs.length} visit{runs.length === 1 ? "" : "s"}</span><span>{runs.length ? `${duration(totalWall)} wall · ${duration(totalActive)} active` : "Not run"}</span><span>{runs.some((run) => run.telemetry?.delta.usage) ? `${tokenCount(totalTokens)} tok` : "Tokens —"} · {costRuns.length ? `${usd(totalCost)}${hasEstimatedCost ? " est" : ""}` : "Cost —"}</span></footer>}
+          {ticket && <footer className="factory-node-metrics"><span>{runs.length} visit{runs.length === 1 ? "" : "s"}</span><span>{runs.length ? `${duration(totalWall)} wall · ${duration(totalActive)} active` : "Not run"}</span>{usage && <><span>Uncached {tokenCount(usage.input_tokens)} · Cached {tokenCount(usage.cached_input_tokens)} · Write {tokenCount(usage.cache_write_input_tokens)}</span><span>Out {tokenCount(usage.output_tokens)}{usage.reasoning_output_tokens > 0 ? ` · Reasoning ${tokenCount(usage.reasoning_output_tokens)}` : ""}</span></>}<span>{costRuns.length ? `${costLabel(costRuns.map((run) => run.telemetry!.latest.cost.kind))} ${usd(totalCost)}` : "Cost —"}</span></footer>}
         </button>;
       })}
     </div></div>
@@ -1783,7 +1966,7 @@ function WorkflowEditorPage({ workflows, releases, prompts, agentProfiles, onCha
       <aside className="prompt-list">{creating && preview && <button className="active artifact-draft"><strong>{preview.name}</strong><small>{preview.id}.yaml · unsaved</small></button>}{workflows.map((workflow) => <button className={!creating && workflow.definition.id === selected?.definition.id ? "active" : ""} key={workflow.definition.id} onClick={() => { setCreating(null); setSelectedId(workflow.definition.id); }}><strong>{workflow.definition.name}</strong><small>{workflow.definition.id}.yaml · v{workflow.version}</small>{!workflow.valid && <em>Invalid</em>}</button>)}</aside>
       <section className="workflow-editor-main">
         <div className="prompt-heading"><div><span>{creating ? `${creating === "clone" ? "Cloned" : "New"} artifact` : `${selected?.definition.id}.yaml · v${selected?.version}`}</span><h2>{preview?.name ?? "Workflow draft"}</h2><p>{preview?.description}</p></div>{selected && !creating && <code>{selected.revision.slice(0, 12)}</code>}</div>
-        {selected && !creating && <section className="workflow-releases"><div className="section-heading"><div><span>Releases</span><h3>Current default and trials</h3><p>Versions identify unique workflow content, not activation order. Restoring shipped content can make an earlier version the default.</p></div>{retiredReleaseCount > 0 && <button className="button-secondary button-compact" type="button" onClick={() => setShowRetiredReleases((value) => !value)}>{showRetiredReleases ? "Hide history" : `Show history (${retiredReleaseCount})`}</button>}</div><div>{visibleReleases.map((release) => <article key={release.revision} className={release.is_default ? "default-release" : ""}><span><strong>v{release.version} · {release.label}</strong><small>{release.revision.slice(0, 12)} · {release.is_default ? "Default" : humanize(release.status)} · {timeAgo(release.published_at, Date.now())}</small></span>{!release.is_default && <button className="button-secondary button-compact" disabled={busy} onClick={() => void promote(release.revision)}>{release.status === "retired" ? "Restore as default" : "Make default"}</button>}</article>)}</div></section>}
+        {selected && !creating && <section className="workflow-releases"><div className="section-heading"><div><span>Revision history</span><h3>Default and trial revisions</h3><p>Each publication creates an immutable numbered revision. One revision is the default for new tickets; trials must be selected explicitly.</p></div>{retiredReleaseCount > 0 && <button className="button-secondary button-compact" type="button" onClick={() => setShowRetiredReleases((value) => !value)}>{showRetiredReleases ? "Hide retired revisions" : `Show retired revisions (${retiredReleaseCount})`}</button>}</div><div>{visibleReleases.map((release) => <article key={release.revision} className={release.is_default ? "default-release" : ""}><span><strong>{releaseDisplayLabel(release)}</strong><small>{release.revision.slice(0, 12)} · {humanize(release.status)} · published {timeAgo(release.published_at, Date.now())}</small></span>{!release.is_default && <button className="button-secondary button-compact" disabled={busy} onClick={() => void promote(release.revision)}>{release.status === "retired" ? "Restore as default" : "Make default"}</button>}</article>)}</div></section>}
         {preview && <section className="workflow-settings" aria-label="Workflow settings"><label><span>Workflow ID</span><input aria-label="Workflow ID" disabled={!creating} value={preview.id} onChange={(event) => { const id = event.target.value.toLowerCase().replace(/[^a-z0-9-]/g, "-"); setSelectedId(id); setDefinition({ ...preview, id }); }} /></label><label><span>Name</span><input aria-label="Workflow name" value={preview.name} onChange={(event) => setDefinition({ ...preview, name: event.target.value })} /></label><label className="wide"><span>Description</span><input aria-label="Workflow description" value={preview.description} onChange={(event) => setDefinition({ ...preview, description: event.target.value })} /></label><label><span>Start node</span><select aria-label="Workflow start node" value={preview.start} onChange={(event) => setDefinition({ ...preview, start: event.target.value })}>{preview.nodes.map((node) => <option key={node.id} value={node.id}>{node.name}</option>)}</select></label><label><span>Transition limit</span><input aria-label="Workflow transition limit" type="number" min="1" value={preview.max_transitions} onChange={(event) => setDefinition({ ...preview, max_transitions: Number(event.target.value) })} /></label></section>}
         {preview && <WorkflowContractEditor workflow={preview} onChange={setDefinition} />}
         <div className="workflow-toolbar"><div><strong>Add node</strong>{(["agent", "script", "checkpoint", "restore_checkpoint", "human_gate", "wait", "read", "write", "workflow", "fan_out", "fan_in", "terminal"] as const).map((type) => <button type="button" key={type} onClick={() => addNode(type)}>＋ {humanize(type)}</button>)}</div><span>Select a node to edit its behavior and outcomes.</span></div>
@@ -1812,11 +1995,18 @@ function FiveNumberCard({ title, summary, kind }: { title: string; summary: Numb
   </dl></section>;
 }
 
+type MetricsTab = "overview" | "runtime" | "reliability" | "cost" | "compare";
+
+function ExecutiveMetric({ label, value, detail, coverage }: { label: string; value: string; detail: string; coverage: string }) {
+  return <article className="executive-metric"><span>{label}</span><strong>{value}</strong><p>{detail}</p><small>{coverage}</small></article>;
+}
+
 function MetricsPage({ releases, onError }: { releases: WorkflowReleaseCatalog | null; onError: (message: string | null) => void }) {
   const [report, setReport] = useState<MetricsReport | null>(null);
   const [comparison, setComparison] = useState<WorkflowComparisonReport | null>(null);
   const [compareLeft, setCompareLeft] = useState("");
   const [compareRight, setCompareRight] = useState("");
+  const [tab, setTab] = useState<MetricsTab>("overview");
   const [filters, setFilters] = useState({ from: "", to: "", labels: [] as string[], labelMode: "any" as "any" | "all", workflowId: "", workflowRevision: "", productionResult: "" });
   const [loading, setLoading] = useState(false);
   const filterKey = JSON.stringify(filters);
@@ -1843,7 +2033,7 @@ function MetricsPage({ releases, onError }: { releases: WorkflowReleaseCatalog |
     setCompareRight((current) => current || (alternative ? `${alternative.workflow_id}@${alternative.revision}` : ""));
   }, [releaseKey]);
   useEffect(() => {
-    if (!compareLeft || !compareRight || compareLeft === compareRight) { setComparison(null); return; }
+    if (tab !== "compare" || !compareLeft || !compareRight || compareLeft === compareRight) { setComparison(null); return; }
     const release = (value: string) => releaseOptions.find((item) => `${item.workflow_id}@${item.revision}` === value);
     const left = release(compareLeft); const right = release(compareRight);
     if (!left || !right) { setComparison(null); return; }
@@ -1855,7 +2045,7 @@ function MetricsPage({ releases, onError }: { releases: WorkflowReleaseCatalog |
       ...(filters.productionResult ? { productionResult: filters.productionResult } : {}),
     }).then((value) => { if (active) setComparison(value); }).catch((error: Error) => { if (active) onError(error.message); });
     return () => { active = false; };
-  }, [compareLeft, compareRight, filterKey, releaseKey]);
+  }, [tab, compareLeft, compareRight, filterKey, releaseKey]);
   const toggleLabel = (label: string) => setFilters((current) => ({ ...current, labels: current.labels.includes(label) ? current.labels.filter((item) => item !== label) : [...current.labels, label] }));
   const releaseName = (value: string) => { const release = releaseOptions.find((item) => `${item.workflow_id}@${item.revision}` === value); return release ? `${release.definition.name} · v${release.version} · ${release.is_default ? "Default" : release.label}` : value; };
   const delta = (metric: keyof WorkflowComparisonReport["deltas"], kind: "rate" | "duration" | "cost" | "tokens") => {
@@ -1863,19 +2053,54 @@ function MetricsPage({ releases, onError }: { releases: WorkflowReleaseCatalog |
     const absolute = kind === "rate" ? `${value.absolute >= 0 ? "+" : ""}${(value.absolute * 100).toFixed(1)} pp` : kind === "duration" ? `${value.absolute >= 0 ? "+" : "−"}${duration(Math.abs(value.absolute))}` : kind === "cost" ? `${value.absolute >= 0 ? "+" : "−"}${usd(Math.abs(value.absolute))}` : `${value.absolute >= 0 ? "+" : "−"}${tokenCount(Math.abs(value.absolute))}`;
     return `${absolute}${value.percent === null ? "" : ` · ${value.percent >= 0 ? "+" : ""}${(value.percent * 100).toFixed(1)}%`}`;
   };
+  const clearFilters = () => setFilters({ from: "", to: "", labels: [], labelMode: "any", workflowId: "", workflowRevision: "", productionResult: "" });
+  const activeFilterCount = Number(Boolean(filters.from)) + Number(Boolean(filters.to)) + filters.labels.length + Number(Boolean(filters.workflowId)) + Number(Boolean(filters.workflowRevision)) + Number(Boolean(filters.productionResult));
+  const allNodes = report?.workflows.flatMap((workflow) => workflow.nodes) ?? [];
+  const slowestNode = [...allNodes].filter((node) => node.wall_ms.median !== null).sort((left, right) => (right.wall_ms.median ?? 0) - (left.wall_ms.median ?? 0))[0];
+  const leastReliableNode = [...allNodes].filter((node) => node.success_rate !== null && node.runs > 0).sort((left, right) => (left.success_rate ?? 1) - (right.success_rate ?? 1))[0];
+  const mostExpensiveNode = [...allNodes].filter((node) => node.telemetry_coverage.cost_runs > 0 && node.runs > 0).sort((left, right) => (right.known_cost_usd / right.runs) - (left.known_cost_usd / left.runs))[0];
+  const completionRate = report?.totals.tickets ? report.totals.completed / report.totals.tickets : null;
+  const observedRuntime = report ? report.totals.active_ms + report.totals.human_wait_ms + report.totals.external_wait_ms + report.totals.quota_paused_ms : 0;
+  const runtimeSegments = report ? [
+    { label: "Active", value: report.totals.active_ms, className: "active" },
+    { label: "Human wait", value: report.totals.human_wait_ms, className: "human" },
+    { label: "External wait", value: report.totals.external_wait_ms, className: "external" },
+    { label: "Quota paused", value: report.totals.quota_paused_ms, className: "quota" },
+  ] : [];
+  const workflowReliability = report && <section className="workflow-metrics"><div className="section-heading"><div><span>Workflow reliability</span><h2>Nodes and branches</h2></div><small>Grouped by immutable workflow revision</small></div>
+    {report.workflows.map((workflow) => <details key={`${workflow.workflow_id}@${workflow.workflow_revision}`} open={report.workflows.length === 1}><summary><strong>{humanize(workflow.workflow_id)}</strong><code>{workflow.workflow_revision.slice(0, 12)}</code><span>{workflow.ticket_count} tickets · {workflow.nodes.reduce((sum, node) => sum + node.runs, 0)} runs</span></summary><div className="node-metrics-grid">{workflow.nodes.map((node) => <article key={node.node_id} className="node-metric-card">
+      <header><div><span>{humanize(node.node_type)}</span><h3>{node.node_name}</h3></div><strong>{node.success_rate === null ? "—" : `${(node.success_rate * 100).toFixed(0)}%`}</strong></header>
+      <p>{node.classifications.success} success · {node.classifications.failure} failure · {node.classifications.neutral} neutral · {node.classifications.unclassified} unclassified</p>
+      <div className="reliability-bar"><i style={{ width: `${node.success_rate === null ? 0 : node.success_rate * 100}%` }} /></div>
+      <dl><div><dt>Runs</dt><dd>{node.runs}</dd></div><div><dt>Median</dt><dd>{formatMetric(node.wall_ms.median, "duration")}</dd></div><div><dt>Tokens</dt><dd>{node.telemetry_coverage.token_runs ? tokenCount(node.total_tokens) : "—"}</dd></div><div><dt>Cost</dt><dd>{node.telemetry_coverage.cost_runs ? usd(node.known_cost_usd) : "—"}</dd></div></dl>
+      {(node.interrupted > 0 || node.lease_lost > 0 || node.delivery_failed > 0 || node.bypassed > 0) && <small>{node.interrupted} interrupted · {node.lease_lost} lease lost · {node.delivery_failed} delivery failed · {node.bypassed} bypassed</small>}
+      {node.branches.length > 0 && <div className="branch-metrics"><strong>Branches taken</strong>{node.branches.map((branch) => <div key={branch.outcome}><span><i className={`metric-${branch.metric_class}`} />{branch.label}{branch.target ? ` → ${humanize(branch.target)}` : ""}</span><b>{branch.count} · {(branch.rate * 100).toFixed(0)}%</b></div>)}</div>}
+      {(node.quality ?? []).length > 0 && <div className="quality-metrics"><strong>Quality attributes</strong>{node.quality.map((quality) => <div key={`${quality.key}/${quality.type}/${quality.unit}/${quality.direction}`}><span><i className={quality.statuses.fail ? "metric-failure" : quality.statuses.warn ? "metric-neutral" : "metric-success"} />{quality.label}<small>{quality.numeric?.median !== null && quality.numeric ? `Median ${quality.numeric.median}${quality.unit ? ` ${quality.unit}` : ""}` : quality.values.slice(0, 2).map((item) => `${item.value} (${item.count})`).join(", ")}</small></span><b>{quality.pass_rate === null ? "—" : `${(quality.pass_rate * 100).toFixed(0)}% pass`} · n={quality.ticket_count}</b></div>)}</div>}
+    </article>)}</div></details>)}
+    {!report.workflows.length && <div className="empty-health"><h2>No workflow runs match these filters</h2></div>}
+  </section>;
   return <main className="metrics-page">
     <div className="health-heading"><div><span>Operational intelligence</span><h1>Factory metrics</h1><p>Execution reliability, branch behavior, production outcomes, cost, tokens, and elapsed time from durable ticket history.</p></div><div className="health-summary"><strong>{loading ? "…" : report?.totals.tickets ?? 0}</strong><span>filtered tickets</span></div></div>
-    <section className="metrics-filters">
+    <section className="metrics-filter-shell" aria-label="Metrics filters">
+      <div className="metrics-filter-primary">
       <label>From<input aria-label="Metrics from date" type="date" value={filters.from} onChange={(event) => setFilters({ ...filters, from: event.target.value })} /></label>
       <label>To<input aria-label="Metrics to date" type="date" value={filters.to} onChange={(event) => setFilters({ ...filters, to: event.target.value })} /></label>
       <label>Workflow<select aria-label="Metrics workflow" value={filters.workflowId} onChange={(event) => setFilters({ ...filters, workflowId: event.target.value, workflowRevision: "" })}><option value="">All workflows</option>{[...new Set(report?.available.workflows.map((item) => item.id) ?? [])].map((id) => <option key={id} value={id}>{humanize(id)}</option>)}</select></label>
       <label>Revision<select aria-label="Metrics workflow revision" disabled={!filters.workflowId} value={filters.workflowRevision} onChange={(event) => setFilters({ ...filters, workflowRevision: event.target.value })}><option value="">All revisions</option>{report?.available.workflows.filter((item) => item.id === filters.workflowId).map((item) => <option key={item.revision} value={item.revision}>{item.revision.slice(0, 12)}</option>)}</select></label>
+      <details className="metrics-more-filters"><summary>More filters{activeFilterCount > 0 ? ` (${activeFilterCount})` : ""}</summary><div>
       <label>Production<select aria-label="Metrics production result" value={filters.productionResult} onChange={(event) => setFilters({ ...filters, productionResult: event.target.value })}><option value="">All outcomes</option><option value="unassessed">Unassessed</option><option value="succeeded">Succeeded</option><option value="failed">Failed</option><option value="rolled_back">Rolled back</option><option value="not_deployed">Not deployed</option></select></label>
       <label>Label matching<select aria-label="Metrics label matching" value={filters.labelMode} onChange={(event) => setFilters({ ...filters, labelMode: event.target.value as "any" | "all" })}><option value="any">Any selected label</option><option value="all">All selected labels</option></select></label>
       <div className="metrics-label-filter"><span>Labels</span><div>{report?.available.labels.map((label) => <button className={filters.labels.includes(label) ? "active" : ""} key={label} onClick={() => toggleLabel(label)}>{label}</button>)}{!report?.available.labels.length && <small>No labels recorded</small>}</div></div>
-      <button className="button-secondary" disabled={!filters.from && !filters.to && !filters.labels.length && !filters.workflowId && !filters.productionResult} onClick={() => setFilters({ from: "", to: "", labels: [], labelMode: "any", workflowId: "", workflowRevision: "", productionResult: "" })}>Clear filters</button>
+      </div></details>
+      <button className="button-secondary" disabled={activeFilterCount === 0} onClick={clearFilters}>Clear</button>
+      </div>
+      {activeFilterCount > 0 && <div className="metrics-filter-chips"><span>Active:</span>{filters.from && <button onClick={() => setFilters({ ...filters, from: "" })}>From {filters.from} ×</button>}{filters.to && <button onClick={() => setFilters({ ...filters, to: "" })}>To {filters.to} ×</button>}{filters.workflowId && <button onClick={() => setFilters({ ...filters, workflowId: "", workflowRevision: "" })}>{humanize(filters.workflowId)} ×</button>}{filters.workflowRevision && <button onClick={() => setFilters({ ...filters, workflowRevision: "" })}>{filters.workflowRevision.slice(0, 12)} ×</button>}{filters.productionResult && <button onClick={() => setFilters({ ...filters, productionResult: "" })}>{humanize(filters.productionResult)} ×</button>}{filters.labels.map((label) => <button key={label} onClick={() => toggleLabel(label)}>{label} ×</button>)}</div>}
     </section>
-    {releaseOptions.length > 0 && <section className="workflow-comparison content-card"><div className="section-heading"><div><span>Experiment analysis</span><h2>Compare workflow revisions</h2></div><small>Efficiency uses completed, non-crossover tickets</small></div><div className="comparison-selectors"><label>Baseline<select aria-label="Comparison baseline" value={compareLeft} onChange={(event) => setCompareLeft(event.target.value)}>{releaseOptions.map((release) => { const value = `${release.workflow_id}@${release.revision}`; return <option key={value} value={value}>{releaseName(value)}</option>; })}</select></label><span>versus</span><label>Candidate<select aria-label="Comparison candidate" value={compareRight} onChange={(event) => setCompareRight(event.target.value)}><option value="">Choose a revision</option>{releaseOptions.map((release) => { const value = `${release.workflow_id}@${release.revision}`; return <option key={value} value={value}>{releaseName(value)}</option>; })}</select></label></div>{comparison && <>
+    <nav className="metrics-tabs" role="tablist" aria-label="Metrics views">{([
+      ["overview", "Overview"], ["runtime", "Runtime"], ["reliability", "Reliability"], ["cost", "Cost & usage"], ["compare", "Compare"],
+    ] as Array<[MetricsTab, string]>).map(([id, label]) => <button key={id} role="tab" aria-selected={tab === id} className={tab === id ? "active" : ""} onClick={() => setTab(id)}>{label}</button>)}</nav>
+    {tab === "compare" && releaseOptions.length > 0 && <section className="workflow-comparison content-card"><div className="section-heading"><div><span>Experiment analysis</span><h2>Compare workflow revisions</h2></div><small>Efficiency uses completed, non-crossover tickets</small></div><div className="comparison-selectors"><label>Baseline<select aria-label="Comparison baseline" value={compareLeft} onChange={(event) => setCompareLeft(event.target.value)}>{releaseOptions.map((release) => { const value = `${release.workflow_id}@${release.revision}`; return <option key={value} value={value}>{releaseName(value)}</option>; })}</select></label><span>versus</span><label>Candidate<select aria-label="Comparison candidate" value={compareRight} onChange={(event) => setCompareRight(event.target.value)}><option value="">Choose a revision</option>{releaseOptions.map((release) => { const value = `${release.workflow_id}@${release.revision}`; return <option key={value} value={value}>{releaseName(value)}</option>; })}</select></label></div>{comparison && <>
+      <div className="comparison-deltas"><ExecutiveMetric label="Completion difference" value={delta("completion_rate", "rate")} detail="Candidate compared with baseline" coverage={`${comparison.left.cohort.assigned} vs ${comparison.right.cohort.assigned} assigned`} /><ExecutiveMetric label="Delivery-time difference" value={delta("median_duration_ms", "duration")} detail="Median elapsed time" coverage={`${comparison.left.summaries.ticket_duration_ms.count} vs ${comparison.right.summaries.ticket_duration_ms.count} measured`} /><ExecutiveMetric label="Cost difference" value={delta("median_cost_usd", "cost")} detail="Median cost per eligible ticket" coverage={`${comparison.left.coverage.cost_tickets} vs ${comparison.right.coverage.cost_tickets} covered`} /></div>
       <div className="comparison-cohorts"><article><strong>{releaseName(compareLeft)}</strong><span>{comparison.left.cohort.completed}/{comparison.left.cohort.assigned} completed</span><small>{comparison.left.cohort.failed} failed · {comparison.left.cohort.cancelled} cancelled · {comparison.left.cohort.in_progress} in progress ({comparison.left.cohort.blocked} blocked) · {comparison.left.cohort.crossover} crossover</small></article><article><strong>{releaseName(compareRight)}</strong><span>{comparison.right.cohort.completed}/{comparison.right.cohort.assigned} completed</span><small>{comparison.right.cohort.failed} failed · {comparison.right.cohort.cancelled} cancelled · {comparison.right.cohort.in_progress} in progress ({comparison.right.cohort.blocked} blocked) · {comparison.right.cohort.crossover} crossover</small></article></div>
       <table className="comparison-table"><thead><tr><th>Metric</th><th>Baseline</th><th>Candidate</th><th>Difference</th></tr></thead><tbody>
         <tr><td>Completion rate</td><td>{comparison.left.completion_rate === null ? "—" : `${(comparison.left.completion_rate * 100).toFixed(1)}%`}</td><td>{comparison.right.completion_rate === null ? "—" : `${(comparison.right.completion_rate * 100).toFixed(1)}%`}</td><td>{delta("completion_rate", "rate")}</td></tr>
@@ -1887,42 +2112,55 @@ function MetricsPage({ releases, onError }: { releases: WorkflowReleaseCatalog |
       </tbody></table><p className="metrics-coverage">Cost coverage: {comparison.left.coverage.cost_tickets}/{comparison.left.coverage.eligible_tickets} baseline and {comparison.right.coverage.cost_tickets}/{comparison.right.coverage.eligible_tickets} candidate tickets. Token coverage: {comparison.left.coverage.token_tickets}/{comparison.left.coverage.eligible_tickets} and {comparison.right.coverage.token_tickets}/{comparison.right.coverage.eligible_tickets}. Manual trial assignment may introduce selection bias.</p>
       <div className="comparison-nodes"><article><h3>Baseline nodes</h3>{comparison.left.nodes.map((node) => <div key={node.node_id}><span>{node.node_name}{(node.quality ?? []).map((quality) => <small key={`${quality.key}/${quality.type}/${quality.unit}/${quality.direction}`}>{quality.label}: {quality.numeric?.median ?? quality.values[0]?.value ?? "—"}{quality.unit ? ` ${quality.unit}` : ""} · {quality.pass_rate === null ? "unclassified" : `${(quality.pass_rate * 100).toFixed(0)}% pass`}</small>)}</span><strong>{node.success_rate === null ? "—" : `${(node.success_rate * 100).toFixed(0)}%`} · n={node.runs}</strong></div>)}</article><article><h3>Candidate nodes</h3>{comparison.right.nodes.map((node) => <div key={node.node_id}><span>{node.node_name}{(node.quality ?? []).map((quality) => <small key={`${quality.key}/${quality.type}/${quality.unit}/${quality.direction}`}>{quality.label}: {quality.numeric?.median ?? quality.values[0]?.value ?? "—"}{quality.unit ? ` ${quality.unit}` : ""} · {quality.pass_rate === null ? "unclassified" : `${(quality.pass_rate * 100).toFixed(0)}% pass`}</small>)}</span><strong>{node.success_rate === null ? "—" : `${(node.success_rate * 100).toFixed(0)}%`} · n={node.runs}</strong></div>)}</article></div>
     </>}</section>}
+    {tab === "compare" && releaseOptions.length === 0 && <div className="empty-health"><h2>No workflow revisions are available to compare</h2></div>}
     {report && <>
-      <section className="metrics-kpis">
-        <div><span>Total tickets</span><strong>{report.totals.tickets}</strong><small>{report.totals.completed} completed · {report.totals.archived} archived</small></div>
-        <div><span>Total tokens</span><strong>{report.coverage.token_runs ? tokenCount(report.totals.total_tokens) : "Unavailable"}</strong><small>{report.coverage.token_runs}/{report.coverage.agent_runs} agent runs covered</small></div>
-        <div><span>Known cost</span><strong>{report.coverage.cost_runs ? usd(report.totals.known_cost_usd) : "Unavailable"}</strong><small>{report.coverage.cost_runs}/{report.coverage.agent_runs} runs · {report.coverage.estimated_cost_runs} estimated</small></div>
-        <div><span>Active runtime</span><strong>{duration(report.totals.active_ms)}</strong><small>{duration(report.totals.quota_paused_ms)} quota paused · {duration(report.totals.external_wait_ms)} external wait</small></div>
-        <div><span>Production success</span><strong>{report.totals.production_success_rate === null ? "—" : `${(report.totals.production_success_rate * 100).toFixed(1)}%`}</strong><small>{report.totals.production.succeeded} succeeded · {report.totals.production.failed + report.totals.production.rolled_back} failed/rolled back</small></div>
-        <div><span>Estimated human work</span><strong>{(report.totals.estimated_human_days ?? 0).toLocaleString()} days</strong><small>{usd(report.totals.estimated_human_cost_usd ?? 0)} at {usd(report.totals.human_day_rate_usd ?? 1_000)}/day</small></div>
-      </section>
-      <p className="metrics-coverage">Cost and token totals include only observed values. Per-ticket summaries require complete coverage for every completed agent run: {report.coverage.complete_cost_tickets} tickets have complete cost and {report.coverage.complete_token_tickets} have complete token coverage. Unknown subscription cost is never treated as zero.</p>
-      <section className="five-number-grid">
+      {tab === "overview" && <>
+        <section className="executive-metrics" aria-label="Executive summary">
+          <ExecutiveMetric label="Median delivery time" value={formatMetric(report.summaries.ticket_duration_ms.median, "duration")} detail={`P90 ${formatMetric(report.summaries.ticket_duration_ms.p90, "duration")} · ${duration(report.totals.active_ms)} total active`} coverage={`${report.summaries.ticket_duration_ms.count} completed tickets measured`} />
+          <ExecutiveMetric label="Completion rate" value={completionRate === null ? "—" : `${(completionRate * 100).toFixed(1)}%`} detail={`Production success ${report.totals.production_success_rate === null ? "—" : `${(report.totals.production_success_rate * 100).toFixed(1)}%`}`} coverage={`${report.totals.completed}/${report.totals.tickets} completed · ${report.totals.production_assessed} production assessed`} />
+          <ExecutiveMetric label="Median factory cost" value={formatMetric(report.summaries.cost_per_ticket_usd.median, "cost")} detail={`${report.coverage.cost_runs ? usd(report.totals.known_cost_usd) : "No observed cost"} total known cost`} coverage={`${report.coverage.complete_cost_tickets}/${report.totals.completed} completed tickets fully covered`} />
+        </section>
+        {(report.coverage.complete_cost_tickets < report.totals.completed || report.coverage.complete_token_tickets < report.totals.completed) && <p className="metrics-coverage metrics-coverage-warning">Some completed tickets have incomplete telemetry. Unknown subscription cost is not treated as zero.</p>}
+        <section className="metrics-overview-grid">
+          <article className="content-card runtime-composition"><div className="section-heading"><div><span>Runtime composition</span><h2>Where elapsed time is recorded</h2></div><small>{duration(observedRuntime)} observed</small></div><div className="runtime-stack" aria-label="Runtime composition">{runtimeSegments.map((segment) => <i key={segment.label} className={segment.className} style={{ width: `${observedRuntime ? Math.max(1, segment.value / observedRuntime * 100) : 0}%` }} title={`${segment.label}: ${duration(segment.value)}`} />)}</div><div className="runtime-legend">{runtimeSegments.map((segment) => <span key={segment.label}><i className={segment.className} />{segment.label}<strong>{duration(segment.value)}</strong></span>)}</div></article>
+          <article className="content-card metric-insights"><div className="section-heading"><div><span>Where to look</span><h2>Operational signals</h2></div><small>Descriptive, not threshold-based</small></div><div><span><small>Slowest median node</small><strong>{slowestNode?.node_name ?? "Not enough data"}</strong><b>{slowestNode ? formatMetric(slowestNode.wall_ms.median, "duration") : "—"}</b></span><span><small>Lowest observed success</small><strong>{leastReliableNode?.node_name ?? "Not enough data"}</strong><b>{leastReliableNode?.success_rate === null || !leastReliableNode ? "—" : `${(leastReliableNode.success_rate * 100).toFixed(0)}% · n=${leastReliableNode.runs}`}</b></span><span><small>Highest cost per run</small><strong>{mostExpensiveNode?.node_name ?? "Not enough data"}</strong><b>{mostExpensiveNode ? usd(mostExpensiveNode.known_cost_usd / mostExpensiveNode.runs) : "—"}</b></span></div></article>
+        </section>
+        <section className="production-metrics content-card"><div className="section-heading"><div><span>Delivery funnel</span><h2>Production outcomes</h2></div><small>{report.totals.production_assessed}/{report.totals.tickets} assessed</small></div><div>{Object.entries(report.totals.production).map(([result, count]) => <div key={result}><span>{humanize(result)}</span><strong>{count}</strong><progress max={Math.max(1, report.totals.tickets)} value={count} /></div>)}</div></section>
+      </>}
+      {tab === "runtime" && <>
+        <div className="metrics-tab-heading"><span>Delivery speed</span><h2>Runtime and waiting</h2><p>End-to-end elapsed time is separated from active execution and deliberate waiting.</p></div>
+        <section className="five-number-grid runtime-summary-grid">
         <FiveNumberCard title="Ticket duration" summary={report.summaries.ticket_duration_ms} kind="duration" />
         <FiveNumberCard title="Active time / ticket" summary={report.summaries.active_time_ms} kind="duration" />
         <FiveNumberCard title="Human wait / ticket" summary={report.summaries.human_wait_ms} kind="duration" />
         {report.summaries.external_wait_ms && <FiveNumberCard title="External wait / ticket" summary={report.summaries.external_wait_ms} kind="duration" />}
         <FiveNumberCard title="Quota pause / ticket" summary={report.summaries.quota_pause_ms} kind="duration" />
+        </section>
+        <section className="content-card runtime-node-ranking"><div className="section-heading"><div><span>Bottlenecks</span><h2>Node runtime</h2></div><small>Ranked by median wall time</small></div><table><thead><tr><th>Node</th><th>Runs</th><th>Median</th><th>P90</th><th>Total active</th><th>Wait / pause</th></tr></thead><tbody>{[...allNodes].sort((left, right) => (right.wall_ms.median ?? 0) - (left.wall_ms.median ?? 0)).map((node) => <tr key={`${node.workflow_revision}/${node.node_id}`}><td><strong>{node.node_name}</strong><small>{humanize(node.node_type)}</small></td><td>{node.runs}</td><td>{formatMetric(node.wall_ms.median, "duration")}</td><td>{formatMetric(node.wall_ms.p90, "duration")}</td><td>{duration(node.active_ms)}</td><td>{duration(node.human_wait_ms + node.external_wait_ms + node.quota_paused_ms)}</td></tr>)}</tbody></table>{allNodes.length === 0 && <p>No node runtimes match these filters.</p>}</section>
+      </>}
+      {tab === "reliability" && <>
+        <div className="metrics-tab-heading"><span>Delivery confidence</span><h2>Reliability and outcomes</h2><p>Ticket completion, production assessment, node outcomes, loops, and quality evidence.</p></div>
+        <section className="reliability-kpis"><ExecutiveMetric label="Ticket completion" value={completionRate === null ? "—" : `${(completionRate * 100).toFixed(1)}%`} detail={`${report.totals.completed} completed of ${report.totals.tickets} filtered`} coverage="Includes unsettled tickets in the denominator" /><ExecutiveMetric label="Production success" value={report.totals.production_success_rate === null ? "—" : `${(report.totals.production_success_rate * 100).toFixed(1)}%`} detail={`${report.totals.production.succeeded} succeeded · ${report.totals.production.failed + report.totals.production.rolled_back} failed or rolled back`} coverage={`${report.totals.production_assessed} tickets assessed`} /></section>
+        <section className="production-metrics content-card"><div className="section-heading"><div><span>Deployment evidence</span><h2>Production outcomes</h2></div><small>{report.totals.production_assessed}/{report.totals.tickets} assessed</small></div><div>{Object.entries(report.totals.production).map(([result, count]) => <div key={result}><span>{humanize(result)}</span><strong>{count}</strong><progress max={Math.max(1, report.totals.tickets)} value={count} /></div>)}</div></section>
+        {workflowReliability}
+      </>}
+      {tab === "cost" && <>
+        <div className="metrics-tab-heading"><span>Factory economics</span><h2>Cost and usage</h2><p>Observed and estimated spend, token use, and planning comparisons with human effort.</p></div>
+        <section className="metrics-kpis cost-kpis">
+          <div><span>Total tokens</span><strong>{report.coverage.token_runs ? tokenCount(report.totals.total_tokens) : "Unavailable"}</strong><small>{report.coverage.token_runs}/{report.coverage.agent_runs} agent runs covered</small></div>
+          <div><span>Known cost</span><strong>{report.coverage.cost_runs ? usd(report.totals.known_cost_usd) : "Unavailable"}</strong><small>{report.coverage.cost_runs}/{report.coverage.agent_runs} runs · {report.coverage.estimated_cost_runs} estimated</small></div>
+          <div><span>Estimated human work</span><strong>{(report.totals.estimated_human_days ?? 0).toLocaleString()} days</strong><small>{usd(report.totals.estimated_human_cost_usd ?? 0)} at {usd(report.totals.human_day_rate_usd ?? 1_000)}/day</small></div>
+        </section>
+        <p className="metrics-coverage">Cost and token totals include only observed values. Per-ticket summaries require complete coverage for every completed agent run: {report.coverage.complete_cost_tickets} tickets have complete cost and {report.coverage.complete_token_tickets} have complete token coverage.</p>
+        <section className="five-number-grid cost-summary-grid">
         <FiveNumberCard title="Tokens / ticket" summary={report.summaries.tokens_per_ticket} kind="tokens" />
         <FiveNumberCard title="Cost / ticket" summary={report.summaries.cost_per_ticket_usd} kind="cost" />
         <FiveNumberCard title="Estimated human days" summary={report.summaries.estimated_human_days} kind="number" />
         <FiveNumberCard title="Estimated human cost" summary={report.summaries.estimated_human_cost_usd} kind="cost" />
-      </section>
-      <section className="human-comparison content-card"><div className="section-heading"><div><span>Cost comparison</span><h2>Human estimate vs factory</h2></div><small>{report.totals.comparison_tickets} completed ticket{report.totals.comparison_tickets === 1 ? "" : "s"} with human estimates and complete factory cost</small></div><div className="metric-grid"><div><span>Human estimate</span><strong>{usd(report.totals.comparison_human_cost_usd)}</strong></div><div><span>Factory cost</span><strong>{usd(report.totals.comparison_factory_cost_usd)}</strong></div><div><span>Estimated savings</span><strong>{usd(report.totals.comparison_savings_usd)}</strong></div><div><span>Cost reduction</span><strong>{report.totals.comparison_savings_rate === null ? "—" : `${(report.totals.comparison_savings_rate * 100).toFixed(1)}%`}</strong></div></div><p>Human values are planning estimates, not measured labor. Factory comparison includes only completed tickets with complete agent-run cost coverage.</p></section>
-      <section className="production-metrics content-card"><div className="section-heading"><div><span>Deployment evidence</span><h2>Production outcomes</h2></div><small>{report.totals.production_assessed}/{report.totals.tickets} assessed</small></div><div>{Object.entries(report.totals.production).map(([result, count]) => <div key={result}><span>{humanize(result)}</span><strong>{count}</strong><progress max={Math.max(1, report.totals.tickets)} value={count} /></div>)}</div></section>
-      <section className="workflow-metrics"><div className="section-heading"><div><span>Workflow reliability</span><h2>Nodes and branches</h2></div><small>Grouped by immutable workflow revision</small></div>
-        {report.workflows.map((workflow) => <details key={`${workflow.workflow_id}@${workflow.workflow_revision}`} open={report.workflows.length === 1}><summary><strong>{humanize(workflow.workflow_id)}</strong><code>{workflow.workflow_revision.slice(0, 12)}</code><span>{workflow.ticket_count} tickets · {workflow.nodes.reduce((sum, node) => sum + node.runs, 0)} runs</span></summary><div className="node-metrics-grid">{workflow.nodes.map((node) => <article key={node.node_id} className="node-metric-card">
-          <header><div><span>{humanize(node.node_type)}</span><h3>{node.node_name}</h3></div><strong>{node.success_rate === null ? "—" : `${(node.success_rate * 100).toFixed(0)}%`}</strong></header>
-          <p>{node.classifications.success} success · {node.classifications.failure} failure · {node.classifications.neutral} neutral · {node.classifications.unclassified} unclassified</p>
-          <div className="reliability-bar"><i style={{ width: `${node.success_rate === null ? 0 : node.success_rate * 100}%` }} /></div>
-          <dl><div><dt>Runs</dt><dd>{node.runs}</dd></div><div><dt>Median</dt><dd>{formatMetric(node.wall_ms.median, "duration")}</dd></div><div><dt>Tokens</dt><dd>{node.telemetry_coverage.token_runs ? tokenCount(node.total_tokens) : "—"}</dd></div><div><dt>Cost</dt><dd>{node.telemetry_coverage.cost_runs ? usd(node.known_cost_usd) : "—"}</dd></div></dl>
-          {(node.interrupted > 0 || node.lease_lost > 0 || node.delivery_failed > 0 || node.bypassed > 0) && <small>{node.interrupted} interrupted · {node.lease_lost} lease lost · {node.delivery_failed} delivery failed · {node.bypassed} bypassed</small>}
-          {node.branches.length > 0 && <div className="branch-metrics"><strong>Branches taken</strong>{node.branches.map((branch) => <div key={branch.outcome}><span><i className={`metric-${branch.metric_class}`} />{branch.label}{branch.target ? ` → ${humanize(branch.target)}` : ""}</span><b>{branch.count} · {(branch.rate * 100).toFixed(0)}%</b></div>)}</div>}
-          {(node.quality ?? []).length > 0 && <div className="quality-metrics"><strong>Quality attributes</strong>{node.quality.map((quality) => <div key={`${quality.key}/${quality.type}/${quality.unit}/${quality.direction}`}><span><i className={quality.statuses.fail ? "metric-failure" : quality.statuses.warn ? "metric-neutral" : "metric-success"} />{quality.label}<small>{quality.numeric?.median !== null && quality.numeric ? `Median ${quality.numeric.median}${quality.unit ? ` ${quality.unit}` : ""}` : quality.values.slice(0, 2).map((item) => `${item.value} (${item.count})`).join(", ")}</small></span><b>{quality.pass_rate === null ? "—" : `${(quality.pass_rate * 100).toFixed(0)}% pass`} · n={quality.ticket_count}</b></div>)}</div>}
-        </article>)}</div></details>)}
-        {!report.workflows.length && <div className="empty-health"><h2>No workflow runs match these filters</h2></div>}
-      </section>
-      {report.profiles.length > 0 && <section className="profile-metrics content-card"><div className="section-heading"><div><span>Agent runtime</span><h2>Resolved profiles</h2></div></div><div>{report.profiles.map((profile) => <article key={`${profile.alias}/${profile.provider}/${profile.model}/${profile.reasoning}`}><div><strong>{profile.alias}</strong><small>{[profile.provider, profile.model, profile.reasoning].filter(Boolean).join(" · ")}</small></div><span>{profile.runs} runs</span><span>{profile.success_rate === null ? "—" : `${(profile.success_rate * 100).toFixed(0)}% success`}</span><span>{profile.token_runs ? tokenCount(profile.total_tokens) : "Tokens unavailable"}</span><span>{profile.cost_runs ? usd(profile.known_cost_usd) : "Cost unavailable"}</span></article>)}</div></section>}
+        </section>
+        <section className="human-comparison content-card"><div className="section-heading"><div><span>Cost comparison</span><h2>Human estimate vs factory</h2></div><small>{report.totals.comparison_tickets} completed ticket{report.totals.comparison_tickets === 1 ? "" : "s"} with human estimates and complete factory cost</small></div><div className="metric-grid"><div><span>Human estimate</span><strong>{usd(report.totals.comparison_human_cost_usd)}</strong></div><div><span>Factory cost</span><strong>{usd(report.totals.comparison_factory_cost_usd)}</strong></div><div><span>Estimated savings</span><strong>{usd(report.totals.comparison_savings_usd)}</strong></div><div><span>Cost reduction</span><strong>{report.totals.comparison_savings_rate === null ? "—" : `${(report.totals.comparison_savings_rate * 100).toFixed(1)}%`}</strong></div></div><p>Human values are planning estimates, not measured labor. Factory comparison includes only completed tickets with complete agent-run cost coverage.</p></section>
+        {report.profiles.length > 0 && <section className="profile-metrics content-card"><div className="section-heading"><div><span>Agent runtime</span><h2>Resolved profiles</h2></div></div><div>{report.profiles.map((profile) => <article key={`${profile.alias}/${profile.provider}/${profile.model}/${profile.reasoning}`}><div><strong>{profile.alias}</strong><small>{[profile.provider, profile.model, profile.reasoning].filter(Boolean).join(" · ")}</small></div><span>{profile.runs} runs</span><span>{profile.success_rate === null ? "—" : `${(profile.success_rate * 100).toFixed(0)}% success`}</span><span>{profile.token_runs ? tokenCount(profile.total_tokens) : "Tokens unavailable"}</span><span>{profile.cost_runs ? usd(profile.known_cost_usd) : "Cost unavailable"}</span></article>)}</div></section>}
+      </>}
     </>}
   </main>;
 }
@@ -1939,11 +2177,6 @@ function ProductionAssessment({ ticket, busy, onSave, onArchive }: { ticket: Tic
     <p>Production outcome is independent of workflow completion and can be changed after archival.</p>
   </section>;
 }
-
-const QUEUE_STATUS_RANK: Record<string, number> = {
-  blocked: 0, failed: 0, waiting_approval: 0,
-  running: 1, waiting_external: 1, ready: 2, pending: 3, completed: 4, cancelled: 5,
-};
 
 const INTAKE_LIMITS = { max_new_per_run: 3, max_new_per_day: 20, max_open: 20, max_working: 5, max_observed_unarchived: 30 };
 type IntakeEditorState = { kind: "campaign" | "source"; content: string; revision?: string; advanced: boolean };
@@ -2150,16 +2383,16 @@ function AttentionPage({ tickets, now, onOpen, onChanged, onError }: { tickets: 
   </main>;
 }
 
-function QueuePage({ tickets, includeArchived, setIncludeArchived, now, onOpen }: { tickets: TicketSummary[]; includeArchived: boolean; setIncludeArchived: (value: boolean) => void; now: number; onOpen: (id: string) => void }) {
+function QueuePage({ tickets, includeArchived, setIncludeArchived, now, onOpen, onCreate }: { tickets: TicketSummary[]; includeArchived: boolean; setIncludeArchived: (value: boolean) => void; now: number; onOpen: (id: string) => void; onCreate: () => void }) {
   const [query, setQuery] = useStoredState("agentic-project-tracker.queue.query", "");
   const [status, setStatus] = useStoredState("agentic-project-tracker.queue.status", "");
   const normalizedQuery = query.trim().toLowerCase();
   const filtered = [...tickets].filter((ticket) => (!status || ticket.status === status) && (!normalizedQuery || [ticket.id, ticket.title, ticket.workflow_node_name ?? "", ...(ticket.labels ?? []), ...(ticket.repositories ?? [])].some((value) => value.toLowerCase().includes(normalizedQuery))))
-    .sort((left, right) => (QUEUE_STATUS_RANK[left.status] ?? 9) - (QUEUE_STATUS_RANK[right.status] ?? 9) || right.priority - left.priority || (left.updated_at ?? left.created_at).localeCompare(right.updated_at ?? right.created_at) || left.id.localeCompare(right.id));
+    .sort((left, right) => (right.updated_at ?? right.created_at).localeCompare(left.updated_at ?? left.created_at) || left.id.localeCompare(right.id));
   return <main className="queue-page">
-    <div className="health-heading"><div><span>Work management</span><h1>Ticket queue</h1><p>Attention and active work stay above ready tickets, drafts, and finished work.</p></div><div className="health-summary"><strong>{filtered.length}</strong><span>visible tickets</span></div></div>
+    <div className="health-heading"><div><span>Work management</span><h1>Ticket queue</h1><p>Most recently updated tickets appear first.</p></div><div className="health-summary"><strong>{filtered.length}</strong><span>visible tickets</span></div></div>
     <section className="queue-toolbar"><label>Search<input aria-label="Search tickets" placeholder="ID, title, label, repository…" value={query} onChange={(event) => setQuery(event.target.value)} /></label><label>Status<select aria-label="Queue status" value={status} onChange={(event) => setStatus(event.target.value)}><option value="">All states</option>{["blocked", "failed", "waiting_approval", "running", "waiting_external", "ready", "pending", "completed", "cancelled"].map((value) => <option key={value} value={value}>{humanize(value)}</option>)}</select></label><label className="toggle queue-archive-toggle"><input type="checkbox" checked={includeArchived} onChange={(event) => setIncludeArchived(event.target.checked)} /><span><strong>Archived</strong><small>Include archived tickets</small></span></label></section>
-    <section className="queue-table-card"><table className="queue-table"><thead><tr><th>Ticket</th><th>State</th><th>Workflow</th><th>Agent</th><th>Repositories</th><th>Priority</th><th>Updated</th></tr></thead><tbody>{filtered.map((ticket) => <tr key={ticket.id} className={!ticket.valid ? "invalid" : ""} onClick={() => onOpen(ticket.id)}><td><button onClick={() => onOpen(ticket.id)}><strong>{ticket.id}</strong><span>{ticket.title}</span></button>{(ticket.claim_blockers ?? []).map((blocker) => <small key={`${blocker.hostname}:${blocker.ticket_id}`}>{blocker.repositories.join(", ")} blocked by {blocker.ticket_id} on {blocker.hostname}</small>)}</td><td><StatusPill value={ticket.valid ? ticket.status : "invalid"} subtle />{ticket.archived_at && <small>Archived</small>}</td><td><strong>{ticket.workflow_stage_name ?? humanize(ticket.phase)}</strong><small>{ticket.workflow_node_name ?? "Workflow unavailable"}</small></td><td><span>{ticket.provider ? humanize(ticket.provider) : "—"}</span><small>{ticket.assigned_supervisor ?? "Unassigned"}</small></td><td>{(ticket.repositories ?? []).join(", ") || "—"}</td><td>P{ticket.priority}</td><td>{timeAgo(ticket.updated_at || ticket.created_at, now)}</td></tr>)}</tbody></table>{!filtered.length && <div className="queue-empty-state"><h2>No tickets match this view</h2><p>Clear filters or include archived tickets.</p></div>}</section>
+    <section className="queue-table-card"><table className="queue-table"><thead><tr><th>Ticket</th><th>Ticket state</th><th>Workflow state</th><th>Executor</th><th>Repositories</th><th title="Higher numbers are scheduled first">Priority</th><th>Updated</th></tr></thead><tbody>{filtered.map((ticket) => <tr key={ticket.id} className={!ticket.valid ? "invalid" : ""} onClick={() => onOpen(ticket.id)}><td><button onClick={() => onOpen(ticket.id)}><strong>{ticket.id}</strong><span>{ticket.title}</span></button>{(ticket.claim_blockers ?? []).map((blocker) => <small key={`${blocker.hostname}:${blocker.ticket_id}`}>{blocker.repositories.join(", ")} blocked by {blocker.ticket_id} on {blocker.hostname}</small>)}</td><td><StatusPill value={ticket.valid ? ticket.status : "invalid"} subtle />{ticket.archived_at && <small>Archived</small>}</td><td><strong>{ticket.workflow_stage_name ?? humanize(ticket.phase)}</strong><small>{ticket.workflow_node_name ?? "Workflow unavailable"}</small></td><td><span>{ticket.provider ? humanize(ticket.provider) : "—"}</span><small>{ticket.assigned_supervisor ?? "Unassigned"}</small></td><td>{(ticket.repositories ?? []).join(", ") || "—"}</td><td title="Higher numbers are scheduled first">Priority {ticket.priority}</td><td>{timeAgo(ticket.updated_at || ticket.created_at, now)}</td></tr>)}</tbody></table>{!filtered.length && (tickets.length === 0 && !normalizedQuery && !status ? <div className="queue-empty-state"><h2>No tickets yet</h2><p>Create the first work ticket to begin.</p><button className="button-primary" onClick={onCreate}>＋ Create ticket</button></div> : <div className="queue-empty-state"><h2>No tickets match this view</h2><p>Clear the search or status filter, or include archived tickets.</p></div>)}</section>
   </main>;
 }
 
@@ -2438,10 +2671,10 @@ export function App() {
     try { window.localStorage.removeItem("agentic-project-tracker.selected-ticket"); } catch { /* storage may be disabled */ }
   };
   return <div className="app-shell">
-    <header className="topbar"><div className="brand"><div className="brand-mark">{theme === "retro" ? ">_" : "A"}</div><div><span>Agentic operations</span><strong>Project Tracker</strong></div></div><nav className="topnav"><button className={view === "attention" ? "active" : ""} onClick={() => setView("attention")}>Inbox <span>{attentionCount}</span></button><button className={view === "tickets" ? "active" : ""} onClick={showQueue}>Queue</button><button className={view === "intake" ? "active" : ""} onClick={() => setView("intake")}>Intake</button><button className={view === "metrics" ? "active" : ""} onClick={() => setView("metrics")}>Metrics</button><button className={view === "supervisors" ? "active" : ""} onClick={() => setView("supervisors")}>Operations <span>{supervisors.filter((item) => item.status === "online").length}</span></button><button className={view === "workflows" ? "active" : ""} onClick={() => setView("workflows")}>Workflows</button><button className={view === "prompts" ? "active" : ""} onClick={() => setView("prompts")}>Prompts</button><button className={view === "configuration" ? "active" : ""} onClick={() => setView("configuration")}>Configuration</button></nav><ThemeSelector theme={theme} onChange={setTheme} />{config?.jira?.enabled && <button className="button-secondary" disabled={busy} onClick={() => void beginJiraTicket()}>Import Jira</button>}<button className="button-primary" onClick={() => void beginLocalTicket()}>＋ New ticket</button></header>
+    <TopNavigation view={view} attentionCount={attentionCount} onlineSupervisors={supervisors.filter((item) => item.status === "online").length} jiraEnabled={Boolean(config?.jira?.enabled)} busy={busy} theme={theme} onView={setView} onQueue={showQueue} onNewTicket={() => void beginLocalTicket()} onImportJira={() => void beginJiraTicket()} onTheme={setTheme} />
     {view === "tickets" && <AgentFleet agents={runtime} now={now} onOpen={(id) => void open(id)} />}
     {error && <div className="error" role="alert"><strong>Something needs attention</strong><span>{error}</span><button onClick={() => setError(null)}>×</button></div>}
-    {view === "attention" ? <AttentionPage tickets={tickets} now={now} onOpen={(id) => void open(id)} onChanged={refresh} onError={setError} /> : view === "intake" ? <IntakePage repositories={config?.repositories ?? []} workflows={workflows} onOpenTicket={(id) => void open(id)} onError={setError} /> : view === "metrics" ? <MetricsPage releases={workflowReleases} onError={setError} /> : view === "workflows" ? <WorkflowEditorPage workflows={workflows} releases={workflowReleases} prompts={prompts} agentProfiles={config?.agent_profiles} onChanged={setWorkflows} onReleasesChanged={setWorkflowReleases} onError={setError} /> : view === "prompts" ? <PromptEditorPage prompts={prompts} onUpdated={(prompt) => setPrompts((current) => [...current.filter((item) => item.name !== prompt.name), prompt])} onError={setError} /> : view === "configuration" ? <ConfigurationPage config={config} quota={quotaReport} busy={busy} onSave={(update) => void saveConfig(update)} onRestoreDefaults={() => void restoreDefaults()} /> : view === "supervisors" ? <SupervisorHealthPage supervisors={supervisors} operations={operations} now={now} onOpenTicket={(id) => void open(id)} /> : !selected && !creating ? <QueuePage tickets={tickets} includeArchived={includeArchived} setIncludeArchived={setIncludeArchived} now={now} onOpen={(id) => void open(id)} /> : <main className="dashboard-layout detail-only">
+    {view === "attention" ? <AttentionPage tickets={tickets} now={now} onOpen={(id) => void open(id)} onChanged={refresh} onError={setError} /> : view === "intake" ? <IntakePage repositories={config?.repositories ?? []} workflows={workflows} onOpenTicket={(id) => void open(id)} onError={setError} /> : view === "metrics" ? <MetricsPage releases={workflowReleases} onError={setError} /> : view === "workflows" ? <WorkflowEditorPage workflows={workflows} releases={workflowReleases} prompts={prompts} agentProfiles={config?.agent_profiles} onChanged={setWorkflows} onReleasesChanged={setWorkflowReleases} onError={setError} /> : view === "prompts" ? <PromptEditorPage prompts={prompts} onUpdated={(prompt) => setPrompts((current) => [...current.filter((item) => item.name !== prompt.name), prompt])} onError={setError} /> : view === "configuration" ? <ConfigurationPage config={config} quota={quotaReport} busy={busy} onSave={(update) => void saveConfig(update)} onRestoreDefaults={() => void restoreDefaults()} /> : view === "supervisors" ? <SupervisorHealthPage supervisors={supervisors} operations={operations} githubObservationEnabled={Boolean(config?.github?.observation_enabled)} now={now} onOpenTicket={(id) => void open(id)} /> : !selected && !creating ? <QueuePage tickets={tickets} includeArchived={includeArchived} setIncludeArchived={setIncludeArchived} now={now} onOpen={(id) => void open(id)} onCreate={() => void beginLocalTicket()} /> : <main className="dashboard-layout detail-only">
       <section className="ticket-workspace">
         {creating ? <TicketEditor draft={draft} setDraft={(value) => { setDirty(true); setDraft(value); }} existing={false} busy={busy} repositories={config?.repositories ?? []} workflows={workflows} {...(workflowReleases ? { workflowReleases } : {})} onSave={() => void save()} onCancel={() => setCreating(false)} /> : selected ? !selected.valid ? <div className="invalid-editor">
           <div className="issue-heading"><div><span className="issue-key">Recovery editor</span><h1>{selected.relative_path}</h1><p>Repair the invalid Markdown before this ticket can be scheduled.</p></div></div>
@@ -2449,7 +2682,7 @@ export function App() {
           <textarea aria-label="Raw ticket Markdown" value={rawDraft} onChange={(event) => { setRawDraft(event.target.value); setDirty(true); }} />
           <div className="sticky-actions"><button className="button-primary" disabled={busy} onClick={() => void save()}>Save repaired ticket</button></div>
         </div> : frontmatter?.status === "pending" ? <TicketEditor draft={draft} setDraft={(value) => { setDirty(true); setDraft(value); }} existing busy={busy} repositories={config?.repositories ?? []} workflows={workflows} {...(workflowReleases ? { workflowReleases } : {})} existingAttachments={frontmatter.attachments} onRemoveAttachment={(id) => void removeAttachment(id)} onSave={() => void save()} onCancel={() => { setDraft(draftFromTicket(selected)); setDirty(false); }} onCustomizeWorkflow={() => void run(() => api.action(selected, "workflow/clone"))} onMigrateWorkflow={() => void migrateWorkflow()} onReady={() => void run(() => api.action(selected, "ready"))} readyDisabled={dirty} /> : frontmatter ? <div className="issue-page">
-          <div className="issue-heading"><div><span className="issue-key">{frontmatter.id} · {selected.relative_path}</span><h1>{frontmatter.title}</h1><div className="issue-chips"><StatusPill value={frontmatter.status} />{frontmatter.labels.map((label) => <span className="label-chip" key={label}>{label}</span>)}</div></div>
+          <div className="issue-heading"><div><span className="issue-key">{frontmatter.id} · {selected.relative_path}</span><h1>{frontmatter.title}</h1><div className="issue-chips"><span className="state-layer"><small>Ticket state</small><StatusPill value={frontmatter.status} label={`Ticket ${humanize(frontmatter.status)}`} /></span>{frontmatter.labels.map((label) => <span className="label-chip" key={label}>{label}</span>)}</div></div>
             <div className="issue-actions">
               <ActionButton onClick={() => setComposer({ kind: "comment", text: "" })}>Add comment</ActionButton>
               <ActionButton primary onClick={() => setComposer({ kind: "guidance", text: "" })}>Guide agent</ActionButton>
@@ -2485,9 +2718,10 @@ export function App() {
               <TicketQuality ticket={frontmatter} />
               {frontmatter.phase === "done" && frontmatter.status === "completed" && <ProductionAssessment ticket={frontmatter} busy={busy} onSave={(production_result, production_assessment_note) => void run(() => api.action(selected, "production-assessment", { production_result, production_assessment_note }))} onArchive={(production_result, production_assessment_note) => void run(() => api.action(selected, "archive", { production_result, production_assessment_note }))} />}
               <section className="side-card"><div className="section-heading"><div><span>Ticket</span><h2>Details</h2></div></div><dl className="details-list">
-                {currentWorkflowNode ? <><DetailRow label="Workflow node">{currentWorkflowNode.name}</DetailRow><DetailRow label="Stage">{currentWorkflowStage?.name ?? humanize(currentWorkflowNode.stage)}</DetailRow><DetailRow label="Node type">{humanize(currentWorkflowNode.type)}</DetailRow><DetailRow label="Assigned agent">{currentProvider ? humanize(currentProvider) : "Not an agent node"}</DetailRow></> : <DetailRow label="Workflow">Unavailable</DetailRow>}
-                {frontmatter.workflow_assignment && <DetailRow label="Workflow release">{assignedRelease ? `v${assignedRelease.version} · ${assignedRelease.label}` : `v${frontmatter.workflow_assignment.version}`} · {humanize(frontmatter.workflow_assignment.selection)}</DetailRow>}
-                <DetailRow label="Priority"><PriorityEditor value={frontmatter.priority} busy={busy} onSave={(priority) => void run(() => api.action(selected, "priority", { priority }))} /></DetailRow><DetailRow label="Updated">{timeAgo(frontmatter.updated_at, now)}</DetailRow>
+                <DetailRow label="Ticket state">{humanize(frontmatter.status)}</DetailRow>
+                {currentWorkflowNode ? <><DetailRow label="Current workflow node">{currentWorkflowNode.name}</DetailRow><DetailRow label="Workflow stage">{currentWorkflowStage?.name ?? humanize(currentWorkflowNode.stage)}</DetailRow><DetailRow label="Node type">{humanize(currentWorkflowNode.type)}</DetailRow><DetailRow label="Resolved agent provider">{currentProvider ? humanize(currentProvider) : "Not an agent node"}</DetailRow></> : <DetailRow label="Workflow state">Unavailable</DetailRow>}
+                {frontmatter.workflow_assignment && <DetailRow label="Workflow revision">{assignedRelease ? releaseDisplayLabel(assignedRelease) : `Revision v${frontmatter.workflow_assignment.version}`} · {humanize(frontmatter.workflow_assignment.selection)}</DetailRow>}
+                <DetailRow label="Ticket priority"><PriorityEditor value={frontmatter.priority} busy={busy} onSave={(priority) => void run(() => api.action(selected, "priority", { priority }))} /></DetailRow><DetailRow label="Updated">{timeAgo(frontmatter.updated_at, now)}</DetailRow>
                 <DetailRow label="Estimated human days"><HumanEstimateEditor value={frontmatter.estimated_human_days ?? null} busy={busy} onSave={(estimated_human_days) => void run(() => api.action(selected, "human-estimate", { estimated_human_days }))} /></DetailRow>
                 <DetailRow label="Supervisor">{frontmatter.assigned_supervisor ?? "Unassigned"}</DetailRow>
                 <DetailRow label="Supervisor host">{frontmatter.assigned_supervisor_host ?? "Unassigned"}</DetailRow>

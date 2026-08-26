@@ -602,6 +602,8 @@ The tracker persists provider, Herdr pane ID, native session reference, and one 
 
 For every Agent-node attempt, the supervisor also streams a UUID-scoped operational trace as immutable, contiguous JSONL chunks in the tracker artifact store. The trace records Herdr commands, timestamps, durations, bounded response metadata, stable errors, meaningful pane observations, and supervisor delivery/recovery decisions. Prompt and terminal bodies remain outside the trace; only their durable path, byte count, and digest are retained. Exact batch replays are idempotent and sequence gaps fail closed. Trace capture is observational and best effort, and cannot complete or fail a workflow node.
 
+The current provenance extension separately captures bounded readable Herdr scrollback and discoverable native harness JSONL at Agent-run boundaries. These immutable artifacts remain tracker-owned and linked to the completed node run; provenance marks full, bounded, or partial content. They are audit snapshots rather than a live terminal mirror and never participate in workflow routing.
+
 Once established, the `specification` and `implementation` agent records for a ticket must use `work_provider` and the same native session reference. The `review` record must use `review_provider` and the ticket's separate review conversation.
 
 ### Persistent slots
@@ -804,7 +806,7 @@ The Vite/React application is built and served by the Express service. V1 includ
 - a grouped Operational Traces evidence view with command, decision, and error filters plus raw JSONL downloads; and
 - clear invalid-ticket and lease-needs-attention diagnostics.
 
-Herdr remains the full terminal-monitoring interface. The tracker UI does not mirror terminal output, provide a terminal emulator, render provider traces, administer repository manifests, or edit agent permissions. Its workflow visualization is a fixed projection of the four durable phases, not a configurable graph engine.
+Herdr remains the live terminal-monitoring interface. The tracker UI does not provide a terminal emulator, administer repository manifests, or edit agent permissions. It may render immutable boundary transcripts and native session logs as provenance evidence; those snapshots are not live control surfaces.
 
 ## Failure and Recovery
 
@@ -832,7 +834,7 @@ V1 explicitly excludes:
 - Jira Server/Data Center, Jira webhooks, GitHub webhooks, GitHub check-run interpretation, or merge automation;
 - automatic PR merge;
 - authentication, RBAC, public-internet exposure, and multi-tenant isolation;
-- full terminal transcript storage or browser terminal emulation; and
+- continuous live terminal mirroring or browser terminal emulation; and
 - automatic Git versioning of ticket files.
 
 ## Acceptance Criteria

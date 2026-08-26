@@ -107,6 +107,32 @@ describe("TrackerClient execution traces", () => {
   });
 });
 
+describe("TrackerClient provenance session evidence", () => {
+  it("uploads post-callback transcript bytes with explicit provenance", async () => {
+    const artifact = { id: "transcript-1", kind: "agent_transcript" };
+    const fetcher = vi.fn(async (_input: string | URL | Request, _init?: RequestInit) => Response.json({ artifact }, { status: 201 }));
+    vi.stubGlobal("fetch", fetcher);
+    const client = new TrackerClient("http://tracker.test", "worker-1", "process-1");
+    const content = Buffer.from("agent transcript\n");
+
+    const result = await client.uploadSessionEvidence("lease-1", {
+      kind: "agent_transcript", filename: "implementation.herdr.txt", contentType: "text/plain", content,
+      source: "herdr", completeness: "bounded", disposition: "callback", evidenceKey: "herdr:callback",
+      provider: "claude", paneId: "w1:p1", sessionRef: "session-1", lineCount: 1,
+    });
+
+    expect(result).toEqual(artifact);
+    const [input, init] = fetcher.mock.calls[0]!;
+    const url = input as URL;
+    expect(url.pathname).toBe("/api/work/lease-1/session-evidence");
+    expect(Object.fromEntries(url.searchParams)).toMatchObject({
+      kind: "agent_transcript", source: "herdr", completeness: "bounded", disposition: "callback",
+      evidence_key: "herdr:callback", provider: "claude", pane_id: "w1:p1", session_ref: "session-1", line_count: "1",
+    });
+    expect(Buffer.from(init!.body as Uint8Array)).toEqual(content);
+  });
+});
+
 describe("TrackerClient request deadlines", () => {
   it("fails a stalled tracker request with a stable timeout error", async () => {
     // Arrange

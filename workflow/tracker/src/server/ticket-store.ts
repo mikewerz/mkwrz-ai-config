@@ -71,8 +71,11 @@ function telemetryRecord(
   const usage = baseline.usage && latest.usage
     ? Object.fromEntries(usageKeys.map((key) => [key, Math.max(0, latest.usage![key] - baseline.usage![key])])) as unknown as TokenUsage
     : null;
+  const freshZeroBaseline = baseline.attributes.agentic_baseline === "fresh_zero";
   const costUsd = baseline.cost.total_usd !== null && latest.cost.total_usd !== null
     ? Number(Math.max(0, latest.cost.total_usd - baseline.cost.total_usd).toFixed(12))
+    : freshZeroBaseline && latest.cost.total_usd !== null
+      ? Number(Math.max(0, latest.cost.total_usd).toFixed(12))
     : null;
   return { baseline, latest: structuredClone(latest), delta: { usage, cost_usd: costUsd } };
 }
@@ -565,6 +568,46 @@ export class TicketStore extends EventEmitter {
     });
   }
 
+  async addAgentSessionEvidence(
+    leaseId: string,
+    input: { kind: "agent_transcript" | "harness_session_log"; filename: string; contentType: string; content: Buffer; metadata: Record<string, JsonValue> },
+  ): Promise<ArtifactRecord> {
+    if (input.content.byteLength > MAX_ARTIFACT_BYTES) throw new HttpError(413, `Session evidence exceeds the ${MAX_ARTIFACT_BYTES} byte limit`, undefined, "SESSION_EVIDENCE_TOO_LARGE");
+    const safeName = basename(input.filename.trim());
+    if (!safeName || safeName !== input.filename.trim() || safeName.length > 255) throw new HttpError(422, "Session evidence filename must be a basename of at most 255 characters", undefined, "SESSION_EVIDENCE_INVALID");
+    if (!/^[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]*\/[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]*$/.test(input.contentType)) throw new HttpError(422, "Session evidence content type must be a MIME type without parameters", undefined, "SESSION_EVIDENCE_INVALID");
+    return this.serial(async () => {
+      const current = this.indexedTickets().find((item): item is LoadedTicket & { frontmatter: TicketFrontmatter } => Boolean(
+        item.valid && item.frontmatter?.workflow?.node_runs.some((run) => run.lease_id === leaseId),
+      ));
+      if (!current) throw new HttpError(409, "Execution lease is unknown or no longer retained", undefined, "LEASE_STALE");
+      const run = current.frontmatter.workflow!.node_runs.find((candidate) => candidate.lease_id === leaseId)!;
+      if (run.node_type !== "agent") throw new HttpError(409, "Session evidence can only be attached to an Agent node run", undefined, "SESSION_EVIDENCE_INVALID");
+      const sha256 = digest(input.content);
+      const evidenceKey = typeof input.metadata.evidence_key === "string" ? input.metadata.evidence_key : null;
+      const duplicate = current.frontmatter.artifacts.find((artifact) => artifact.node_run_id === run.id
+        && artifact.kind === input.kind && artifact.sha256 === sha256
+        && (evidenceKey === null || artifact.metadata.evidence_key === evidenceKey));
+      if (duplicate) return duplicate;
+      if (current.frontmatter.artifacts.length >= MAX_ARTIFACTS_PER_TICKET) throw new HttpError(422, `Ticket cannot contain more than ${MAX_ARTIFACTS_PER_TICKET} artifact references`);
+      const artifact = await this.artifactStore.put({
+        ticket_id: current.frontmatter.id, node_run_id: run.id, kind: input.kind,
+        filename: safeName, content_type: input.contentType, content: input.content, metadata: input.metadata,
+        policy: await this.artifactPolicy(),
+      });
+      try {
+        const ticket = structuredClone(current.frontmatter);
+        ticket.artifacts.push(artifact);
+        await this.mutateLoaded(current, ticket, current.body, {
+          event: "provenance.session_evidence_stored",
+          message: `${input.kind === "agent_transcript" ? "Herdr transcript" : "Native harness session log"} stored for ${run.node_id} attempt ${run.attempt}.`,
+          silent: true,
+        });
+        return artifact;
+      } catch (error) { await this.artifactStore.deleteRecord(artifact.id); throw error; }
+    });
+  }
+
   private async referencedArtifactIds(): Promise<Set<string>> {
     const tickets = await this.list();
     return new Set(tickets.flatMap((loaded) => loaded.frontmatter?.artifacts.map((artifact) => artifact.id) ?? []));
@@ -624,7 +667,10 @@ export class TicketStore extends EventEmitter {
       const definition = (await this.workflowLibrary.get(workflowId, run.workflow_revision)).definition;
       const node = workflowNode(definition, run.node_id);
       const conversation = node.conversation_key ? current.frontmatter.conversations?.[node.conversation_key] ?? null : null;
-      const profile = current.frontmatter.workflow!.resolved_agent_profiles?.[`${workflowId}/${node.id}`] ?? null;
+      const capturedInputs = run.input_context;
+      const profile = capturedInputs
+        ? capturedInputs.resolved_agent_profile
+        : current.frontmatter.workflow!.resolved_agent_profiles?.[`${workflowId}/${node.id}`] ?? null;
       const manifest = {
         schema_version: 1,
         generated_at: this.clock().toISOString(),
@@ -633,7 +679,10 @@ export class TicketStore extends EventEmitter {
           id: workflowId, revision: run.workflow_revision, root_id: current.frontmatter.workflow!.id,
           root_revision: current.frontmatter.workflow!.revision, node_id: run.node_id, node_name: node.name,
           node_type: run.node_type, node_run_id: run.id, visit: run.visit, attempt: run.attempt,
-          prompt: node.prompt ? { id: node.prompt, revision: current.frontmatter.workflow!.prompt_revisions[node.prompt] ?? null } : null,
+          prompt: node.prompt ? {
+            id: node.prompt,
+            revision: capturedInputs ? capturedInputs.prompt_revision : current.frontmatter.workflow!.prompt_revisions[node.prompt] ?? null,
+          } : null,
         },
         execution: {
           status: run.status, outcome: run.outcome, summary: run.summary, started_at: run.started_at, completed_at: run.completed_at,
@@ -650,10 +699,15 @@ export class TicketStore extends EventEmitter {
           metadata_writes: run.metadata_writes ?? {}, external_references: run.external_references ?? [],
         } : null,
         inputs: {
-          ticket_attachments: current.frontmatter.attachments.map((attachment) => ({ id: attachment.id, filename: attachment.filename, sha256: attachment.sha256 })),
-          prior_artifacts: current.frontmatter.artifacts.filter((artifact) => artifact.node_run_id !== run.id && artifact.kind !== "execution_manifest" && artifact.kind !== "execution_trace")
-            .map((artifact) => ({ id: artifact.id, kind: artifact.kind, filename: artifact.filename, sha256: artifact.sha256, node_run_id: artifact.node_run_id })),
-          incoming: current.frontmatter.workflow!.incoming,
+          ticket_revision: capturedInputs?.ticket_revision ?? run.input_revision,
+          workflow_inputs: capturedInputs?.workflow_inputs ?? current.frontmatter.workflow!.inputs,
+          stage_enabled: capturedInputs?.stage_enabled ?? current.frontmatter.workflow!.stage_enabled,
+          ticket_attachments: capturedInputs?.attachments
+            ?? current.frontmatter.attachments.map((attachment) => ({ id: attachment.id, filename: attachment.filename, sha256: attachment.sha256 })),
+          prior_artifacts: capturedInputs?.prior_artifacts
+            ?? current.frontmatter.artifacts.filter((artifact) => artifact.node_run_id !== run.id && artifact.kind !== "execution_manifest" && artifact.kind !== "execution_trace")
+              .map((artifact) => ({ id: artifact.id, kind: artifact.kind, filename: artifact.filename, sha256: artifact.sha256, node_run_id: artifact.node_run_id })),
+          incoming: capturedInputs ? capturedInputs.incoming : current.frontmatter.workflow!.incoming,
         },
         outputs: current.frontmatter.artifacts.filter((artifact) => artifact.node_run_id === run.id && artifact.kind !== "execution_manifest" && artifact.kind !== "execution_trace")
           .map((artifact) => ({ id: artifact.id, kind: artifact.kind, filename: artifact.filename, sha256: artifact.sha256, size_bytes: artifact.size_bytes })),

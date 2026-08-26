@@ -1,4 +1,4 @@
-import { PHASES, PRODUCTION_RESULTS, PROVIDERS, STATUSES, type AgentRef, type AttemptCounter, type Execution, type HarnessTelemetryRecord, type HarnessTelemetrySnapshot, type HerdrObservation, type JsonValue, type NodeRunTiming, type Phase, type PullRequestRef, type ResolvedAgentProfile, type TicketFrontmatter, type TicketQuestion, type TokenUsage, type WorkflowRuntime, type WorkflowTransitionContext } from "./domain.js";
+import { PHASES, PRODUCTION_RESULTS, PROVIDERS, STATUSES, type AgentRef, type ArtifactKind, type AttemptCounter, type Execution, type HarnessTelemetryRecord, type HarnessTelemetrySnapshot, type HerdrObservation, type JsonValue, type NodeRunTiming, type Phase, type PullRequestRef, type ResolvedAgentProfile, type TicketFrontmatter, type TicketQuestion, type TokenUsage, type WorkflowNodeInputContext, type WorkflowRuntime, type WorkflowTransitionContext } from "./domain.js";
 import { qualityReportMetadata } from "./quality.js";
 
 const phaseStatuses: Record<Phase, Set<string>> = {
@@ -339,6 +339,59 @@ function workflowRuntime(value: unknown, errors: string[], now: string): Workflo
         url: optionalString(item.url, `workflow.node_runs[${index}].external_references[${referenceIndex}].url`, errors),
       }];
     }) : [];
+    let inputContext: WorkflowNodeInputContext | undefined;
+    if (isRecord(run.input_context)) {
+      const context = run.input_context;
+      const incoming = context.incoming === null || context.incoming === undefined ? null : isRecord(context.incoming) ? {
+        source_node: asString(context.incoming.source_node, `workflow.node_runs[${index}].input_context.incoming.source_node`, errors),
+        target_node: asString(context.incoming.target_node, `workflow.node_runs[${index}].input_context.incoming.target_node`, errors),
+        outcome: asString(context.incoming.outcome, `workflow.node_runs[${index}].input_context.incoming.outcome`, errors),
+        summary: optionalString(context.incoming.summary, `workflow.node_runs[${index}].input_context.incoming.summary`, errors),
+        handoff: optionalString(context.incoming.handoff, `workflow.node_runs[${index}].input_context.incoming.handoff`, errors),
+        output: optionalString(context.incoming.output, `workflow.node_runs[${index}].input_context.incoming.output`, errors),
+        output_log_path: optionalString(context.incoming.output_log_path, `workflow.node_runs[${index}].input_context.incoming.output_log_path`, errors),
+        actor: asString(context.incoming.actor, `workflow.node_runs[${index}].input_context.incoming.actor`, errors),
+        created_at: timestamp(context.incoming.created_at, `workflow.node_runs[${index}].input_context.incoming.created_at`, errors),
+      } : (errors.push(`workflow.node_runs[${index}].input_context.incoming must be an object or null`), null);
+      const workflowInputs: Record<string, boolean | string> = {};
+      if (isRecord(context.workflow_inputs)) for (const [key, item] of Object.entries(context.workflow_inputs)) {
+        if (typeof item === "boolean" || typeof item === "string") workflowInputs[key] = item;
+        else errors.push(`workflow.node_runs[${index}].input_context.workflow_inputs.${key} must be a boolean or string`);
+      } else errors.push(`workflow.node_runs[${index}].input_context.workflow_inputs must be an object`);
+      const stageEnabled: Record<string, boolean> = {};
+      if (isRecord(context.stage_enabled)) for (const [key, item] of Object.entries(context.stage_enabled)) {
+        if (typeof item === "boolean") stageEnabled[key] = item;
+        else errors.push(`workflow.node_runs[${index}].input_context.stage_enabled.${key} must be a boolean`);
+      } else errors.push(`workflow.node_runs[${index}].input_context.stage_enabled must be an object`);
+      const attachments = Array.isArray(context.attachments) ? context.attachments.filter(isRecord).map((item, itemIndex) => ({
+        id: asString(item.id, `workflow.node_runs[${index}].input_context.attachments[${itemIndex}].id`, errors),
+        filename: asString(item.filename, `workflow.node_runs[${index}].input_context.attachments[${itemIndex}].filename`, errors),
+        sha256: asString(item.sha256, `workflow.node_runs[${index}].input_context.attachments[${itemIndex}].sha256`, errors),
+      })) : (errors.push(`workflow.node_runs[${index}].input_context.attachments must be an array`), []);
+      const priorArtifacts = Array.isArray(context.prior_artifacts) ? context.prior_artifacts.filter(isRecord).map((item, itemIndex) => ({
+        id: asString(item.id, `workflow.node_runs[${index}].input_context.prior_artifacts[${itemIndex}].id`, errors),
+        kind: asString(item.kind, `workflow.node_runs[${index}].input_context.prior_artifacts[${itemIndex}].kind`, errors) as ArtifactKind,
+        filename: asString(item.filename, `workflow.node_runs[${index}].input_context.prior_artifacts[${itemIndex}].filename`, errors),
+        sha256: asString(item.sha256, `workflow.node_runs[${index}].input_context.prior_artifacts[${itemIndex}].sha256`, errors),
+        node_run_id: optionalString(item.node_run_id, `workflow.node_runs[${index}].input_context.prior_artifacts[${itemIndex}].node_run_id`, errors),
+      })) : (errors.push(`workflow.node_runs[${index}].input_context.prior_artifacts must be an array`), []);
+      let resolvedProfile: ResolvedAgentProfile | null = null;
+      if (context.resolved_agent_profile !== null && context.resolved_agent_profile !== undefined) {
+        if (isRecord(context.resolved_agent_profile) && PROVIDERS.includes(context.resolved_agent_profile.provider as never)) resolvedProfile = {
+          alias: asString(context.resolved_agent_profile.alias, `workflow.node_runs[${index}].input_context.resolved_agent_profile.alias`, errors),
+          provider: context.resolved_agent_profile.provider as ResolvedAgentProfile["provider"],
+          model: optionalString(context.resolved_agent_profile.model, `workflow.node_runs[${index}].input_context.resolved_agent_profile.model`, errors),
+          reasoning: optionalString(context.resolved_agent_profile.reasoning, `workflow.node_runs[${index}].input_context.resolved_agent_profile.reasoning`, errors),
+        };
+        else errors.push(`workflow.node_runs[${index}].input_context.resolved_agent_profile is invalid`);
+      }
+      inputContext = {
+        ticket_revision: Number.isInteger(context.ticket_revision) ? Number(context.ticket_revision) : (errors.push(`workflow.node_runs[${index}].input_context.ticket_revision must be an integer`), 0),
+        incoming, workflow_inputs: workflowInputs, stage_enabled: stageEnabled, attachments, prior_artifacts: priorArtifacts,
+        prompt_revision: optionalString(context.prompt_revision, `workflow.node_runs[${index}].input_context.prompt_revision`, errors),
+        resolved_agent_profile: resolvedProfile,
+      };
+    } else if (run.input_context !== undefined) errors.push(`workflow.node_runs[${index}].input_context must be an object`);
     return ({
     id: asString(run.id, `workflow.node_runs[${index}].id`, errors),
     ...(typeof run.workflow_id === "string" ? { workflow_id: run.workflow_id } : {}),
@@ -377,6 +430,7 @@ function workflowRuntime(value: unknown, errors: string[], now: string): Workflo
     metadata_writes: metadataWrites,
     external_references: externalReferences,
     input_revision: Number.isInteger(run.input_revision) ? Number(run.input_revision) : 0,
+    ...(inputContext ? { input_context: inputContext } : {}),
     telemetry: telemetryRecord(run.telemetry, `workflow.node_runs[${index}].telemetry`, errors),
     timing: nodeTiming(run.timing, run, index, errors),
   }); }) : [];
@@ -518,7 +572,7 @@ export function normalizeTicket(raw: Record<string, unknown>, now = new Date().t
   if (raw.artifacts !== undefined && !Array.isArray(raw.artifacts)) errors.push("artifacts must be an array");
   else if (Array.isArray(raw.artifacts)) raw.artifacts.forEach((item, index) => {
     if (!isRecord(item)) { errors.push(`artifacts[${index}] must be an object`); return; }
-    const kind = ["attachment", "evidence", "script_output", "script_artifact", "quality_report", "checkpoint_bundle", "checkpoint_manifest", "execution_manifest", "execution_trace"].includes(String(item.kind))
+    const kind = ["attachment", "evidence", "script_output", "script_artifact", "quality_report", "checkpoint_bundle", "checkpoint_manifest", "execution_manifest", "execution_trace", "agent_transcript", "harness_session_log"].includes(String(item.kind))
       ? item.kind as TicketFrontmatter["artifacts"][number]["kind"]
       : (errors.push(`artifacts[${index}].kind is invalid`), "script_artifact" as const);
     const metadata = isRecord(item.metadata) ? jsonValue(item.metadata, `artifacts[${index}].metadata`, errors) : {};

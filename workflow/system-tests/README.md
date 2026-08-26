@@ -18,6 +18,10 @@ The fake Herdr implementation supports only the narrow command surface needed
 by the supervisor system tests. It records every invocation and, in the agent
 scenario, submits a declared callback directly to the tracker.
 
+The fake also emits deterministic pane scrollback and a fake Claude-native JSONL
+session record. The Agent-path test verifies that both become tracker-owned
+provenance artifacts after the callback without starting a real provider.
+
 ## Run
 
 ```bash
@@ -50,7 +54,7 @@ Node 22.12 or newer is required by the applications under test.
 - Rejected required quality evidence, lease expiry, same-node retry, and
   eventual successful completion without an agent.
 - Agent workflow claiming, assignment-bundle creation, Herdr lifecycle calls,
-  generated review-evidence publication, fake terminal callback, completed node-run audit history, and automatic
+  generated review-evidence publication, fake terminal callback, immutable run-start inputs in the execution manifest, completed node-run audit history, and automatic
   same-node recovery when the fake pane rejects the first prompt deliveries.
 - Fail-closed fake-Herdr startup and provider credential scrubbing.
 - Stable lease/artifact errors, artifact quotas, orphan diagnostics, recovery,

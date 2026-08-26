@@ -7,6 +7,7 @@ import type { AssignmentBundle } from "./assignments.js";
 import type { HerdrController } from "./herdr.js";
 import { PromptStore, type PromptTemplates } from "./prompts.js";
 import { Supervisor, buildAssignmentPrompt, buildCallbackReminder } from "./supervisor.js";
+import { TelemetryCollector } from "./telemetry.js";
 import { TrackerClient } from "./tracker-client.js";
 import type { AgentObservation, ClaimedTicket, Provider } from "./types.js";
 import * as activities from "./activities.js";
@@ -266,6 +267,58 @@ describe("assignment prompt", () => {
     expect(fetch).toHaveBeenCalledWith(expect.objectContaining({ href: "http://tracker.test/api/work/lease-1/delivery-failed" }), expect.objectContaining({ method: "POST" }));
   });
 
+  it("delivers an assignment even when optional telemetry persistence is rejected", async () => {
+    // Arrange
+    const observation: AgentObservation = {
+      paneId: "w1:p1", state: "idle", sessionRef: "session-1", workspaceId: "w1", tabId: "w1:t1",
+      terminalId: "term-1", focused: false, cwd: "/srv/projects", foregroundCwd: "/srv/projects",
+      terminalTitle: null, terminalTitleStripped: null, displayName: "Claude", revision: 1,
+      sessionSource: "herdr:claude", sessionKind: "id", tokens: {}, interactiveReady: true, launchPending: false,
+    };
+    let supervisor!: Supervisor;
+    const promptAndConfirm = vi.fn().mockImplementation(async () => { await supervisor.stop(); return true; });
+    const herdr = { projectRoot: "/srv/projects", ensureAgent: vi.fn().mockResolvedValue(observation), promptAndConfirm } as unknown as HerdrController;
+    const telemetryCollector = {
+      collect: vi.fn().mockResolvedValue({
+        schema_version: 1, harness: "claude", session_ref: "session-1", observed_at: "2026-08-25T12:00:00.000Z",
+        source: { kind: "session_log", detail: null }, model: { id: null, provider: null, observed_ids: [] },
+        reasoning: { effort: null, enabled: null, source: null }, usage: null,
+        cost: { total_usd: null, kind: "unavailable" }, context: { used_tokens: null, window_tokens: null, used_percent: null },
+        rate_limits: [], attributes: {},
+      }),
+      evidence: vi.fn().mockResolvedValue([]),
+    } as unknown as TelemetryCollector;
+    const requests: Array<{ url: URL; body: string }> = [];
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = new URL(input instanceof Request ? input.url : String(input));
+      const body = String(init?.body ?? "");
+      requests.push({ url, body });
+      if (url.pathname.endsWith("/telemetry")) return Response.json({ error: "Invalid telemetry_baseline" }, { status: 422 });
+      if (url.pathname.endsWith("/trace/events")) {
+        const parsed = JSON.parse(body) as { first_sequence: number; events: unknown[] };
+        return Response.json({ artifact: { id: "trace-1" }, next_sequence: parsed.first_sequence + parsed.events.length }, { status: 201 });
+      }
+      return Response.json({ active: true, delivered: true });
+    }));
+    supervisor = new Supervisor(herdr, {
+      trackerUrl: "http://tracker.test", supervisorId: "vm", providers: ["claude"],
+      heartbeatIntervalMs: 30_000, idlePollMs: 1, assignmentRoot: temporaryAssignmentRoot(),
+      telemetryCollector, sessionEvidenceEnabled: false,
+    });
+    (supervisor as unknown as { prompts: PromptStore }).prompts.replace(trackerPromptTemplates());
+
+    // Execute
+    await (supervisor as unknown as { runAssignment(provider: Provider, value: ClaimedTicket): Promise<void> })
+      .runAssignment("claude", ticket("implementation"));
+
+    // Verify
+    expect(promptAndConfirm).toHaveBeenCalledTimes(1);
+    const heartbeat = requests.find(({ url }) => url.pathname.endsWith("/heartbeat") && url.pathname.includes("lease-1"));
+    expect(JSON.parse(heartbeat!.body)).not.toHaveProperty("telemetry");
+    expect(requests.some(({ url }) => url.pathname.endsWith("/telemetry"))).toBe(true);
+    expect(requests.some(({ url }) => url.pathname.endsWith("/delivered"))).toBe(true);
+  });
+
   it("sends at most one callback reminder per lease across repeated idle periods", async () => {
     const baseObservation: AgentObservation = {
       paneId: "w1:p1", state: "idle", sessionRef: "session-1", workspaceId: "w1", tabId: "w1:t1",
@@ -360,6 +413,88 @@ describe("assignment prompt", () => {
     expect(herdr.prompt).toHaveBeenCalledWith("w1:p1", expect.stringContaining(join(runDirectory, "START_HERE.md")));
     expect(await readFile(join(runDirectory, "ticket.md"), "utf8")).toContain("revised behavior");
     expect(await readFile(join(runDirectory, "updates", "00000004-guidance-1.md"), "utf8")).toContain("revised deployment target");
+  });
+
+  it.each(["control", "guidance", "heartbeat"] as const)("captures callback provenance when %s discovers the fenced lease", async (fenceSource) => {
+    // Arrange
+    const projectRoot = temporaryAssignmentRoot();
+    await mkdir(projectRoot, { recursive: true });
+    const observation: AgentObservation = {
+      paneId: "w1:p1", state: "working", sessionRef: "session-1", workspaceId: "w1", tabId: "w1:t1",
+      terminalId: "term-1", focused: false, cwd: projectRoot, foregroundCwd: projectRoot,
+      terminalTitle: null, terminalTitleStripped: null, displayName: "Claude", revision: 2,
+      sessionSource: "herdr:claude", sessionKind: "id", tokens: {},
+    };
+    const herdr = {
+      projectRoot,
+      ensureAgent: vi.fn().mockResolvedValue(observation),
+      observe: vi.fn().mockResolvedValue(observation),
+      interrupt: vi.fn().mockResolvedValue(undefined),
+      readTranscript: vi.fn().mockResolvedValue("durable agent transcript\n"),
+    } as unknown as HerdrController;
+    const claimed = ticket("implementation");
+    claimed.frontmatter.execution.delivery_status = "delivered";
+    claimed.frontmatter.execution.delivery_confirmed_at = new Date().toISOString();
+    let observedHeartbeatCount = 0;
+    const requests: Array<{ url: URL; init?: RequestInit }> = [];
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = input instanceof Request ? new URL(input.url) : new URL(String(input));
+      requests.push({ url, ...(init ? { init } : {}) });
+      if (url.pathname.endsWith("/trace/events")) {
+        const body = JSON.parse(String(init?.body)) as { first_sequence: number; events: unknown[] };
+        return Response.json({ artifact: { id: "trace-1" }, next_sequence: body.first_sequence + body.events.length });
+      }
+      if (url.pathname.endsWith("/control")) {
+        return fenceSource === "control"
+          ? Response.json({ error: "Lease is stale or fenced" }, { status: 409 })
+          : Response.json({ interrupt: null, waiting_for_answer: false });
+      }
+      if (url.pathname.endsWith("/guidance")) {
+        return fenceSource === "guidance"
+          ? Response.json({ error: "Lease is stale or fenced" }, { status: 409 })
+          : Response.json({ guidance: [] });
+      }
+      if (url.pathname.endsWith("/heartbeat")) {
+        const body = String(init?.body ?? "");
+        if (body.includes("observed_state")) {
+          observedHeartbeatCount += 1;
+          if (fenceSource === "heartbeat" && observedHeartbeatCount > 1) {
+            return Response.json({ error: "Lease is stale or fenced" }, { status: 409 });
+          }
+        }
+        return Response.json({ active: true });
+      }
+      if (url.pathname.endsWith("/session-evidence")) {
+        return Response.json({ artifact: { id: "transcript-1", kind: "agent_transcript" } }, { status: 201 });
+      }
+      if (url.pathname.endsWith("/finalize") || url.pathname.endsWith("/telemetry")) return Response.json({ accepted: true });
+      throw new Error(`Unexpected request: ${url}`);
+    }));
+    const supervisor = new Supervisor(herdr, {
+      trackerUrl: "http://tracker.test", supervisorId: "vm", providers: ["claude"],
+      heartbeatIntervalMs: 1, idlePollMs: 2, assignmentRoot: temporaryAssignmentRoot(),
+      nativeSessionEvidenceEnabled: false,
+    });
+    (supervisor as unknown as { prompts: PromptStore }).prompts.replace(trackerPromptTemplates());
+
+    // Act
+    await (supervisor as unknown as { runAssignment(provider: Provider, value: ClaimedTicket): Promise<void> })
+      .runAssignment("claude", claimed);
+
+    // Assert
+    const evidenceRequests = requests.filter(({ url }) => url.pathname.endsWith("/session-evidence"));
+    expect(evidenceRequests).toHaveLength(1);
+    expect(Object.fromEntries(evidenceRequests[0]!.url.searchParams)).toMatchObject({
+      kind: "agent_transcript", disposition: "callback", evidence_key: "herdr:callback",
+      provider: "claude", pane_id: "w1:p1", session_ref: "session-1",
+    });
+    const finalize = requests.find(({ url }) => url.pathname.endsWith("/finalize"));
+    expect(finalize).toBeDefined();
+    expect(JSON.parse(String(finalize!.init?.body))).toMatchObject({
+      runtime: { agent: { disposition: "callback", fence_source: fenceSource, session_evidence: { artifacts: [{ id: "transcript-1" }], failures: [] } } },
+    });
+    expect(herdr.interrupt).toHaveBeenCalledWith("w1:p1");
+    expect(herdr.readTranscript).toHaveBeenCalledWith("w1:p1", 5_000);
   });
 
   it("interrupts the Herdr turn when cancellation or fencing removes the lease", async () => {

@@ -4,6 +4,7 @@ import { join } from "node:path";
 import request from "supertest";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { createApp } from "./app.js";
+import type { HarnessTelemetrySnapshot } from "./domain.js";
 import { TicketStore } from "./ticket-store.js";
 import { ticketMarkdown } from "./test-helpers.js";
 import { stringify } from "yaml";
@@ -33,7 +34,7 @@ beforeEach(async () => {
 });
 afterEach(async () => { await store.close(); await rm(root, { recursive: true, force: true }); });
 
-function telemetry(totalTokens: number, totalUsd: number) {
+function telemetry(totalTokens: number, totalUsd: number): HarnessTelemetrySnapshot {
   return {
     schema_version: 1, harness: "claude", session_ref: "claude-session", observed_at: "2026-08-18T12:00:00.000Z",
     source: { kind: "session_log", detail: "claude-session.jsonl" },
@@ -252,6 +253,34 @@ describe("tracker API", () => {
     await request(app).post(`/api/work/${lease}/telemetry`).send({ telemetry: { nope: true } }).expect(422);
   }, 15_000);
 
+  it("keeps heartbeats alive when optional telemetry is invalid and accounts a fresh zero-cost baseline", async () => {
+    // Arrange
+    const app = createApp(store, join(root, "missing-client"));
+    const created = await request(app).post("/api/tickets").send({ markdown: ticketMarkdown(), stage_enabled: { specification: false, review: false } }).expect(201);
+    await request(app).post("/api/tickets/APT-0001/ready").send({ expected_revision: created.body.frontmatter.revision }).expect(200);
+    const claim = await request(app).post("/api/work/claim").send({ supervisor_id: "vm", provider: "claude", available_providers: ["claude"] }).expect(200);
+    const lease = claim.body.frontmatter.execution.lease_id;
+    const baseline = telemetry(0, 0);
+    baseline.usage = { input_tokens: 0, cached_input_tokens: 0, cache_write_input_tokens: 0, output_tokens: 0, reasoning_output_tokens: 0, total_tokens: 0 };
+    baseline.cost = { total_usd: null, kind: "unavailable" };
+    baseline.attributes = { agentic_baseline: "fresh_zero" };
+
+    // Execute
+    const heartbeat = await request(app).post(`/api/work/${lease}/heartbeat`).send({
+      observed_state: "working", pane_id: "w1:p1", session_ref: "claude-session", telemetry: { invalid: true },
+    }).expect(200);
+    const recorded = await request(app).post(`/api/work/${lease}/telemetry`).send({
+      telemetry: telemetry(200, 1.5), telemetry_baseline: baseline,
+    }).expect(200);
+
+    // Verify
+    expect(heartbeat.body.ticket.frontmatter.execution).toMatchObject({ lease_id: lease, observed_herdr_state: "working" });
+    expect(recorded.body.ticket.frontmatter.execution.telemetry).toMatchObject({
+      baseline: { cost: { total_usd: null, kind: "unavailable" }, attributes: { agentic_baseline: "fresh_zero" } },
+      delta: { usage: { total_tokens: 200 }, cost_usd: 1.5 },
+    });
+  });
+
   it("stores idempotent, sequence-fenced execution trace chunks before and after a terminal callback", async () => {
     // Arrange
     const app = createApp(store, join(root, "missing-client"));
@@ -285,6 +314,39 @@ describe("tracker API", () => {
     ]);
     const content = await request(app).get(`/api/tickets/APT-0001/artifacts/${chunks[1].id}/content`).expect(200);
     expect(content.text).toContain('"event":"execution.trace_finished"');
+  }, 15_000);
+
+  it("stores provenance session evidence against a completed Agent run and deduplicates retries", async () => {
+    // Arrange
+    const app = createApp(store, join(root, "missing-client"));
+    const created = await request(app).post("/api/tickets").send({ markdown: ticketMarkdown(), stage_enabled: { specification: false, review: false } }).expect(201);
+    await request(app).post("/api/tickets/APT-0001/ready").send({ expected_revision: created.body.frontmatter.revision }).expect(200);
+    const claim = await request(app).post("/api/work/claim").send({ supervisor_id: "vm", provider: "claude", available_providers: ["claude"] }).expect(200);
+    const lease = claim.body.frontmatter.execution.lease_id as string;
+    await request(app).post(`/api/work/${lease}/complete`).send({
+      summary: "Implemented", outcome: "completed", pull_requests: [{ repository: "demo", url: "https://github.com/example/demo/pull/100" }],
+    }).expect(200);
+    const transcript = Buffer.from("assignment delivered\nagent worked\ncallback complete\n");
+    const path = `/api/work/${lease}/session-evidence?kind=agent_transcript&filename=implementation.herdr.txt&content_type=text%2Fplain&source=herdr&completeness=bounded&disposition=callback&evidence_key=herdr%3Acallback&provider=claude&pane_id=w1%3Ap1&session_ref=session-1&line_count=3`;
+
+    // Execute
+    const first = await request(app).post(path).set("Content-Type", "application/octet-stream").send(transcript).expect(201);
+    const duplicate = await request(app).post(path).set("Content-Type", "application/octet-stream").send(transcript).expect(201);
+
+    // Verify
+    expect(duplicate.body.artifact.id).toBe(first.body.artifact.id);
+    expect(first.body.artifact).toMatchObject({
+      kind: "agent_transcript", filename: "implementation.herdr.txt",
+      metadata: {
+        source: "herdr", completeness: "bounded", disposition: "callback", evidence_key: "herdr:callback",
+        provider: "claude", pane_id: "w1:p1", session_ref: "session-1", line_count: 3,
+        presentation: { title: "Agent session transcript", category: "provenance" },
+      },
+    });
+    const ticket = await request(app).get("/api/tickets/APT-0001").expect(200);
+    expect(ticket.body.frontmatter.artifacts.filter((artifact: { kind: string }) => artifact.kind === "agent_transcript")).toHaveLength(1);
+    const downloaded = await request(app).get(`/api/tickets/APT-0001/artifacts/${first.body.artifact.id}/content`).expect(200);
+    expect(downloaded.text).toContain("callback complete");
   }, 15_000);
 
   it("reprioritizes tickets in any state and returns unclaimed ready work to draft without adding a workflow visit", async () => {
@@ -383,6 +445,10 @@ describe("tracker API", () => {
       .set("Content-Type", "application/octet-stream").send(qualityYaml).expect(409);
     const activityManifest = await request(app).post(`/api/work/${activity.body.frontmatter.execution.lease_id}/finalize`).send({ runtime: { supervisor: { hostname: "factory-vm" }, repositories: { before: [], after: [] } } }).expect(200);
     expect(activityManifest.body.artifact).toMatchObject({ kind: "execution_manifest", node_run_id: expect.any(String) });
+    const manifestResponse = await request(app).get(`/api/tickets/APT-0001/artifacts/${activityManifest.body.artifact.id}/content`).expect(200);
+    const manifest = JSON.parse(Buffer.isBuffer(manifestResponse.body) ? manifestResponse.body.toString("utf8") : manifestResponse.text);
+    expect(manifest.inputs).toMatchObject({ incoming: null, prior_artifacts: [], workflow_inputs: {}, ticket_revision: expect.any(Number) });
+    expect(manifest.outputs.map((artifact: { id: string }) => artifact.id)).toEqual(expect.arrayContaining([quality.body.artifact.id, evidence.body.artifact.id]));
     const waiting = await request(app).get("/api/tickets/APT-0001").expect(200);
     expect(waiting.body.frontmatter.workflow.node_attempts.verify.consecutive_lease_losses).toBe(0);
     const activityRun = waiting.body.frontmatter.workflow.node_runs[0];
@@ -404,7 +470,10 @@ describe("tracker API", () => {
     expect(assignment.body).toMatchObject({ workflow_node: { id: "deliver", conversation_key: "work" }, node_prompt: { id: "implementation" } });
     await request(app).put(`/api/work/${assignment.body.frontmatter.execution.lease_id}/metadata/release`).send({ value: "candidate" }).expect(200);
     await request(app).post(`/api/work/${assignment.body.frontmatter.execution.lease_id}/complete`).send({ summary: "Delivered", handoff: "Ready for release notes.", outcome: "completed" }).expect(200);
-    await request(app).post(`/api/work/${assignment.body.frontmatter.execution.lease_id}/finalize`).send({ runtime: { agent: { provider: "codex", generation: 1 } } }).expect(200);
+    const deliveryManifest = await request(app).post(`/api/work/${assignment.body.frontmatter.execution.lease_id}/finalize`).send({ runtime: { agent: { provider: "codex", generation: 1 } } }).expect(200);
+    const deliveryManifestResponse = await request(app).get(`/api/tickets/APT-0001/artifacts/${deliveryManifest.body.artifact.id}/content`).expect(200);
+    const deliveryManifestContent = JSON.parse(Buffer.isBuffer(deliveryManifestResponse.body) ? deliveryManifestResponse.body.toString("utf8") : deliveryManifestResponse.text);
+    expect(deliveryManifestContent.inputs.incoming).toMatchObject({ source_node: "approval", target_node: "deliver", outcome: "approved" });
     const complete = await request(app).get("/api/tickets/APT-0001").expect(200);
     expect(complete.body.frontmatter).toMatchObject({ phase: "done", status: "completed", metadata: { environment: { name: "nonprod", retries: 2 }, release: "candidate" }, workflow: { current_node: "done" } });
     expect(complete.body.frontmatter.workflow.node_runs.map((run: { outcome: string }) => run.outcome)).toEqual(["success", "approved", "completed"]);

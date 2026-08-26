@@ -552,6 +552,37 @@ test("an Agent node uses only fake Herdr and advances through its declared callb
     assert.equal(evidenceResponse.status, 200);
     assert.match(await evidenceResponse.text(), /deterministic system-test agent published this evidence/);
 
+    const governedTicket = await waitFor("tracker-owned agent provenance evidence", async () => {
+      const current = (await jsonRequest(tracker.baseUrl, "/api/tickets/SYSTEM-FAKE-AGENT")).body;
+      const kinds = new Set(current.frontmatter.artifacts.map((artifact) => artifact.kind));
+      return kinds.has("agent_transcript") && kinds.has("harness_session_log") ? current : null;
+    });
+    const transcript = governedTicket.frontmatter.artifacts.find((artifact) => artifact.kind === "agent_transcript");
+    const nativeLog = governedTicket.frontmatter.artifacts.find((artifact) => artifact.kind === "harness_session_log");
+    assert.equal(transcript.metadata.source, "herdr");
+    assert.equal(transcript.metadata.disposition, "callback");
+    assert.equal(nativeLog.metadata.source, "harness");
+    assert.equal(nativeLog.metadata.provider, "claude");
+    const transcriptResponse = await fetch(`${tracker.baseUrl}/api/tickets/SYSTEM-FAKE-AGENT/artifacts/${transcript.id}/content`);
+    assert.equal(transcriptResponse.status, 200);
+    assert.match(await transcriptResponse.text(), /Completion callback accepted/);
+    const nativeResponse = await fetch(`${tracker.baseUrl}/api/tickets/SYSTEM-FAKE-AGENT/artifacts/${nativeLog.id}/content`);
+    assert.equal(nativeResponse.status, 200);
+    assert.match(await nativeResponse.text(), /no-model-started/);
+
+    const manifestedTicket = await waitFor("agent execution manifest", async () => {
+      const current = (await jsonRequest(tracker.baseUrl, "/api/tickets/SYSTEM-FAKE-AGENT")).body;
+      return current.frontmatter.artifacts.some((artifact) => artifact.kind === "execution_manifest") ? current : null;
+    });
+    const manifestArtifact = manifestedTicket.frontmatter.artifacts.find((artifact) => artifact.kind === "execution_manifest");
+    const manifestResponse = await fetch(`${tracker.baseUrl}/api/tickets/SYSTEM-FAKE-AGENT/artifacts/${manifestArtifact.id}/content`);
+    assert.equal(manifestResponse.status, 200);
+    const manifest = await manifestResponse.json();
+    assert.equal(manifest.inputs.incoming, null, "the manifest must retain the node's original input instead of the terminal transition");
+    assert.equal(typeof manifest.inputs.ticket_revision, "number");
+    assert.deepEqual(manifest.inputs.workflow_inputs, {});
+    assert.deepEqual(manifest.inputs.prior_artifacts, []);
+
     const invocations = await waitFor("fake Herdr callback cleanup", async () => {
       const observed = await readHerdrInvocations(supervisor);
       return observed.some(({ args }) => args[0] === "agent" && args[1] === "send-keys") ? observed : null;

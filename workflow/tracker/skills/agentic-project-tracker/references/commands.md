@@ -87,6 +87,8 @@ Artifacts with kind `evidence` are permissive human-readable run outputs. Option
 
 Artifacts with kind `execution_trace` are immutable JSONL chunks streamed by the supervisor. Chunks from one attempt share `metadata.trace_id`; concatenate them in ascending `metadata.first_sequence`. Events distinguish raw Herdr commands and observations from `delivery.*` supervisor decisions. Prompt and terminal bodies are intentionally represented by byte counts and SHA-256 digests rather than copied content. These artifacts are read-only diagnostic evidence and never authorize an outside agent to issue supervisor callbacks.
 
+Artifacts with kind `agent_transcript` are bounded human-readable Herdr scrollback snapshots. `harness_session_log` artifacts are native Codex or Claude session JSONL files. Both are immutable, tracker-owned provenance evidence linked to an Agent node run. Inspect `metadata.source`, `provider`, `pane_id`, `session_ref`, `role`, `disposition`, and especially `completeness` before drawing conclusions; a partial or missing capture is not evidence that the node failed. Outside agents may download these artifacts with `artifact-download` but cannot create them or use them as workflow callbacks.
+
 ## Comments, guidance, and questions
 
 ```bash

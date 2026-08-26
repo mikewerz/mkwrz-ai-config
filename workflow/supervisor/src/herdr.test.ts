@@ -62,6 +62,16 @@ describe("HerdrController", () => {
     expect(events).toContainEqual(expect.objectContaining({ event: "herdr.observation", data: expect.objectContaining({ pane_id: "w1:p1", state: "working", revision: 12 }) }));
   });
 
+  it("reads a bounded provenance transcript from the pane scrollback", async () => {
+    const runner = new FakeRunner();
+    const controller = new HerdrController(runner, "/srv/projects");
+
+    await controller.readTranscript("w1:p1", 5_000);
+
+    expect(runner.calls.at(-1)).toEqual(["agent", "read", "w1:p1", "--source", "recent-unwrapped", "--lines", "5000"]);
+    await expect(controller.readTranscript("w1:p1", 100_001)).rejects.toThrow("between 1 and 100000");
+  });
+
   it("waits for a new macOS login-shell pane to accept the agent start", async () => {
     vi.useFakeTimers();
     let starts = 0;

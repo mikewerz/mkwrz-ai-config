@@ -289,6 +289,11 @@ export class HerdrController {
     return this.runText(args);
   }
 
+  async readTranscript(paneId: string, lines: number): Promise<string> {
+    if (!Number.isSafeInteger(lines) || lines < 1 || lines > 100_000) throw new Error("Herdr transcript lines must be an integer between 1 and 100000");
+    return this.runText(["agent", "read", paneId, "--source", "recent-unwrapped", "--lines", String(lines)]);
+  }
+
   async sendKeys(paneId: string, ...keys: string[]): Promise<void> {
     await this.run(["agent", "send-keys", paneId, ...keys]);
   }

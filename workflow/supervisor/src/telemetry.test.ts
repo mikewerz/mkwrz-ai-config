@@ -20,6 +20,27 @@ async function jsonl(path: string, entries: unknown[]): Promise<void> {
 }
 
 describe("TelemetryCollector", () => {
+  it("locates native provenance logs for Codex and Claude subagents without interpreting their contents", async () => {
+    // Arrange
+    const home = await root();
+    const codex = join(home, "codex", "sessions", "2026", "session-codex.jsonl");
+    const claude = join(home, "claude", "projects", "demo", "session-claude.jsonl");
+    const subagent = join(home, "claude", "projects", "demo", "session-claude", "subagents", "agent-1.jsonl");
+    await jsonl(codex, [{ type: "session_meta" }]);
+    await jsonl(claude, [{ type: "assistant" }]);
+    await jsonl(subagent, [{ type: "assistant" }]);
+    const collector = new TelemetryCollector({ codex: join(home, "codex"), claude: join(home, "claude") });
+
+    // Execute / Verify
+    await expect(collector.evidence({ harness: "codex", sessionRef: "session-codex" })).resolves.toEqual([
+      expect.objectContaining({ path: codex, role: "primary", contentType: "application/x-ndjson" }),
+    ]);
+    await expect(collector.evidence({ harness: "claude", sessionRef: "session-claude" })).resolves.toEqual([
+      expect.objectContaining({ path: claude, role: "primary" }),
+      expect.objectContaining({ path: subagent, role: "subagent" }),
+    ]);
+  });
+
   it("uses zero usage for a new session baseline captured before the first token event", () => {
     const baseline = zeroTelemetryBaseline({
       schema_version: 1,
@@ -45,9 +66,10 @@ describe("TelemetryCollector", () => {
         reasoning_output_tokens: 0,
         total_tokens: 0,
       },
-      cost: { total_usd: 0, kind: "unavailable" },
+      cost: { total_usd: null, kind: "unavailable" },
       context: { used_tokens: 0, window_tokens: 258_400, used_percent: 0 },
       rate_limits: [{ id: "codex:primary", used_percent: 31, window_minutes: 10_080 }],
+      attributes: { agentic_baseline: "fresh_zero" },
     });
   });
 

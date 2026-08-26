@@ -35,7 +35,7 @@ export interface TicketAttachment {
   created_at: string;
 }
 
-export type ArtifactKind = "attachment" | "evidence" | "script_output" | "script_artifact" | "quality_report" | "checkpoint_bundle" | "checkpoint_manifest" | "execution_manifest" | "execution_trace";
+export type ArtifactKind = "attachment" | "evidence" | "script_output" | "script_artifact" | "quality_report" | "checkpoint_bundle" | "checkpoint_manifest" | "execution_manifest" | "execution_trace" | "agent_transcript" | "harness_session_log";
 export interface ArtifactRecord {
   id: string;
   kind: ArtifactKind;
@@ -262,8 +262,20 @@ export interface WorkflowNodeRun {
   metadata_writes?: Record<string, JsonValue>;
   external_references?: Array<{ type: string; id: string; url: string | null }>;
   input_revision: number;
+  input_context?: WorkflowNodeInputContext;
   telemetry: HarnessTelemetryRecord | null;
   timing: NodeRunTiming;
+}
+
+export interface WorkflowNodeInputContext {
+  ticket_revision: number;
+  incoming: WorkflowTransitionContext | null;
+  workflow_inputs: Record<string, boolean | string>;
+  stage_enabled: Record<string, boolean>;
+  attachments: Array<Pick<TicketAttachment, "id" | "filename" | "sha256">>;
+  prior_artifacts: Array<Pick<ArtifactRecord, "id" | "kind" | "filename" | "sha256" | "node_run_id">>;
+  prompt_revision: string | null;
+  resolved_agent_profile: ResolvedAgentProfile | null;
 }
 
 export interface WorkflowTransitionContext {

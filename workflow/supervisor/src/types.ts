@@ -110,7 +110,7 @@ export interface ClaimedTicket {
 }
 
 export interface ArtifactRecord {
-  id: string; kind: "attachment" | "evidence" | "script_output" | "script_artifact" | "quality_report" | "checkpoint_bundle" | "checkpoint_manifest" | "execution_manifest" | "execution_trace";
+  id: string; kind: "attachment" | "evidence" | "script_output" | "script_artifact" | "quality_report" | "checkpoint_bundle" | "checkpoint_manifest" | "execution_manifest" | "execution_trace" | "agent_transcript" | "harness_session_log";
   ticket_id: string; node_run_id: string | null; filename: string; content_type: string;
   size_bytes: number; sha256: string; created_at: string; metadata: Record<string, unknown>;
 }

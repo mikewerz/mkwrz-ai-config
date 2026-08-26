@@ -1293,8 +1293,18 @@ export function createApp(
     const supervisorHost = registry.hostnameFor(leased.execution.supervisor_id);
     const herdr = heartbeatHerdr(request.body?.herdr_observation);
     const pricing = (await configStore.read()).pricing;
-    const telemetry = estimateTelemetryCost(heartbeatTelemetry(request.body?.telemetry, "telemetry"), pricing);
-    const telemetryBaseline = estimateTelemetryCost(heartbeatTelemetry(request.body?.telemetry_baseline, "telemetry_baseline"), pricing);
+    let telemetry: HarnessTelemetrySnapshot | undefined;
+    let telemetryBaseline: HarnessTelemetrySnapshot | undefined;
+    try {
+      telemetry = estimateTelemetryCost(heartbeatTelemetry(request.body?.telemetry, "telemetry"), pricing);
+      telemetryBaseline = estimateTelemetryCost(heartbeatTelemetry(request.body?.telemetry_baseline, "telemetry_baseline"), pricing);
+    } catch (error) {
+      log("warn", "work.heartbeat_telemetry_ignored", {
+        ticket_id: leased.frontmatter.id, node_id: leased.execution.node_id, lease_id: leaseId,
+        error: error instanceof Error ? error.message : String(error),
+        details: error instanceof HttpError ? error.details : undefined,
+      });
+    }
     const updated = await store.heartbeat(leaseId, {
       ...(supervisorHost ? { supervisorHost } : {}),
       ...(typeof request.body?.observed_state === "string" ? { state: request.body.observed_state } : {}),
@@ -1319,6 +1329,42 @@ export function createApp(
     const events = executionTraceEvents(request.body?.events, Number(firstSequence));
     const result = await store.appendExecutionTrace(String(request.params.lease), traceId, Number(firstSequence), events, request.body?.completed === true);
     response.status(201).json(result);
+  });
+
+  app.post("/api/work/:lease/session-evidence", express.raw({ type: "application/octet-stream", limit: MAX_ARTIFACT_BYTES }), async (request, response) => {
+    const kind = String(request.query.kind ?? "");
+    if (kind !== "agent_transcript" && kind !== "harness_session_log") throw new HttpError(422, "Unsupported session evidence kind", undefined, "SESSION_EVIDENCE_INVALID");
+    if (!Buffer.isBuffer(request.body)) throw new HttpError(422, "Session evidence body must be application/octet-stream", undefined, "SESSION_EVIDENCE_INVALID");
+    const source = String(request.query.source ?? "");
+    if (source !== "herdr" && source !== "harness") throw new HttpError(422, "Session evidence source must be herdr or harness", undefined, "SESSION_EVIDENCE_INVALID");
+    const completeness = String(request.query.completeness ?? "");
+    if (!["full", "bounded", "partial"].includes(completeness)) throw new HttpError(422, "Session evidence completeness must be full, bounded, or partial", undefined, "SESSION_EVIDENCE_INVALID");
+    const disposition = message(request.query.disposition, "disposition");
+    const provider = optionalString(request.query.provider);
+    if (provider !== null && !PROVIDERS.includes(provider as typeof PROVIDERS[number])) throw new HttpError(422, "Session evidence provider is invalid", undefined, "SESSION_EVIDENCE_INVALID");
+    const lineCount = request.query.line_count === undefined ? null : Number(request.query.line_count);
+    if (lineCount !== null && (!Number.isSafeInteger(lineCount) || lineCount < 0)) throw new HttpError(422, "line_count must be a non-negative integer", undefined, "SESSION_EVIDENCE_INVALID");
+    const presentation = {
+      title: kind === "agent_transcript" ? "Agent session transcript" : `${provider ? provider[0]!.toUpperCase() + provider.slice(1) : "Harness"} native session log`,
+      description: `${completeness === "full" ? "Complete" : completeness === "bounded" ? "Bounded" : "Partial"} ${source} capture at ${disposition}.`,
+      category: "provenance",
+    };
+    const metadata: Record<string, JsonValue> = {
+      schema_version: 1, source, completeness, disposition,
+      captured_at: new Date().toISOString(), presentation,
+      evidence_key: String(request.query.evidence_key ?? `${source}:${disposition}`),
+      ...(provider ? { provider } : {}),
+      ...(optionalString(request.query.pane_id) ? { pane_id: optionalString(request.query.pane_id)! } : {}),
+      ...(optionalString(request.query.session_ref) ? { session_ref: optionalString(request.query.session_ref)! } : {}),
+      ...(optionalString(request.query.role) ? { role: optionalString(request.query.role)! } : {}),
+      ...(optionalString(request.query.original_filename) ? { original_filename: optionalString(request.query.original_filename)! } : {}),
+      ...(lineCount !== null ? { line_count: lineCount } : {}),
+    };
+    const artifact = await store.addAgentSessionEvidence(String(request.params.lease), {
+      kind, filename: String(request.query.filename ?? ""), contentType: String(request.query.content_type ?? "application/octet-stream"),
+      content: request.body, metadata,
+    });
+    response.status(201).json({ artifact });
   });
 
   app.post("/api/work/:lease/delivered", async (request, response) => {

@@ -1403,11 +1403,26 @@ export function advanceWorkflow(ticket: TicketFrontmatter, definition: WorkflowD
 
 export function beginNodeRun(ticket: TicketFrontmatter, node: WorkflowNode, workflowRevision: string, attempt: number, now: string, supervisorId: string, provider: Provider | null, leaseId: string | null = null): WorkflowNodeRun {
   const timingState: NodeTimingState = node.type === "human_gate" ? "human_wait" : node.type === "wait" ? "external_wait" : "active";
+  const workflowId = ticket.workflow ? activeWorkflowIdentity(ticket).id : null;
+  const resolvedProfile = workflowId && ticket.workflow
+    ? ticket.workflow.resolved_agent_profiles?.[`${workflowId}/${node.id}`] ?? null
+    : null;
   const run: WorkflowNodeRun = {
-    id: randomUUID(), ...(ticket.workflow ? { workflow_id: activeWorkflowIdentity(ticket).id } : {}), workflow_revision: workflowRevision, node_id: node.id, node_type: node.type,
+    id: randomUUID(), ...(workflowId ? { workflow_id: workflowId } : {}), workflow_revision: workflowRevision, node_id: node.id, node_type: node.type,
     visit: ticket.workflow?.node_visits[ticket.workflow ? runtimeNodeKey(ticket, node.id) : node.id] ?? 1, attempt, status: "running", supervisor_id: supervisorId, provider,
     lease_id: leaseId, started_at: now, completed_at: null, outcome: null, summary: null, handoff: null, output: null,
-    input_revision: ticket.revision, telemetry: null, timing: emptyNodeTiming(timingState, now),
+    input_revision: ticket.revision,
+    input_context: {
+      ticket_revision: ticket.revision,
+      incoming: structuredClone(ticket.workflow?.incoming ?? null),
+      workflow_inputs: structuredClone(ticket.workflow?.inputs ?? {}),
+      stage_enabled: structuredClone(ticket.workflow?.stage_enabled ?? {}),
+      attachments: ticket.attachments.map(({ id, filename, sha256 }) => ({ id, filename, sha256 })),
+      prior_artifacts: ticket.artifacts.map(({ id, kind, filename, sha256, node_run_id }) => ({ id, kind, filename, sha256, node_run_id })),
+      prompt_revision: node.prompt && ticket.workflow ? ticket.workflow.prompt_revisions[node.prompt] ?? null : null,
+      resolved_agent_profile: resolvedProfile ? structuredClone(resolvedProfile) : null,
+    },
+    telemetry: null, timing: emptyNodeTiming(timingState, now),
   };
   ticket.workflow?.node_runs.push(run);
   return run;

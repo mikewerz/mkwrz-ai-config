@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 
-import { appendFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
-import { dirname } from "node:path";
+import { dirname, join } from "node:path";
 
 const rawArguments = process.argv.slice(2);
 const sessionOffset = rawArguments[0] === "--session" ? 2 : 0;
@@ -83,6 +83,17 @@ async function completePrompt(prompt, state) {
       console.error(`fake herdr callback failed with HTTP ${response.status}: ${await response.text()}`);
       process.exit(67);
     }
+    state.transcript = [
+      `Work assignment for ${configuration.ticket_id ?? "system-test ticket"}`,
+      "The deterministic fake agent read START_HERE.md and exercised the callback contract.",
+      "Completion callback accepted by the tracker.",
+    ].join("\n");
+    const claudeRoot = process.env.CLAUDE_CONFIG_DIR;
+    if (claudeRoot) {
+      const sessionPath = join(claudeRoot, "projects", "system-test", `${state.session}.jsonl`);
+      mkdirSync(dirname(sessionPath), { recursive: true });
+      writeFileSync(sessionPath, `${JSON.stringify({ type: "message", id: "fake-provenance-record", message: { role: "assistant", provider: "fake", model: "no-model-started", content: [{ type: "text", text: "Deterministic system-test session record." }] } })}\n`);
+    }
     state.callback_submitted = true;
     writeState(state);
   }
@@ -123,7 +134,7 @@ if (args[0] === "workspace" && args[1] === "create") {
   });
 } else if (args[0] === "agent" && args[1] === "read") {
   process.stdout.write(state.pending_prompt && process.env.FAKE_HERDR_COLLAPSE_STAGED_PROMPT === "true"
-    ? "Claude Code\n[Pasted text #1 +14 lines]" : state.pending_prompt ?? "");
+    ? "Claude Code\n[Pasted text #1 +14 lines]" : state.pending_prompt ?? state.transcript ?? "");
 } else if (args[0] === "agent" && args[1] === "prompt") {
   state.prompt_attempts = (state.prompt_attempts ?? 0) + 1;
   const prompt = args[3] ?? "";

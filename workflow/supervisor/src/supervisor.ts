@@ -2,13 +2,13 @@ import type { HerdrController } from "./herdr.js";
 import { PromptStore, type PromptName, type PromptTemplates } from "./prompts.js";
 import { TrackerClient, TrackerError } from "./tracker-client.js";
 import { RepositoryReconciler, type RepositoryReconcilerLike } from "./repositories.js";
-import type { ActivityCapability, AgentObservation, ClaimedTicket, Provider, SupervisorPresence } from "./types.js";
+import type { ActivityCapability, AgentObservation, ArtifactRecord, ClaimedTicket, Provider, SupervisorPresence } from "./types.js";
 import { detectActivityCapabilities, requiredRestoreArtifactIds, runRepositoryActivity, type ActivityResult } from "./activities.js";
-import { TelemetryCollector, zeroTelemetryBaseline, type TelemetryContext } from "./telemetry.js";
+import { TelemetryCollector, zeroTelemetryBaseline, type HarnessSessionEvidenceFile, type TelemetryContext } from "./telemetry.js";
 import type { HarnessTelemetrySnapshot } from "./types.js";
 import { AssignmentBundleWriter, assignmentValues, type AssignmentBundle } from "./assignments.js";
-import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { mkdir, open, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { basename, join } from "node:path";
 import { createHash } from "node:crypto";
 import { captureRepositoryState, fileIdentity, supervisorRuntime } from "./provenance.js";
 import { log } from "./logger.js";
@@ -25,13 +25,17 @@ export interface SupervisorOptions {
   assignmentRoot?: string;
   presence?: SupervisorPresence;
   repositoryReconciler?: RepositoryReconcilerLike;
-  telemetryCollector?: Pick<TelemetryCollector, "collect">;
+  telemetryCollector?: Pick<TelemetryCollector, "collect"> & Partial<Pick<TelemetryCollector, "evidence">>;
   agentExecutionEnabled?: boolean;
   trackerRequestTimeoutMs?: number;
   trackerClaimTimeoutMs?: number;
   trackerArtifactTimeoutMs?: number;
   callbackReminderGraceMs?: number;
   assignmentPromptRecoveryMs?: number;
+  sessionEvidenceEnabled?: boolean;
+  nativeSessionEvidenceEnabled?: boolean;
+  herdrTranscriptLines?: number;
+  sessionEvidenceMaxBytes?: number;
 }
 
 const sleep = (milliseconds: number) => new Promise((resolve) => setTimeout(resolve, milliseconds));
@@ -67,6 +71,28 @@ interface ConfirmedAssignmentDelivery {
   confirmation: AssignmentDeliveryConfirmation;
 }
 
+interface SessionEvidenceCapture {
+  artifacts: ArtifactRecord[];
+  failures: Array<{ source: string; error: string }>;
+}
+
+async function readBoundedEvidenceFile(path: string, maximumBytes: number): Promise<{ content: Buffer; completeness: "full" | "partial" }> {
+  const size = (await stat(path)).size;
+  if (size <= maximumBytes) return { content: await readFile(path), completeness: "full" };
+  const handle = await open(path, "r");
+  try {
+    const content = Buffer.alloc(maximumBytes);
+    const { bytesRead } = await handle.read(content, 0, maximumBytes, size - maximumBytes);
+    const tail = content.subarray(0, bytesRead);
+    const firstNewline = tail.indexOf(0x0a);
+    return { content: firstNewline >= 0 ? tail.subarray(firstNewline + 1) : tail, completeness: "partial" };
+  } finally { await handle.close(); }
+}
+
+function evidenceFilenameToken(value: string): string {
+  return value.replaceAll(/[^A-Za-z0-9._-]/g, "-").replaceAll(/-+/g, "-").slice(0, 80) || "session";
+}
+
 function bundleValues(ticket: ClaimedTicket, callbackBaseUrl: string, projectRoot: string, bundle: AssignmentBundle): Record<string, string> {
   return {
     ...assignmentValues(ticket, callbackBaseUrl, projectRoot),
@@ -97,11 +123,15 @@ export class Supervisor {
   private readonly activityCapabilities: ActivityCapability[];
   private repositorySync: Promise<void> | null = null;
   private lastRepositorySyncAt = 0;
-  private readonly telemetry: Pick<TelemetryCollector, "collect">;
+  private readonly telemetry: Pick<TelemetryCollector, "collect"> & Partial<Pick<TelemetryCollector, "evidence">>;
   private readonly assignments: AssignmentBundleWriter;
   private readonly locallyDeliveredLeases = new Set<string>();
   private readonly callbackReminderGraceMs: number;
   private readonly assignmentPromptRecoveryMs: number;
+  private readonly sessionEvidenceEnabled: boolean;
+  private readonly nativeSessionEvidenceEnabled: boolean;
+  private readonly herdrTranscriptLines: number;
+  private readonly sessionEvidenceMaxBytes: number;
 
   constructor(private readonly herdr: HerdrController, private readonly options: SupervisorOptions) {
     this.tracker = new TrackerClient(options.trackerUrl, options.supervisorId, options.presence?.instanceId, {
@@ -119,11 +149,92 @@ export class Supervisor {
       ? Number(options.callbackReminderGraceMs) : 60_000;
     this.assignmentPromptRecoveryMs = Number.isFinite(options.assignmentPromptRecoveryMs) && Number(options.assignmentPromptRecoveryMs) >= 0
       ? Number(options.assignmentPromptRecoveryMs) : 30_000;
+    this.sessionEvidenceEnabled = options.sessionEvidenceEnabled !== false;
+    this.nativeSessionEvidenceEnabled = options.nativeSessionEvidenceEnabled !== false;
+    this.herdrTranscriptLines = Number.isSafeInteger(options.herdrTranscriptLines) && Number(options.herdrTranscriptLines) >= 120 && Number(options.herdrTranscriptLines) <= 100_000
+      ? Number(options.herdrTranscriptLines) : 5_000;
+    this.sessionEvidenceMaxBytes = Number.isSafeInteger(options.sessionEvidenceMaxBytes) && Number(options.sessionEvidenceMaxBytes) >= 1_048_576
+      ? Number(options.sessionEvidenceMaxBytes) : 64 * 1024 * 1024;
   }
 
   private async collectTelemetry(context: TelemetryContext): Promise<HarnessTelemetrySnapshot | null> {
     try { return await this.telemetry.collect(context); }
     catch (error) { log("warn", "telemetry.collection_failed", { provider: context.harness, session_ref: context.sessionRef }, error); return null; }
+  }
+
+  private async captureAgentSessionEvidence(
+    ticket: ClaimedTicket,
+    lease: string,
+    observation: AgentObservation | null,
+    sessionRef: string | null,
+    disposition: string,
+    trace: ExecutionTraceSink,
+  ): Promise<SessionEvidenceCapture> {
+    const capture: SessionEvidenceCapture = { artifacts: [], failures: [] };
+    if (!this.sessionEvidenceEnabled) return capture;
+    const provider = ticket.frontmatter.execution.provider;
+    const runId = ticket.frontmatter.execution.node_run_id ?? lease;
+    const recordFailure = (source: string, error: unknown) => {
+      const message = errorMessage(error);
+      capture.failures.push({ source, error: message });
+      trace.record("provenance.capture_failed", { source, disposition, error: message });
+      log("warn", "provenance.session_evidence_failed", {
+        source, disposition, provider, ticket_id: ticket.frontmatter.id, node_id: ticket.workflow_node.id, lease_id: lease,
+      }, error);
+    };
+    if (observation && typeof this.herdr.readTranscript === "function") {
+      try {
+        let transcript: string;
+        let completeness: "full" | "bounded" | "partial";
+        try {
+          transcript = await this.herdr.readTranscript(observation.paneId, this.herdrTranscriptLines);
+          const lineCount = transcript ? transcript.split(/\r?\n/).length : 0;
+          completeness = lineCount < this.herdrTranscriptLines ? "full" : "bounded";
+        } catch (error) {
+          trace.record("provenance.herdr_full_read_unavailable", { disposition, error: errorMessage(error) });
+          transcript = await this.herdr.readText(observation.paneId);
+          completeness = "partial";
+        }
+        if (transcript.trim()) {
+          const lineCount = transcript.split(/\r?\n/).length;
+          const artifact = await this.tracker.uploadSessionEvidence(lease, {
+            kind: "agent_transcript", filename: `${evidenceFilenameToken(runId)}.${evidenceFilenameToken(disposition)}.herdr-transcript.txt`,
+            contentType: "text/plain", content: Buffer.from(`${transcript.trimEnd()}\n`), source: "herdr", completeness, disposition,
+            evidenceKey: `herdr:${disposition}`, provider, paneId: observation.paneId, sessionRef, lineCount,
+          });
+          capture.artifacts.push(artifact);
+          trace.record("provenance.capture_stored", { source: "herdr", disposition, artifact_id: artifact.id, completeness, line_count: lineCount });
+        } else {
+          trace.record("provenance.capture_unavailable", { source: "herdr", disposition, reason: "empty_transcript" });
+        }
+      } catch (error) { recordFailure("herdr", error); }
+    }
+    if (this.nativeSessionEvidenceEnabled && sessionRef && this.telemetry.evidence) {
+      let files: HarnessSessionEvidenceFile[] = [];
+      try {
+        const cwd = observation?.foregroundCwd ?? observation?.cwd;
+        files = await this.telemetry.evidence({ harness: provider ?? "", sessionRef, ...(cwd === undefined ? {} : { cwd }) });
+      }
+      catch (error) { recordFailure("harness", error); }
+      for (const [index, file] of files.entries()) {
+        try {
+          const bounded = await readBoundedEvidenceFile(file.path, this.sessionEvidenceMaxBytes);
+          const role = file.role === "primary" ? "primary" : `subagent-${String(index).padStart(2, "0")}`;
+          const artifact = await this.tracker.uploadSessionEvidence(lease, {
+            kind: "harness_session_log",
+            filename: `${evidenceFilenameToken(runId)}.${evidenceFilenameToken(provider ?? "agent")}.${role}.session${file.contentType === "application/x-ndjson" ? ".jsonl" : file.contentType === "application/json" ? ".json" : ".txt"}`,
+            contentType: file.contentType, content: bounded.content, source: "harness", completeness: bounded.completeness,
+            disposition, evidenceKey: `harness:${role}:${disposition}`, provider, ...(observation ? { paneId: observation.paneId } : {}), sessionRef,
+            lineCount: file.contentType === "application/x-ndjson" || file.contentType === "text/plain" ? bounded.content.toString("utf8").split(/\r?\n/).filter(Boolean).length : null,
+            role: file.role, originalFilename: basename(file.originalFilename),
+          });
+          capture.artifacts.push(artifact);
+          trace.record("provenance.capture_stored", { source: "harness", disposition, role: file.role, artifact_id: artifact.id, completeness: bounded.completeness });
+        } catch (error) { recordFailure(`harness:${file.role}`, error); }
+      }
+      if (!files.length) trace.record("provenance.capture_unavailable", { source: "harness", disposition, reason: "session_file_not_found", session_ref: sessionRef });
+    }
+    return capture;
   }
 
   private async finalizeExecution(
@@ -523,6 +634,8 @@ export class Supervisor {
       provider, supervisor_id: this.options.supervisorId, ticket_id: ticket.frontmatter.id, node_id: ticket.workflow_node.id, lease_id: lease,
     });
     const stopLeaseRenewal = this.startLeaseRenewal(ticket, lease);
+    let evidenceObservation: AgentObservation | null = null;
+    let evidenceSessionRef: string | null = null;
     try {
     const repositoryStart = await captureRepositoryState(this.herdr.projectRoot, ticket);
     let currentTicket = ticket;
@@ -534,6 +647,8 @@ export class Supervisor {
     const runtimeConversation = `${conversation}-g${generation}`;
     const agentStartupStartedAt = Date.now();
     let observation = await this.herdr.ensureAgent(ticket.frontmatter.id, provider, runtimeConversation, existing.herdr_pane_id, existing.session_ref, ticket.resolved_agent_profile);
+    evidenceObservation = observation;
+    evidenceSessionRef = observation.sessionRef ?? existing.session_ref;
     log("info", "herdr.agent_ready", {
       provider, supervisor_id: this.options.supervisorId, ticket_id: ticket.frontmatter.id,
       node_id: ticket.workflow_node.id, lease_id: lease, pane_id: observation.paneId,
@@ -555,14 +670,25 @@ export class Supervisor {
         ? snapshot : zeroTelemetryBaseline(snapshot);
       return telemetryBaseline;
     };
+    const persistTelemetry = async (snapshot: HarnessTelemetrySnapshot): Promise<void> => {
+      const baseline = captureBaseline(snapshot);
+      try {
+        await this.tracker.telemetry(lease, snapshot, baseline);
+      } catch (error) {
+        trace.record("telemetry.persistence_failed", { error: errorMessage(error) });
+        log("warn", "telemetry.persistence_failed", {
+          provider, supervisor_id: this.options.supervisorId, ticket_id: ticket.frontmatter.id,
+          node_id: ticket.workflow_node.id, lease_id: lease, session_ref: snapshot.session_ref,
+        }, error);
+      }
+    };
     const initialTelemetry = observation.sessionRef ? await this.collectTelemetry(telemetryContext(observation.sessionRef)) : null;
     if (initialTelemetry) captureBaseline(initialTelemetry);
     let cursor = 0;
     await this.tracker.heartbeat(lease, {
       ...observation, guidanceCursor: cursor,
-      ...(initialTelemetry ? { telemetry: initialTelemetry } : {}),
-      ...(telemetryBaseline ? { telemetryBaseline } : {}),
     });
+    if (initialTelemetry) await persistTelemetry(initialTelemetry);
     if (assignmentDelivered && trackerDeliveryPending) {
       await this.tracker.confirmAssignmentDelivery(lease).then(
         () => { this.locallyDeliveredLeases.delete(lease); },
@@ -575,8 +701,9 @@ export class Supervisor {
     if (ticket.frontmatter.execution.interrupt_request) {
       await this.herdr.interrupt(observation.paneId);
       await this.tracker.acknowledgeInterrupt(lease);
+      const evidence = await this.captureAgentSessionEvidence(ticket, lease, observation, observation.sessionRef ?? existing.session_ref, "interrupted_before_prompt", trace);
       await this.finalizeExecution(ticket, lease, repositoryStart, {
-        agent: { provider, conversation, generation, pane_id: observation.paneId, session_ref: observation.sessionRef, disposition: "interrupted_before_prompt" },
+        agent: { provider, conversation, generation, pane_id: observation.paneId, session_ref: observation.sessionRef, disposition: "interrupted_before_prompt", session_evidence: evidence },
       });
       traceDisposition = "interrupted_before_prompt";
       return;
@@ -602,6 +729,44 @@ export class Supervisor {
     let lastHeartbeatAt = Date.now();
     let lastObservedActivityAt = Date.now();
     let lastObservedRevision = observation.revision;
+    let waitingForAnswerObserved = false;
+    let leaseFenceSettled = false;
+
+    const settleAfterLeaseFence = async (lastObservation: AgentObservation, fenceSource: "control" | "guidance" | "heartbeat"): Promise<void> => {
+      if (leaseFenceSettled) return;
+      leaseFenceSettled = true;
+      trace.record("tracker.callback_observed", { lease_active: false, fence_source: fenceSource });
+      this.locallyDeliveredLeases.delete(lease);
+      let finalObservation: AgentObservation | null = null;
+      try {
+        finalObservation = await this.herdr.observe(observation.paneId);
+        if (finalObservation.sessionRef) {
+          const finalTelemetry = await this.collectTelemetry(telemetryContext(finalObservation.sessionRef));
+          if (finalTelemetry) await this.tracker.telemetry(lease, finalTelemetry, captureBaseline(finalTelemetry)).catch(() => undefined);
+        }
+      } catch { /* the completed node may already have closed its pane */ }
+      await this.herdr.interrupt(observation.paneId).catch(() => undefined);
+      const settledObservation = typeof this.herdr.observe === "function"
+        ? await this.herdr.observe(observation.paneId).catch(() => finalObservation ?? lastObservation)
+        : finalObservation ?? lastObservation;
+      evidenceObservation = settledObservation;
+      evidenceSessionRef = settledObservation.sessionRef ?? finalObservation?.sessionRef ?? knownSessionRef;
+      const evidence = await this.captureAgentSessionEvidence(ticket, lease, settledObservation, evidenceSessionRef, "callback", trace);
+      await this.finalizeExecution(ticket, lease, repositoryStart, {
+        agent: {
+          provider, conversation, generation, pane_id: observation.paneId,
+          session_ref: evidenceSessionRef,
+          model: ticket.resolved_agent_profile?.model ?? null,
+          reasoning: ticket.resolved_agent_profile?.reasoning ?? null,
+          disposition: "callback", fence_source: fenceSource, session_evidence: evidence,
+        },
+      });
+      log("info", "work.agent_settled", {
+        provider, supervisor_id: this.options.supervisorId, ticket_id: ticket.frontmatter.id,
+        node_id: ticket.workflow_node.id, lease_id: lease, disposition: "callback", fence_source: fenceSource,
+      });
+      traceDisposition = "callback";
+    };
 
     while (!this.stopped) {
       await sleep(Math.min(this.options.idlePollMs, this.options.heartbeatIntervalMs));
@@ -610,28 +775,7 @@ export class Supervisor {
         throw error;
       });
       if (control === null) {
-        trace.record("tracker.callback_observed", { lease_active: false });
-        this.locallyDeliveredLeases.delete(lease);
-        let finalObservation = null;
-        try {
-          finalObservation = await this.herdr.observe(observation.paneId);
-          if (finalObservation.sessionRef) {
-            const finalTelemetry = await this.collectTelemetry(telemetryContext(finalObservation.sessionRef));
-            if (finalTelemetry) await this.tracker.telemetry(lease, finalTelemetry, captureBaseline(finalTelemetry)).catch(() => undefined);
-          }
-        } catch { /* the completed node may already have closed its pane */ }
-        await this.finalizeExecution(ticket, lease, repositoryStart, {
-          agent: {
-            provider, conversation, generation, pane_id: observation.paneId,
-            session_ref: finalObservation?.sessionRef ?? knownSessionRef,
-            model: ticket.resolved_agent_profile?.model ?? null,
-            reasoning: ticket.resolved_agent_profile?.reasoning ?? null,
-            disposition: "callback",
-          },
-        });
-        await this.herdr.interrupt(observation.paneId).catch(() => undefined);
-        log("info", "work.agent_settled", { provider, supervisor_id: this.options.supervisorId, ticket_id: ticket.frontmatter.id, node_id: ticket.workflow_node.id, lease_id: lease, disposition: "callback" });
-        traceDisposition = "callback";
+        await settleAfterLeaseFence(observation, "control");
         return;
       }
       if (control?.interrupt) {
@@ -645,13 +789,19 @@ export class Supervisor {
           }
         } catch { /* interruption telemetry is best effort */ }
         await this.tracker.acknowledgeInterrupt(lease);
+        const settledObservation = typeof this.herdr.observe === "function"
+          ? await this.herdr.observe(observation.paneId).catch(() => observation)
+          : observation;
+        evidenceObservation = settledObservation;
+        evidenceSessionRef = settledObservation.sessionRef ?? knownSessionRef;
+        const evidence = await this.captureAgentSessionEvidence(ticket, lease, settledObservation, evidenceSessionRef, "interrupted", trace);
         await this.finalizeExecution(ticket, lease, repositoryStart, {
           agent: {
             provider, conversation, generation, pane_id: observation.paneId,
-            session_ref: knownSessionRef,
+            session_ref: evidenceSessionRef,
             model: ticket.resolved_agent_profile?.model ?? null,
             reasoning: ticket.resolved_agent_profile?.reasoning ?? null,
-            disposition: "interrupted",
+            disposition: "interrupted", session_evidence: evidence,
           },
         });
         traceDisposition = "interrupted";
@@ -662,9 +812,12 @@ export class Supervisor {
       catch (error) {
         trace.record("agent.observation_failed", { error: errorMessage(error) });
         log("error", "herdr.agent_disappeared", { provider, ticket_id: ticket.frontmatter.id, node_id: ticket.workflow_node.id, lease_id: lease }, error);
+        await this.captureAgentSessionEvidence(ticket, lease, evidenceObservation, evidenceSessionRef, "agent_disappeared", trace);
         traceDisposition = "agent_disappeared";
         return;
       }
+      evidenceObservation = current;
+      evidenceSessionRef = current.sessionRef ?? evidenceSessionRef;
       const revisionAdvanced = current.revision !== null && lastObservedRevision !== null && current.revision !== lastObservedRevision;
       if (current.state === "working" || revisionAdvanced) lastObservedActivityAt = Date.now();
       lastObservedRevision = current.revision;
@@ -673,7 +826,10 @@ export class Supervisor {
         if (error instanceof TrackerError && error.status === 409) return null;
         throw error;
       });
-      if (guidance === null) return;
+      if (guidance === null) {
+        await settleAfterLeaseFence(current, "guidance");
+        return;
+      }
       for (const item of guidance) {
         await this.refreshPrompts();
         currentTicket = await this.tracker.assignment(lease);
@@ -692,24 +848,26 @@ export class Supervisor {
       const heartbeatDue = Date.now() - lastHeartbeatAt >= this.options.heartbeatIntervalMs;
       if (guidance.length > 0 || sessionAppeared || heartbeatDue) {
         const currentTelemetry = current.sessionRef ? await this.collectTelemetry(telemetryContext(current.sessionRef)) : null;
-        if (currentTelemetry) captureBaseline(currentTelemetry);
         try {
-          await this.tracker.heartbeat(lease, {
-            ...current, guidanceCursor: cursor,
-            ...(currentTelemetry ? { telemetry: currentTelemetry } : {}),
-            ...(telemetryBaseline ? { telemetryBaseline } : {}),
-          });
+          await this.tracker.heartbeat(lease, { ...current, guidanceCursor: cursor });
         }
         catch (error) {
           if (error instanceof TrackerError && error.status === 409) {
             if (currentTelemetry) await this.tracker.telemetry(lease, currentTelemetry, captureBaseline(currentTelemetry)).catch(() => undefined);
+            await settleAfterLeaseFence(current, "heartbeat");
             return;
           }
           throw error;
         }
+        if (currentTelemetry) await persistTelemetry(currentTelemetry);
         knownSessionRef = current.sessionRef;
         lastHeartbeatAt = Date.now();
       }
+
+      if (control.waitingForAnswer && !waitingForAnswerObserved) {
+        await this.captureAgentSessionEvidence(ticket, lease, current, current.sessionRef ?? knownSessionRef, "question", trace);
+      }
+      waitingForAnswerObserved = control.waitingForAnswer;
 
       if (!control?.waitingForAnswer && !callbackReminderSent && (current.state === "idle" || current.state === "done")
         && Date.now() - lastObservedActivityAt >= this.callbackReminderGraceMs) {
@@ -734,6 +892,7 @@ export class Supervisor {
             node_id: ticket.workflow_node.id, lease_id: lease, disposition: result.blocked ? "blocked" : "requeued",
           }, error);
           trace.record("delivery.failed", { reason, disposition: result.blocked ? "blocked" : "requeued" });
+          await this.captureAgentSessionEvidence(ticket, lease, evidenceObservation, evidenceSessionRef, "delivery_failed", trace);
           traceDisposition = result.blocked ? "delivery_failed_blocked" : "delivery_failed_requeued";
           await sleep(this.options.idlePollMs);
           return;

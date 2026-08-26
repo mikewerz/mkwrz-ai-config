@@ -16,6 +16,14 @@ export interface TelemetryContext {
 export interface HarnessTelemetryAdapter {
   readonly harness: string;
   collect(context: TelemetryContext): Promise<HarnessTelemetrySnapshot | null>;
+  evidence?(context: TelemetryContext): Promise<HarnessSessionEvidenceFile[]>;
+}
+
+export interface HarnessSessionEvidenceFile {
+  path: string;
+  role: "primary" | "subagent";
+  originalFilename: string;
+  contentType: "application/x-ndjson" | "application/json" | "text/plain";
 }
 
 export interface TelemetryRoots {
@@ -121,6 +129,11 @@ class CodexTelemetryAdapter implements HarnessTelemetryAdapter {
   readonly harness = "codex";
   constructor(private readonly root: string) {}
 
+  async evidence(context: TelemetryContext): Promise<HarnessSessionEvidenceFile[]> {
+    const path = await findNamed(join(this.root, "sessions"), context.sessionRef);
+    return path ? [{ path, role: "primary", originalFilename: basename(path), contentType: "application/x-ndjson" }] : [];
+  }
+
   async collect(context: TelemetryContext): Promise<HarnessTelemetrySnapshot | null> {
     const path = await findNamed(join(this.root, "sessions"), context.sessionRef);
     if (!path) return null;
@@ -192,15 +205,32 @@ class ClaudeTelemetryAdapter implements HarnessTelemetryAdapter {
   readonly harness = "claude";
   constructor(private readonly root: string, private readonly cacheRoot: string) {}
 
-  async collect(context: TelemetryContext): Promise<HarnessTelemetrySnapshot | null> {
-    const main = await findNamed(join(this.root, "projects"), context.sessionRef);
-    if (!main) return null;
-    const result = snapshotBase(this.harness, context.sessionRef, "session_log", main);
+  private async sessionPaths(sessionRef: string): Promise<string[]> {
+    const main = await findNamed(join(this.root, "projects"), sessionRef);
+    if (!main) return [];
     const paths = [main];
     const subagents = join(dirname(main), basename(main, ".jsonl"), "subagents");
     try {
-      for (const entry of await readdir(subagents, { withFileTypes: true })) if (entry.isFile() && entry.name.endsWith(".jsonl")) paths.push(join(subagents, entry.name));
+      for (const entry of await readdir(subagents, { withFileTypes: true })) {
+        if (entry.isFile() && entry.name.endsWith(".jsonl")) paths.push(join(subagents, entry.name));
+      }
     } catch { /* no subagents */ }
+    return paths;
+  }
+
+  async evidence(context: TelemetryContext): Promise<HarnessSessionEvidenceFile[]> {
+    const paths = await this.sessionPaths(context.sessionRef);
+    return paths.slice(0, 33).map((path, index) => ({
+      path, role: index === 0 ? "primary" : "subagent",
+      originalFilename: basename(path), contentType: "application/x-ndjson",
+    }));
+  }
+
+  async collect(context: TelemetryContext): Promise<HarnessTelemetrySnapshot | null> {
+    const paths = await this.sessionPaths(context.sessionRef);
+    const main = paths[0];
+    if (!main) return null;
+    const result = snapshotBase(this.harness, context.sessionRef, "session_log", main);
     const messages = new Map<string, { usage: TokenUsage; model: string | null; rawUsage: JsonRecord; thinking: boolean }>();
     let version: string | null = null;
     let mainModel: string | null = null;
@@ -302,6 +332,10 @@ export class TelemetryCollector {
   async collect(context: TelemetryContext): Promise<HarnessTelemetrySnapshot | null> {
     return this.adapters.get(context.harness)?.collect(context) ?? null;
   }
+
+  async evidence(context: TelemetryContext): Promise<HarnessSessionEvidenceFile[]> {
+    return await this.adapters.get(context.harness)?.evidence?.(context) ?? [];
+  }
 }
 
 export function zeroTelemetryBaseline(snapshot: HarnessTelemetrySnapshot): HarnessTelemetrySnapshot {
@@ -311,8 +345,11 @@ export function zeroTelemetryBaseline(snapshot: HarnessTelemetrySnapshot): Harne
     // A fresh session starts this node at zero even when its model and pricing
     // are not observable until the first response. The latest snapshot still
     // has to supply a reported cost or match configured pricing.
-    cost: { total_usd: 0, kind: snapshot.cost.kind },
+    cost: snapshot.cost.kind === "unavailable"
+      ? { ...snapshot.cost, total_usd: null }
+      : { ...snapshot.cost, total_usd: 0 },
     context: { ...snapshot.context, used_tokens: 0, used_percent: snapshot.context.window_tokens ? 0 : null },
     rate_limits: structuredClone(snapshot.rate_limits),
+    attributes: { ...snapshot.attributes, agentic_baseline: "fresh_zero" },
   };
 }

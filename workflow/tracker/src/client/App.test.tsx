@@ -101,7 +101,7 @@ const metricsFixture = {
   available: { labels: ["dashboard"], workflows: [{ id: "standard-delivery", revision: "workflow-r1" }], repositories: ["demo"] },
   totals: {
     tickets: 1, completed: 1, archived: 0, total_tokens: 1_100, known_cost_usd: 0.02,
-    active_ms: 90_000, quota_paused_ms: 30_000, human_wait_ms: 60_000,
+    active_ms: 90_000, quota_paused_ms: 30_000, human_wait_ms: 60_000, external_wait_ms: 0,
     estimated_human_days: 2, estimated_human_cost_usd: 2_000, human_day_rate_usd: 1_000,
     comparison_tickets: 1, comparison_human_cost_usd: 2_000, comparison_factory_cost_usd: 0.02,
     comparison_savings_usd: 1_999.98, comparison_savings_rate: 0.99999,
@@ -109,7 +109,7 @@ const metricsFixture = {
     production_assessed: 1, production_success_rate: 1,
   },
   coverage: { agent_runs: 1, token_runs: 1, cost_runs: 1, estimated_cost_runs: 0, complete_token_tickets: 1, complete_cost_tickets: 1 },
-  summaries: Object.fromEntries(["ticket_duration_ms", "active_time_ms", "human_wait_ms", "quota_pause_ms", "tokens_per_ticket", "cost_per_ticket_usd", "estimated_human_days", "estimated_human_cost_usd"].map((key) => [key, { count: 1, min: 1, q1: 1, median: 1, q3: 1, max: 1, mean: 1, p90: 1, p95: 1 }])),
+  summaries: Object.fromEntries(["ticket_duration_ms", "active_time_ms", "human_wait_ms", "external_wait_ms", "quota_pause_ms", "tokens_per_ticket", "cost_per_ticket_usd", "estimated_human_days", "estimated_human_cost_usd"].map((key) => [key, { count: 1, min: 1, q1: 1, median: 1, q3: 1, max: 1, mean: 1, p90: 1, p95: 1 }])),
   workflows: [{
     workflow_id: "standard-delivery", workflow_revision: "workflow-r1", ticket_count: 1,
     nodes: [{
@@ -117,7 +117,7 @@ const metricsFixture = {
       ticket_count: 1, runs: 1, completed: 1, running: 0, interrupted: 0, bypassed: 0, lease_lost: 0, delivery_failed: 0,
       classifications: { success: 1, failure: 0, neutral: 0, unclassified: 0 }, success_rate: 1,
       wall_ms: { count: 1, min: 90_000, q1: 90_000, median: 90_000, q3: 90_000, max: 90_000, mean: 90_000, p90: 90_000, p95: 90_000 },
-      active_ms: 90_000, quota_paused_ms: 30_000, human_wait_ms: 0, total_tokens: 1_100, known_cost_usd: 0.02,
+      active_ms: 90_000, quota_paused_ms: 30_000, human_wait_ms: 0, external_wait_ms: 0, total_tokens: 1_100, known_cost_usd: 0.02,
       telemetry_coverage: { token_runs: 1, cost_runs: 1, total_runs: 1 },
       branches: [{ outcome: "completed", label: "Completed", target: "done", metric_class: "success", count: 1, rate: 1 }],
       quality: [{ key: "coverage.line_percent", label: "Line coverage", type: "number", unit: "percent", direction: "higher_is_better", ticket_count: 1, reports: 1, statuses: { pass: 1, warn: 0, fail: 0, unknown: 0 }, pass_rate: 1, numeric: { count: 1, min: 84, q1: 84, median: 84, q3: 84, max: 84, mean: 84, p90: 84, p95: 84 }, values: [{ value: "84", count: 1 }] }],
@@ -151,6 +151,7 @@ describe("operator UI", () => {
   let workflows: any[];
   let workflowReleases: any;
   let intakeOverview: any;
+  let extraTicketSummaries: any[];
   beforeEach(() => {
     installLocalStorage();
     document.documentElement.removeAttribute("data-theme");
@@ -172,7 +173,12 @@ describe("operator UI", () => {
         "standard-delivery/review": { alias: "review", provider: "codex", model: "gpt-5.6-sol", reasoning: "high" },
       },
     };
+    current.frontmatter.workflow_assignment = {
+      workflow_id: "standard-delivery", revision: "workflow-r1", version: 1,
+      selection: "default", assigned_at: "2026-08-14T11:00:00Z", experiment_id: null,
+    };
     claimBlockers = [];
+    extraTicketSummaries = [];
     prompts = structuredClone(promptFixtures);
     workflows = [structuredClone(workflowFixture)];
     workflowReleases = { catalog: { version: 1, revision: 1, updated_at: "2026-08-14T12:00:00Z", default_workflow_id: "standard-delivery", workflows: { "standard-delivery": { default_revision: "workflow-r1" } } }, releases: [{ workflow_id: "standard-delivery", revision: "workflow-r1", version: 1, label: "Initial release", status: "active", published_at: "2026-08-14T12:00:00Z", parent_revision: null, is_default: true, definition: structuredClone(workflowDefinition) }] };
@@ -197,7 +203,7 @@ describe("operator UI", () => {
       const path = String(input);
       if ((path === "/api/tickets" || path === "/api/tickets?include_archived=true") && !init?.method) {
         const ticket = { ...summary, phase: current.frontmatter.phase, status: current.frontmatter.status, priority: current.frontmatter.priority, revision: current.frontmatter.revision, claim_blockers: claimBlockers, archived_at: current.frontmatter.archived_at };
-        return Response.json({ tickets: current.frontmatter.archived_at && path === "/api/tickets" ? [] : [ticket] });
+        return Response.json({ tickets: [...(current.frontmatter.archived_at && path === "/api/tickets" ? [] : [ticket]), ...extraTicketSummaries] });
       }
       if (path === "/api/runtime" && !init?.method) return Response.json({ agents: current.frontmatter.execution ? [{
         ticket_id: current.id, title: current.frontmatter.title, phase: current.frontmatter.phase, status: current.frontmatter.status,
@@ -368,6 +374,18 @@ describe("operator UI", () => {
     expect(await screen.findByRole("button", { name: "Use Retro Hacker theme" })).toHaveAttribute("aria-pressed", "true");
   });
 
+  it("keeps workflows, prompts, and configuration visible in desktop navigation", async () => {
+    render(<App />);
+
+    const navigation = await screen.findByRole("navigation", { name: "Primary navigation" });
+    expect(within(navigation).getByRole("button", { name: "Workflows" })).toBeInTheDocument();
+    expect(within(navigation).getByRole("button", { name: "Prompts" })).toBeInTheDocument();
+    expect(within(navigation).getByRole("button", { name: "Configuration" })).toBeInTheDocument();
+    expect(within(navigation).queryByText("Build")).not.toBeInTheDocument();
+    expect(screen.queryByTitle("Open configuration")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Open ticket queue" })).toBeInTheDocument();
+  });
+
   it("puts a unified attention inbox first and exposes gate and question actions inline", async () => {
     current.frontmatter.status = "waiting_approval";
     current.frontmatter.execution = null;
@@ -441,7 +459,9 @@ describe("operator UI", () => {
   it("presents a live ticket as a workflow-focused issue instead of a raw editor", async () => {
     render(<App />);
     fireEvent.click(await screen.findByRole("button", { name: /UI ticket/i }));
-    expect(await screen.findByRole("heading", { name: "Standard delivery" })).toBeInTheDocument();
+    const workflow = await screen.findByRole("region", { name: "Ticket workflow" });
+    expect(within(workflow).getByRole("heading", { name: "Workflow · Standard delivery · v1" })).toBeInTheDocument();
+    expect(within(workflow).queryByText(/standard-delivery@/i)).not.toBeInTheDocument();
     expect(screen.getByText("Running tests")).toBeInTheDocument();
     expect(screen.getByText("/srv/projects/demo")).toBeInTheDocument();
     expect(screen.getByText("herdr:claude · id")).toBeInTheDocument();
@@ -503,7 +523,7 @@ describe("operator UI", () => {
     current.frontmatter.workflow.node_runs = Array.from({ length: 13 }, (_, index) => ({
       id: `run-${index}`, workflow_revision: "workflow-r1", node_id: index === 0 ? "historic-run" : "implementation", node_type: index === 12 ? "script" : "agent",
       visit: index + 1, attempt: 1, status: "completed", outcome: "completed", summary: `Run ${index} finished.`,
-      started_at: "2026-08-14T11:00:00Z", completed_at: "2026-08-14T11:01:00Z", lease_id: `lease-${index}`, telemetry: null, timing,
+      started_at: "2026-08-14T11:00:00Z", completed_at: "2026-08-14T11:01:00Z", lease_id: `lease-${index}`, provider: index === 12 ? null : "claude", telemetry: null, timing,
       ...(index === 12 ? { supervisor_id: "worker-a", provider: "claude", input_revision: 7, conversation_generation: 2, output_path: ".runs/output.log", output_bytes: 2_048, manifest_artifact_id: "execution-manifest" } : {}),
     }));
     current.frontmatter.artifacts = [
@@ -513,6 +533,8 @@ describe("operator UI", () => {
       { id: "checkpoint-manifest", kind: "checkpoint_manifest", ticket_id: "APT-42", node_run_id: "run-12", filename: "checkpoint-1.json", content_type: "application/json", size_bytes: 500, sha256: "c".repeat(64), created_at: "2026-08-14T11:02:00Z", metadata: {} },
       { id: "checkpoint-bundle", kind: "checkpoint_bundle", ticket_id: "APT-42", node_run_id: "run-12", filename: "demo.bundle", content_type: "application/x-git-bundle", size_bytes: 4_096, sha256: "d".repeat(64), created_at: "2026-08-14T11:01:00Z", metadata: {} },
       { id: "trace-1", kind: "execution_trace", ticket_id: "APT-42", node_run_id: "run-12", filename: "run-12.000001-000002.herdr-trace.jsonl", content_type: "application/x-ndjson", size_bytes: 400, sha256: "1".repeat(64), created_at: "2026-08-14T11:01:30Z", metadata: { trace_id: "trace-id", first_sequence: 1, last_sequence: 2, event_count: 2, completed: true } },
+      { id: "transcript-1", kind: "agent_transcript", ticket_id: "APT-42", node_run_id: "run-10", filename: "implementation.herdr.txt", content_type: "text/plain", size_bytes: 2_400, sha256: "2".repeat(64), created_at: "2026-08-14T11:01:40Z", metadata: { source: "herdr", completeness: "bounded", disposition: "callback", presentation: { title: "Agent session transcript", description: "Bounded Herdr capture at callback.", category: "provenance" } } },
+      { id: "native-1", kind: "harness_session_log", ticket_id: "APT-42", node_run_id: "run-10", filename: "session-claude.jsonl", content_type: "application/x-ndjson", size_bytes: 6_400, sha256: "3".repeat(64), created_at: "2026-08-14T11:01:41Z", metadata: { source: "harness", completeness: "full", disposition: "callback", provider: "claude", role: "primary", presentation: { title: "Claude native session log", description: "Complete harness capture at callback.", category: "provenance" } } },
     ];
     current.frontmatter.checkpoints = [{ id: "checkpoint-1", label: "Before release", kind: "workflow", node_id: "implementation", node_run_id: "run-12", created_at: "2026-08-14T11:02:00Z", manifest_artifact_id: "checkpoint-manifest", repositories: [{ repository: "demo", head_sha: "1".repeat(40), snapshot_sha: "2".repeat(40), branch: "main", remote_url: "https://github.com/example/demo.git", dirty: true, bundle_artifact_id: "checkpoint-bundle" }] }];
     current.frontmatter.attachments = [{ id: "attachment-1", filename: "requirements.txt", content_type: "text/plain", size_bytes: 42, sha256: "e".repeat(64), created_at: "2026-08-14T10:00:00Z" }];
@@ -544,6 +566,10 @@ describe("operator UI", () => {
     expect((await within(evidence).findAllByText(/agent\.prompt/)).length).toBeGreaterThan(0);
     expect(within(evidence).getByText("Delivery Confirmed")).toBeInTheDocument();
     expect(within(evidence).getByRole("link", { name: "JSONL 1" })).toHaveAttribute("href", "/api/tickets/APT-42/artifacts/trace-1/content?download=true");
+    fireEvent.click(within(evidence).getByRole("tab", { name: /Provenance/ }));
+    expect(within(evidence).getByText("Agent session transcript")).toBeInTheDocument();
+    expect(within(evidence).getByText("Claude native session log")).toBeInTheDocument();
+    expect(within(evidence).getByText(/1\/12 executed agent runs captured/)).toBeInTheDocument();
     fireEvent.click(within(evidence).getByRole("tab", { name: /Technical artifacts/ }));
     const manifestRow = within(evidence).getByText("run-12.execution-manifest.json").closest("article")!;
     expect(within(manifestRow).getByRole("link", { name: "Download" })).toHaveAttribute("href", "/api/tickets/APT-42/artifacts/execution-manifest/content?download=true");
@@ -572,14 +598,25 @@ describe("operator UI", () => {
     current.frontmatter.workflow.completed_at = "2026-08-14T12:05:00Z";
     const usage = { input_tokens: 10_000, cached_input_tokens: 0, cache_write_input_tokens: 0, output_tokens: 2_000, reasoning_output_tokens: 0, total_tokens: 12_000 };
     const snapshot = { schema_version: 1, harness: "claude", session_ref: "session-1", observed_at: "2026-08-14T11:01:00Z", source: { kind: "session_log", detail: "session.jsonl" }, model: { id: "claude-opus", provider: "anthropic", observed_ids: ["claude-opus"] }, reasoning: { effort: "high", enabled: true, source: "session" }, usage, cost: { total_usd: 1.25, kind: "reported" }, context: { used_tokens: 12_000, window_tokens: 200_000, used_percent: 6 }, rate_limits: [], attributes: {} };
-    current.frontmatter.workflow.node_runs = [{ id: "run-1", workflow_revision: "workflow-r1", node_id: "implementation", node_type: "agent", visit: 1, attempt: 1, status: "completed", outcome: "completed", summary: "Implemented", started_at: "2026-08-14T11:00:00Z", completed_at: "2026-08-14T11:01:00Z", lease_id: "lease-1", timing, telemetry: { baseline: { ...snapshot, usage: { ...usage, input_tokens: 0, output_tokens: 0, total_tokens: 0 }, cost: { total_usd: 0, kind: "reported" } }, latest: snapshot, delta: { usage, cost_usd: 1.25 } } }];
+    current.frontmatter.workflow.node_runs = [
+      { id: "run-spec", workflow_revision: "workflow-r1", node_id: "specification", node_type: "agent", visit: 1, attempt: 0, status: "completed", outcome: "bypassed", summary: "Specification was disabled.", started_at: "2026-08-14T10:59:59Z", completed_at: "2026-08-14T10:59:59Z", lease_id: null, provider: null, timing, telemetry: null },
+      { id: "run-1", workflow_revision: "workflow-r1", node_id: "implementation", node_type: "agent", visit: 1, attempt: 1, status: "completed", outcome: "completed", summary: "Implemented", started_at: "2026-08-14T11:00:00Z", completed_at: "2026-08-14T11:01:00Z", lease_id: "lease-1", provider: "claude", timing, telemetry: { baseline: { ...snapshot, usage: { ...usage, input_tokens: 0, output_tokens: 0, total_tokens: 0 }, cost: { total_usd: 0, kind: "reported" } }, latest: snapshot, delta: { usage, cost_usd: 1.25 } } },
+      { id: "run-review", workflow_revision: "workflow-r1", node_id: "review", node_type: "agent", visit: 1, attempt: 0, status: "completed", outcome: "bypassed", summary: "Review was disabled.", started_at: "2026-08-14T11:01:01Z", completed_at: "2026-08-14T11:01:01Z", lease_id: null, provider: null, timing, telemetry: null },
+    ];
     current.workflow_node = structuredClone(workflowDefinition.nodes.find((node) => node.id === "done"));
 
     render(<App />);
     fireEvent.click(await screen.findByRole("button", { name: /UI ticket/i }));
     const recap = await screen.findByLabelText("Execution recap");
     expect(within(recap).getByText("Implementation")).toBeInTheDocument();
-    expect(within(recap).getByText("12K")).toBeInTheDocument();
+    expect(within(recap).getByText("Uncached input").parentElement).toHaveTextContent("10K");
+    expect(within(recap).getByText("Cached input").parentElement).toHaveTextContent("0");
+    expect(within(recap).getByText("Cache write").parentElement).toHaveTextContent("0");
+    expect(within(recap).getByText("Output tokens").parentElement).toHaveTextContent("2K");
+    expect(within(recap).getByText("Reasoning output").parentElement).toHaveTextContent("0");
+    expect(within(recap).getByText("Reported cost").parentElement).toHaveTextContent("$1.25");
+    expect(within(recap).getAllByText("1/1 executed agent runs")).toHaveLength(2);
+    expect(within(recap).getByText("0/1").parentElement).toHaveTextContent("executed agent runs captured");
     expect(within(recap).getByText("$1.25")).toBeInTheDocument();
     expect(within(recap).getByRole("link", { name: /demo · PR/ })).toHaveAttribute("href", "https://github.com/example/demo/pull/42");
     expect(within(recap).getByRole("link", { name: /Release review/ })).toBeInTheDocument();
@@ -628,16 +665,16 @@ describe("operator UI", () => {
       source: { kind: "session_log", detail: "session.jsonl" }, model: { id: "claude-sonnet-4-5", provider: "anthropic", observed_ids: ["claude-sonnet-4-5"] },
       reasoning: { effort: "high", enabled: true, source: "session" },
       usage: { input_tokens: 900, cached_input_tokens: 100, cache_write_input_tokens: 0, output_tokens: 100, reasoning_output_tokens: 0, total_tokens: 1100 },
-      cost: { total_usd: 0.02, kind: "reported" }, context: { used_tokens: 1100, window_tokens: 100000, used_percent: 1.1 },
+      cost: { total_usd: 0.023456, kind: "estimated" }, context: { used_tokens: 1100, window_tokens: 100000, used_percent: 1.1 },
       rate_limits: [], attributes: { cli_version: "1.2.3" },
     };
-    const telemetry = { baseline: { ...snapshot, usage: { ...snapshot.usage, input_tokens: 0, cached_input_tokens: 0, output_tokens: 0, total_tokens: 0 }, cost: { total_usd: 0, kind: "reported" } }, latest: snapshot, delta: { usage: snapshot.usage, cost_usd: 0.02 } };
+    const telemetry = { baseline: { ...snapshot, usage: { ...snapshot.usage, input_tokens: 0, cached_input_tokens: 0, output_tokens: 0, total_tokens: 0 }, cost: { total_usd: 0, kind: "reported" } }, latest: snapshot, delta: { usage: snapshot.usage, cost_usd: 0.023456 } };
     current.frontmatter.execution.telemetry = telemetry;
     current.frontmatter.workflow = {
       id: "standard-delivery", revision: "workflow-r1", current_node: "implementation", transition_count: 1,
       started_at: new Date(Date.now() - 120_000).toISOString(), completed_at: null, current_node_entered_at: new Date(Date.now() - 120_000).toISOString(),
       node_visits: { implementation: 1 }, node_attempts: {}, prompt_revisions: {}, inputs: {}, stage_enabled: {}, incoming: null,
-      node_runs: [{ id: "run-1", node_id: "implementation", node_type: "agent", visit: 1, attempt: 1, status: "running", outcome: null, summary: null, started_at: new Date(Date.now() - 60_000).toISOString(), completed_at: null, lease_id: "lease-1", telemetry, timing: { active_ms: 30_000, quota_paused_ms: 30_000, human_wait_ms: 0, state: "quota_paused", last_accounted_at: new Date().toISOString(), pause_limit_id: "five_hour", pause_until: new Date(Date.now() + 60_000).toISOString() } }],
+      node_runs: [{ id: "run-1", workflow_revision: "workflow-r1", node_id: "implementation", node_type: "agent", visit: 1, attempt: 1, status: "running", outcome: null, summary: null, started_at: new Date(Date.now() - 60_000).toISOString(), completed_at: null, lease_id: "lease-1", provider: "claude", telemetry, timing: { active_ms: 30_000, quota_paused_ms: 30_000, human_wait_ms: 0, state: "quota_paused", last_accounted_at: new Date().toISOString(), pause_limit_id: "five_hour", pause_until: new Date(Date.now() + 60_000).toISOString() } }],
     };
     render(<App />);
     fireEvent.click(await screen.findByRole("button", { name: /UI ticket/i }));
@@ -645,20 +682,52 @@ describe("operator UI", () => {
     expect(screen.getAllByText("high").length).toBeGreaterThan(0);
     expect(screen.getAllByText("1.1K").length).toBeGreaterThan(0);
     expect(screen.getAllByText("$0.02").length).toBeGreaterThan(0);
+    expect(screen.queryByText(/\$0\.023/)).not.toBeInTheDocument();
+    const usageCard = screen.getByLabelText("Ticket usage");
+    expect(within(usageCard).getByText("Uncached input").parentElement).toHaveTextContent("900");
+    expect(within(usageCard).getByText("Cached input").parentElement).toHaveTextContent("100");
+    expect(within(usageCard).getByText("Cache write").parentElement).toHaveTextContent("0");
+    expect(within(usageCard).getByText("Output tokens").parentElement).toHaveTextContent("100");
+    expect(within(usageCard).getByText("Reasoning output").parentElement).toHaveTextContent("0");
+    expect(within(usageCard).getByText("Estimated cost").parentElement).toHaveTextContent("$0.02");
+    const workflowCard = screen.getByLabelText("Ticket workflow");
+    expect(within(workflowCard).getByText("Uncached 900 · Cached 100 · Write 0")).toBeInTheDocument();
+    expect(within(workflowCard).getByText("Out 100")).toBeInTheDocument();
+    expect(within(workflowCard).getByText("Estimated cost $0.02")).toBeInTheDocument();
     expect(screen.getByText(/Cost coverage: 1\/1/)).toBeInTheDocument();
     expect(screen.getByText("Quota paused")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("tab", { name: /Run history/ }));
     expect(screen.getAllByText(/30s quota paused/).length).toBeGreaterThan(0);
+    expect(screen.getByText(/Uncached 900 · Cached 100 · Write 0 · Output 100/)).toBeInTheDocument();
   });
 
-  it("orders the queue by priority and allows priority changes while a ticket is live", async () => {
+  it("sorts the ticket queue by most recently updated by default", async () => {
+    extraTicketSummaries = [
+      { ...summary, id: "APT-NEW", title: "Newest ticket", status: "completed", updated_at: "2026-08-14T13:00:00Z" },
+      { ...summary, id: "APT-OLD", title: "Oldest ticket", status: "blocked", updated_at: "2026-08-14T10:00:00Z" },
+    ];
+
+    render(<App />);
+    const table = await screen.findByRole("table");
+    const rows = within(table).getAllByRole("row").slice(1);
+    expect(rows.map((row) => within(row).getByRole("button").textContent)).toEqual([
+      expect.stringContaining("APT-NEW"),
+      expect.stringContaining("APT-42"),
+      expect.stringContaining("APT-OLD"),
+    ]);
+    expect(screen.getByText("Most recently updated tickets appear first.")).toBeInTheDocument();
+  });
+
+  it("allows priority changes while a ticket is live", async () => {
     render(<App />);
     expect(await screen.findByRole("heading", { name: /Ticket queue/i })).toBeInTheDocument();
     fireEvent.click(await screen.findByRole("button", { name: /UI ticket/i }));
     const priority = await screen.findByLabelText("Ticket priority");
     expect(priority).toHaveValue(50);
     fireEvent.change(priority, { target: { value: "75" } });
-    fireEvent.click(within(priority.parentElement!).getByRole("button", { name: "Update" }));
+    const update = within(priority.parentElement!).getByRole("button", { name: "Update" });
+    await waitFor(() => expect(update).toBeEnabled());
+    fireEvent.click(update);
     await waitFor(() => expect(fetch).toHaveBeenCalledWith("/api/tickets/APT-42/priority", expect.objectContaining({
       method: "POST", body: expect.stringContaining('"priority":75'),
     })));
@@ -700,6 +769,8 @@ describe("operator UI", () => {
     expect(screen.getByText("192.0.2.70")).toBeInTheDocument();
     expect(screen.getByText("/srv/projects")).toBeInTheDocument();
     expect(screen.getByText("Claude")).toBeInTheDocument();
+    expect(screen.getByText("Disabled")).toBeInTheDocument();
+    expect(screen.getByText("Disabled in Configuration → Integrations")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /APT-42 · UI ticket/i })).toBeInTheDocument();
   });
 
@@ -708,14 +779,25 @@ describe("operator UI", () => {
     render(<App />);
     fireEvent.click(await screen.findByRole("button", { name: "Metrics" }));
     expect(await screen.findByRole("heading", { name: "Factory metrics" })).toBeInTheDocument();
-    expect(screen.getByText("Nodes and branches")).toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: "Overview" })).toHaveAttribute("aria-selected", "true");
+    expect(screen.getByText("Median delivery time")).toBeInTheDocument();
+    expect(screen.getByText("Completion rate")).toBeInTheDocument();
+    expect(screen.getByText("Median factory cost")).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "Operational signals" })).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("tab", { name: "Reliability" }));
+    expect(await screen.findByText("Nodes and branches")).toBeInTheDocument();
     expect(screen.getByText("Production outcomes")).toBeInTheDocument();
     expect(screen.getAllByText("100%", { exact: false }).length).toBeGreaterThan(0);
     expect(screen.getByText("Completed → Done")).toBeInTheDocument();
     expect(screen.getByText("Quality attributes")).toBeInTheDocument();
     expect(screen.getAllByText("Line coverage").length).toBeGreaterThan(0);
     expect(screen.getByText("Median 84 percent")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("tab", { name: "Cost & usage" }));
     expect(screen.getByText(/complete cost/)).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("tab", { name: "Compare" }));
     expect(screen.getByRole("heading", { name: "Compare workflow revisions" })).toBeInTheDocument();
     expect(await screen.findByText("Manual trial assignment may introduce selection bias.", { exact: false })).toBeInTheDocument();
   });
@@ -723,12 +805,15 @@ describe("operator UI", () => {
   it("edits and saves the YAML-backed repository catalog through structured fields", async () => {
     render(<App />);
     fireEvent.click(await screen.findByRole("button", { name: "Configuration" }));
-    expect(await screen.findByRole("heading", { name: "Repository catalog" })).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: "Tracker configuration" })).toBeInTheDocument();
     expect(screen.getByLabelText("Repository ID 1")).toHaveValue("demo");
+    fireEvent.click(screen.getByRole("tab", { name: /Agents & models/ }));
     expect(screen.getByLabelText("Enable Claude")).toBeChecked();
+    fireEvent.click(screen.getByRole("tab", { name: /General & repositories/ }));
     fireEvent.click(screen.getByRole("button", { name: "Add repository" }));
     fireEvent.change(screen.getByLabelText("Repository ID 2"), { target: { value: "other-api" } });
     fireEvent.change(screen.getByLabelText("Repository URL 2"), { target: { value: "https://github.com/example/other-api.git" } });
+    fireEvent.click(screen.getByRole("tab", { name: /Quality & artifacts/ }));
     fireEvent.click(screen.getByRole("button", { name: "Add attribute" }));
     fireEvent.change(screen.getByLabelText("Quality key 1"), { target: { value: "coverage.line_percent" } });
     fireEvent.change(screen.getByLabelText("Quality label 1"), { target: { value: "Line coverage" } });
@@ -742,10 +827,28 @@ describe("operator UI", () => {
     expect(await screen.findByText("r3")).toBeInTheDocument();
   });
 
+  it("tracks unsaved configuration changes across tabs and can revert them", async () => {
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: "Configuration" }));
+
+    expect(await screen.findByText("Configuration saved")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Save configuration" })).toBeDisabled();
+    fireEvent.change(screen.getByLabelText("Repository ID 1"), { target: { value: "renamed-demo" } });
+    expect(screen.getByText("Unsaved changes")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Save configuration" })).toBeEnabled();
+    fireEvent.click(screen.getByRole("tab", { name: /Integrations/ }));
+    expect(screen.getByText("Unsaved changes")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Revert changes" }));
+    fireEvent.click(screen.getByRole("tab", { name: /General & repositories/ }));
+    expect(screen.getByLabelText("Repository ID 1")).toHaveValue("demo");
+    expect(screen.getByText("Configuration saved")).toBeInTheDocument();
+  });
+
   it("shows Claude and Codex weekly estimates and persists provider-scoped account aliases", async () => {
     // Arrange
     render(<App />);
     fireEvent.click(await screen.findByRole("button", { name: "Configuration" }));
+    fireEvent.click(screen.getByRole("tab", { name: /Cost & metrics/ }));
 
     // Act
     fireEvent.change(await screen.findByLabelText("Claude quota account alias coordinator-vm"), { target: { value: "team-claude" } });
@@ -776,6 +879,7 @@ describe("operator UI", () => {
     // Act
     render(<App />);
     fireEvent.click(await screen.findByRole("button", { name: "Configuration" }));
+    fireEvent.click(screen.getByRole("tab", { name: /Cost & metrics/ }));
 
     // Assert
     expect(await screen.findByText("No weekly allowance reported")).toBeInTheDocument();
@@ -787,6 +891,7 @@ describe("operator UI", () => {
     // Arrange
     render(<App />);
     fireEvent.click(await screen.findByRole("button", { name: "Configuration" }));
+    fireEvent.click(screen.getByRole("tab", { name: /Quality & artifacts/ }));
     fireEvent.click(screen.getByRole("button", { name: "Add attribute" }));
     fireEvent.change(screen.getByLabelText("Quality minimum 1"), { target: { value: "0" } });
     fireEvent.change(screen.getByLabelText("Quality maximum 1"), { target: { value: "100" } });
@@ -883,15 +988,15 @@ describe("operator UI", () => {
 
     render(<App />);
     fireEvent.click(await screen.findByRole("button", { name: "Workflows" }));
-    const releasesSection = (await screen.findByRole("heading", { name: "Current default and trials" })).closest("section")!;
+    const releasesSection = (await screen.findByRole("heading", { name: "Default and trial revisions" })).closest("section")!;
 
-    expect(within(releasesSection).getByText("v1 · Initial release")).toBeInTheDocument();
-    expect(within(releasesSection).getByText("v2 · Review experiment")).toBeInTheDocument();
-    expect(within(releasesSection).queryByText("v3 · Retired experiment")).not.toBeInTheDocument();
-    fireEvent.click(within(releasesSection).getByRole("button", { name: "Show history (1)" }));
-    const retiredRelease = within(releasesSection).getByText("v3 · Retired experiment").closest("article")!;
+    expect(within(releasesSection).getByText("Default revision v1 · Initial release")).toBeInTheDocument();
+    expect(within(releasesSection).getByText("Trial revision v2 · Review experiment")).toBeInTheDocument();
+    expect(within(releasesSection).queryByText("Revision v3 · Retired experiment")).not.toBeInTheDocument();
+    fireEvent.click(within(releasesSection).getByRole("button", { name: "Show retired revisions (1)" }));
+    const retiredRelease = within(releasesSection).getByText("Revision v3 · Retired experiment").closest("article")!;
     expect(within(retiredRelease).getByRole("button", { name: "Restore as default" })).toBeInTheDocument();
-    expect(within(releasesSection).getByRole("button", { name: "Hide history" })).toBeInTheDocument();
+    expect(within(releasesSection).getByRole("button", { name: "Hide retired revisions" })).toBeInTheDocument();
   });
 
   it("starts a genuinely new minimal workflow and adds typed nodes", async () => {
@@ -950,7 +1055,7 @@ describe("operator UI", () => {
     const blockers = within(await screen.findByRole("region", { name: "Repository claim blockers" }));
     expect(blockers.getByText("Repository work is reserved on this host")).toBeInTheDocument();
     expect(blockers.getByText("APT-41 · Other work")).toBeInTheDocument();
-    expect(screen.getAllByText("Ready", { selector: ".status-pill" }).length).toBeGreaterThan(0);
+    expect(screen.getByText("Ticket Ready", { selector: ".status-pill" })).toBeInTheDocument();
   });
 
   it("offers a manual GitHub check while specification approval is pending", async () => {
@@ -1039,6 +1144,21 @@ describe("operator UI", () => {
     expect(screen.getByLabelText("Title")).toHaveValue("Describe the work");
   });
 
+  it("waits until submit to show new-ticket validation and uses clear priority and revision labels", async () => {
+    workflowReleases.releases[0].label = "v1";
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: /New ticket/i }));
+
+    expect(await screen.findByRole("heading", { name: "Create work ticket" })).toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(screen.getByLabelText("Ticket priority")).toHaveAttribute("title", "Higher numbers are scheduled before lower numbers");
+    expect(screen.getByRole("option", { name: "Default revision v1" })).toBeInTheDocument();
+    expect(screen.queryByRole("option", { name: /v1 · v1/ })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Create ticket" }));
+    expect(screen.getByRole("alert")).toHaveTextContent("Every repository needs a name.");
+    expect(fetch).not.toHaveBeenCalledWith("/api/tickets", expect.objectContaining({ method: "POST" }));
+  });
+
   it("keeps a custom ticket ID instead of requesting automatic allocation", async () => {
     render(<App />);
     fireEvent.click(await screen.findByRole("button", { name: /New ticket/i }));
@@ -1090,7 +1210,7 @@ describe("operator UI", () => {
     current.frontmatter.archived_at = "2026-08-14T13:00:00Z";
     current.frontmatter.execution = null;
     render(<App />);
-    expect(await screen.findByRole("heading", { name: "No tickets match this view" })).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: "No tickets yet" })).toBeInTheDocument();
     fireEvent.click(screen.getByRole("checkbox", { name: /Archived/ }));
     expect(await screen.findByRole("button", { name: /UI ticket/i })).toBeInTheDocument();
     expect(fetch).toHaveBeenCalledWith("/api/tickets?include_archived=true", expect.anything());
