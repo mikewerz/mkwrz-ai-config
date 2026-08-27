@@ -127,6 +127,7 @@ export interface Execution {
   interrupt_request: null | {
     target_phase: "specification" | "implementation" | "review"; requested_at: string;
     terminal_status?: "failed" | "cancelled"; terminal_reason?: string;
+    reason_code?: "cost_limit_exceeded"; cost_limit_usd?: number; cost_observed_usd?: number;
   };
   node_id?: string;
   node_type?: "agent" | "script" | "checkpoint" | "restore_checkpoint";
@@ -190,6 +191,7 @@ export interface TicketFrontmatter extends Record<string, unknown> {
     incoming: null | { source_node: string; target_node: string; outcome: string; summary: string | null; handoff: string | null; output?: string | null; output_log_path?: string | null; actor: string; created_at: string };
     active_workflow_id?: string; active_workflow_revision?: string;
     resolved_agent_profiles?: Record<string, { alias: string; provider: "claude" | "codex"; model: string | null; reasoning: string | null }>;
+    cost_limit_pause?: null | { workflow_id: string; node_id: string; limit_usd: number; observed_usd: number; paused_at: string };
     wait_states?: Record<string, { workflow_id: string; workflow_revision: string; node_id: string; started_at: string; wake_at: string; deadline_at: string; attempt: number; node_run_id: string }>;
     node_runs: Array<{ id: string; workflow_id?: string; workflow_revision: string; node_id: string; node_type: string; supervisor_id?: string | null; provider?: "claude" | "codex" | null; visit: number; attempt: number; status: string; outcome: string | null; summary: string | null; handoff?: string | null; output?: string | null; output_path?: string | null; output_sha256?: string | null; output_bytes?: number | null; script_path?: string | null; working_directory?: string | null; conversation_generation?: number | null; manifest_artifact_id?: string | null; wait?: { wake_at: string; deadline_at: string; delay_seconds: number } | null; metadata_writes?: Record<string, unknown>; external_references?: Array<{ type: string; id: string; url: string | null }>; input_revision?: number; started_at: string; completed_at: string | null; lease_id: string | null; telemetry: HarnessTelemetryRecord | null; timing: NodeRunTiming }>;
   };
@@ -349,6 +351,7 @@ export interface WorkflowNode {
   conversation_key?: string;
   conversation_policy?: "resume" | "fresh_each_visit" | "reset_after_visits";
   maximum_visits_per_session?: number;
+  max_cost_usd?: number;
   repository?: string;
   script_file?: { relative_to: "selected_repository" | "primary_repository" | "project_root"; path?: string; path_input?: string };
   working_directory?: { relative_to: "selected_repository" | "primary_repository" | "project_root"; path?: string; path_input?: string };

@@ -80,6 +80,23 @@ function telemetryRecord(
   return { baseline, latest: structuredClone(latest), delta: { usage, cost_usd: costUsd } };
 }
 
+function cumulativeKnownNodeCost(
+  ticket: TicketFrontmatter,
+  workflowId: string,
+  nodeId: string,
+  replacement?: { runId: string; telemetry: HarnessTelemetryRecord },
+): number {
+  return Number((ticket.workflow?.node_runs.reduce((total, run) => {
+    if ((run.workflow_id ?? ticket.workflow?.id) !== workflowId || run.node_id !== nodeId) return total;
+    const telemetry = replacement?.runId === run.id ? replacement.telemetry : run.telemetry;
+    return total + Math.max(0, telemetry?.delta.cost_usd ?? 0);
+  }, 0) ?? 0).toFixed(12));
+}
+
+function costLimitMessage(node: WorkflowNode, observed: number): string {
+  return `${node.name} accumulated $${observed.toFixed(2)}, exceeding its $${node.max_cost_usd!.toFixed(2)} cumulative cost limit; interruption requested.`;
+}
+
 function timingState(snapshot: HarnessTelemetrySnapshot, now: Date): { state: "active" | "quota_paused"; pause_limit_id?: string; pause_until?: string | null } {
   const exhausted = snapshot.rate_limits.find((limit) => limit.used_percent >= 100
     && (!limit.resets_at || Date.parse(limit.resets_at) > now.getTime()));
@@ -1225,6 +1242,21 @@ export class TicketStore extends EventEmitter {
         if (candidate.frontmatter.assigned_supervisor === null && requirements.providers.some((requiredProvider) => !availableProviders.includes(requiredProvider))) continue;
         if (candidate.frontmatter.assigned_supervisor === null && requirements.activities.some((capability) => !activityCapabilities.includes(capability))) continue;
         const node = workflowNode(definition, candidate.frontmatter.workflow!.current_node);
+        if (node.type === "agent") {
+          const observed = cumulativeKnownNodeCost(candidate.frontmatter, identity.id, node.id);
+          if (observed > node.max_cost_usd!) {
+            const pausedTicket = structuredClone(candidate.frontmatter);
+            pausedTicket.status = "blocked";
+            pausedTicket.workflow!.cost_limit_pause = {
+              workflow_id: identity.id, node_id: node.id, limit_usd: node.max_cost_usd!, observed_usd: observed, paused_at: this.clock().toISOString(),
+            };
+            await this.mutateLoaded(candidate, pausedTicket, candidate.body, {
+              event: "work.cost_limit_paused",
+              message: `${costLimitMessage(node, observed)} No new assignment was started.`,
+            });
+            continue;
+          }
+        }
         if (node.type === "agent" && resolveNodeProvider(candidate.frontmatter, node) === provider) {
           match = candidate; workflowNodeForClaim = node; break;
         }
@@ -1357,7 +1389,18 @@ export class TicketStore extends EventEmitter {
     telemetryBaseline?: HarnessTelemetrySnapshot;
   }): Promise<LoadedTicket> {
     const leased = await this.byLease(leaseId);
-    return this.command(leased.frontmatter.id, { event: "work.heartbeat", message: "Lease heartbeat accepted.", silent: true }, (ticket) => {
+    const identity = activeWorkflowIdentity(leased.frontmatter);
+    const budgetNode = this.workflowLibrary && leased.execution.node_type === "agent" && leased.execution.node_id
+      ? workflowNode((await this.workflowLibrary.get(identity.id, identity.revision)).definition, leased.execution.node_id) : null;
+    const predictedTelemetry = observation.telemetry
+      ? telemetryRecord(observation.telemetry, observation.telemetryBaseline, leased.execution.telemetry) : null;
+    const predictedCost = budgetNode && predictedTelemetry && leased.execution.node_run_id
+      ? cumulativeKnownNodeCost(leased.frontmatter, identity.id, budgetNode.id, { runId: leased.execution.node_run_id, telemetry: predictedTelemetry }) : 0;
+    const predictedExceeded = Boolean(budgetNode?.type === "agent" && predictedTelemetry?.delta.cost_usd !== null
+      && predictedCost > (budgetNode.max_cost_usd ?? Number.POSITIVE_INFINITY) && !leased.execution.interrupt_request);
+    return this.command(leased.frontmatter.id, predictedExceeded
+      ? { event: "work.cost_limit_exceeded", message: costLimitMessage(budgetNode!, predictedCost) }
+      : { event: "work.heartbeat", message: "Lease heartbeat accepted.", silent: true }, (ticket) => {
       if (ticket.execution?.lease_id !== leaseId) throw new HttpError(409, "Lease is stale or fenced");
       const now = this.clock();
       if (!ticket.assigned_supervisor_host && observation.supervisorHost) ticket.assigned_supervisor_host = observation.supervisorHost;
@@ -1369,6 +1412,20 @@ export class TicketStore extends EventEmitter {
         const measured = telemetryRecord(observation.telemetry, observation.telemetryBaseline, ticket.execution.telemetry);
         ticket.execution.telemetry = measured;
         if (run) run.telemetry = measured;
+        if (budgetNode?.type === "agent" && measured.delta.cost_usd !== null && run && !ticket.execution.interrupt_request) {
+          const observed = cumulativeKnownNodeCost(ticket, identity.id, budgetNode.id);
+          if (observed > budgetNode.max_cost_usd!) ticket.execution.interrupt_request = {
+            target_phase: budgetNode.phase as Exclude<Phase, "done">,
+            target_node: budgetNode.id,
+            target_workflow_id: identity.id,
+            target_workflow_revision: identity.revision,
+            requested_at: now.toISOString(),
+            reason_code: "cost_limit_exceeded",
+            terminal_reason: costLimitMessage(budgetNode, observed),
+            cost_limit_usd: budgetNode.max_cost_usd,
+            cost_observed_usd: observed,
+          };
+        }
       }
       if (observation.state !== undefined) ticket.execution.observed_herdr_state = observation.state;
       if (observation.state !== undefined || observation.paneId !== undefined || observation.herdr !== undefined) {
@@ -1477,13 +1534,39 @@ export class TicketStore extends EventEmitter {
       && (item.frontmatter.execution?.lease_id === leaseId
         || item.frontmatter.workflow?.node_runs.some((run) => run.lease_id === leaseId)));
     if (!found?.frontmatter) throw new HttpError(409, "Telemetry lease is unknown or no longer retained");
-    return this.command(found.frontmatter.id, { event: "work.telemetry", message: "Harness telemetry recorded.", silent: true }, (ticket) => {
+    const execution = found.frontmatter.execution?.lease_id === leaseId ? found.frontmatter.execution : null;
+    const identity = activeWorkflowIdentity(found.frontmatter);
+    const budgetNode = this.workflowLibrary && execution?.node_type === "agent" && execution.node_id
+      ? workflowNode((await this.workflowLibrary.get(identity.id, identity.revision)).definition, execution.node_id) : null;
+    const existingRun = found.frontmatter.workflow?.node_runs.find((candidate) => candidate.lease_id === leaseId);
+    const predictedTelemetry = telemetryRecord(latest, baseline, execution?.telemetry ?? existingRun?.telemetry);
+    const predictedCost = budgetNode && existingRun
+      ? cumulativeKnownNodeCost(found.frontmatter, identity.id, budgetNode.id, { runId: existingRun.id, telemetry: predictedTelemetry }) : 0;
+    const predictedExceeded = Boolean(execution && budgetNode?.type === "agent" && predictedTelemetry.delta.cost_usd !== null
+      && predictedCost > (budgetNode.max_cost_usd ?? Number.POSITIVE_INFINITY) && !execution.interrupt_request);
+    return this.command(found.frontmatter.id, predictedExceeded
+      ? { event: "work.cost_limit_exceeded", message: costLimitMessage(budgetNode!, predictedCost) }
+      : { event: "work.telemetry", message: "Harness telemetry recorded.", silent: true }, (ticket) => {
       const run = ticket.workflow?.node_runs.find((candidate) => candidate.lease_id === leaseId);
-      const execution = ticket.execution?.lease_id === leaseId ? ticket.execution : null;
-      if (!run && !execution) throw new HttpError(409, "Telemetry lease is unknown or no longer retained");
-      const measured = telemetryRecord(latest, baseline, execution?.telemetry ?? run?.telemetry);
-      if (execution) execution.telemetry = measured;
+      const currentExecution = ticket.execution?.lease_id === leaseId ? ticket.execution : null;
+      if (!run && !currentExecution) throw new HttpError(409, "Telemetry lease is unknown or no longer retained");
+      const measured = telemetryRecord(latest, baseline, currentExecution?.telemetry ?? run?.telemetry);
+      if (currentExecution) currentExecution.telemetry = measured;
       if (run) run.telemetry = measured;
+      if (currentExecution && budgetNode?.type === "agent" && measured.delta.cost_usd !== null && run && !currentExecution.interrupt_request) {
+        const observed = cumulativeKnownNodeCost(ticket, identity.id, budgetNode.id);
+        if (observed > budgetNode.max_cost_usd!) currentExecution.interrupt_request = {
+          target_phase: budgetNode.phase as Exclude<Phase, "done">,
+          target_node: budgetNode.id,
+          target_workflow_id: identity.id,
+          target_workflow_revision: identity.revision,
+          requested_at: this.clock().toISOString(),
+          reason_code: "cost_limit_exceeded",
+          terminal_reason: costLimitMessage(budgetNode, observed),
+          cost_limit_usd: budgetNode.max_cost_usd,
+          cost_observed_usd: observed,
+        };
+      }
       return { ticket };
     });
   }
@@ -1499,11 +1582,19 @@ export class TicketStore extends EventEmitter {
       const ticket = structuredClone(current.frontmatter);
       if (execution.interrupt_request) {
         const interrupt = execution.interrupt_request;
+        const costLimitExceeded = interrupt.reason_code === "cost_limit_exceeded";
         const transitionsWithinWorkflow = Boolean(!interrupt.terminal_status && ticket.workflow && interrupt.target_node && this.workflowLibrary
           && interrupt.target_workflow_id === activeWorkflowIdentity(ticket).id && interrupt.target_workflow_revision === activeWorkflowIdentity(ticket).revision);
         const run = ticket.workflow?.node_runs.find((candidate) => candidate.id === execution.node_run_id);
-        if (run?.status === "running") { const now = this.clock().toISOString(); accountNodeRunTiming(run, now); run.status = "interrupted"; run.completed_at = now; run.outcome = transitionsWithinWorkflow ? "operator_interrupt_timeout" : "interrupt_timeout"; run.summary = "Execution interruption was not acknowledged before lease expiry."; }
-        if (transitionsWithinWorkflow && ticket.workflow && interrupt.target_node && this.workflowLibrary) {
+        if (run?.status === "running") { const now = this.clock().toISOString(); accountNodeRunTiming(run, now); run.status = "interrupted"; run.completed_at = now; run.outcome = costLimitExceeded ? "cost_limit_exceeded" : transitionsWithinWorkflow ? "operator_interrupt_timeout" : "interrupt_timeout"; run.summary = costLimitExceeded ? interrupt.terminal_reason ?? "The node exceeded its cumulative cost limit." : "Execution interruption was not acknowledged before lease expiry."; }
+        if (costLimitExceeded && ticket.workflow && interrupt.target_node) ticket.workflow.cost_limit_pause = {
+          workflow_id: interrupt.target_workflow_id ?? activeWorkflowIdentity(ticket).id,
+          node_id: interrupt.target_node,
+          limit_usd: interrupt.cost_limit_usd ?? 50,
+          observed_usd: interrupt.cost_observed_usd ?? 0,
+          paused_at: this.clock().toISOString(),
+        };
+        if (!costLimitExceeded && transitionsWithinWorkflow && ticket.workflow && interrupt.target_node && this.workflowLibrary) {
           const identity = activeWorkflowIdentity(ticket);
           const definition = (await this.workflowLibrary.get(identity.id, identity.revision)).definition;
           transitionTo(ticket, definition, interrupt.target_node, {
@@ -1513,7 +1604,10 @@ export class TicketStore extends EventEmitter {
         ticket.status = "blocked";
         ticket.execution = null;
         await this.mutateLoaded(current, ticket, current.body, {
-          event: "work.interrupt_timed_out", message: `${interrupt.terminal_status ? `Requested ${interrupt.terminal_status} state` : `Restart at ${interrupt.target_phase}`} requires operator attention because interruption was not acknowledged.`,
+          event: costLimitExceeded ? "work.cost_limit_paused" : "work.interrupt_timed_out",
+          message: costLimitExceeded
+            ? `${interrupt.terminal_reason ?? "The node exceeded its cumulative cost limit."} The lease expired before interruption acknowledgement; the ticket is paused for operator attention.`
+            : `${interrupt.terminal_status ? `Requested ${interrupt.terminal_status} state` : `Restart at ${interrupt.target_phase}`} requires operator attention because interruption was not acknowledged.`,
         });
         count += 1;
         continue;

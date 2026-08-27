@@ -23,6 +23,7 @@ describe("WorkflowLibrary", () => {
     const library = new WorkflowLibrary(root);
     const initial = await library.get("standard-delivery");
     expect(initial.version).toBe(1);
+    expect(initial.definition.nodes.filter((node) => node.type === "agent").every((node) => node.max_cost_usd === 50)).toBe(true);
     expect((await library.list()).map((workflow) => workflow.definition.id)).toEqual(["dev-only", "end-to-end", "standard-delivery"]);
     expect(validateWorkflow(DEV_ONLY_WORKFLOW, new Set(PROMPT_NAMES))).toEqual([]);
     expect(validateWorkflow(END_TO_END_WORKFLOW, new Set(PROMPT_NAMES))).toEqual([]);
@@ -276,6 +277,16 @@ describe("WorkflowLibrary", () => {
     const invalid = structuredClone(STANDARD_WORKFLOW);
     invalid.nodes.find((node) => node.id === "review")!.conversation_key = "work";
     expect(validateWorkflow(invalid, new Set(PROMPT_NAMES))).toContain("node review: conversation work is already assigned to agent profile claude");
+  });
+
+  it("validates agent-only cumulative cost limits", () => {
+    const invalidAgent = structuredClone(STANDARD_WORKFLOW);
+    invalidAgent.nodes.find((node) => node.type === "agent")!.max_cost_usd = 0;
+    expect(validateWorkflow(invalidAgent, new Set(PROMPT_NAMES))).toContain("node specification: max_cost_usd must be a positive finite number");
+
+    const invalidGate = structuredClone(STANDARD_WORKFLOW);
+    invalidGate.nodes.find((node) => node.type === "human_gate")!.max_cost_usd = 50;
+    expect(validateWorkflow(invalidGate, new Set(PROMPT_NAMES))).toContain("node specification-approval: max_cost_usd is only valid for agent nodes");
   });
 
   it("validates durable wait schedules and explicit conversation reset policies", () => {

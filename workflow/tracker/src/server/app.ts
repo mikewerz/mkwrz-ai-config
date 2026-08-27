@@ -956,7 +956,7 @@ export function createApp(
     const id = String(request.params.id);
     const loaded = await store.get(id);
     if (!loaded.valid || !loaded.frontmatter) throw new HttpError(422, "Ticket is invalid", loaded.errors);
-    if (!loaded.frontmatter.execution && !["pending", "blocked", "waiting_approval", "waiting_external", "failed", "completed"].includes(loaded.frontmatter.status)) throw new HttpError(409, "Pause the ticket before migrating its workflow");
+    if (!loaded.frontmatter.execution && !["pending", "blocked", "waiting_approval", "waiting_external", "failed", "completed", "cancelled"].includes(loaded.frontmatter.status)) throw new HttpError(409, "Pause the ticket before migrating its workflow");
     const assigned = await workflowLibrary.assignment(
       message(request.body?.workflow_id, "workflow_id"),
       typeof request.body?.workflow_revision === "string" ? request.body.workflow_revision : undefined,
@@ -1136,6 +1136,7 @@ export function createApp(
       if (ticket.questions.some((item) => item.answer === null)) throw new HttpError(409, "Answer outstanding agent questions before retrying work");
       if (definition && ticket.workflow) {
         const node = workflowNode(definition, ticket.workflow.current_node);
+        if (ticket.workflow.cost_limit_pause?.node_id === node.id) throw new HttpError(409, `Node ${node.name} exceeded its cumulative cost limit; publish a higher max_cost_usd and migrate the ticket before retrying`);
         if (ticket.workflow.transition_count > definition.max_transitions) throw new HttpError(409, "Workflow transition limit requires migration to another node or workflow");
         if (node.max_visits && (ticket.workflow.node_visits[runtimeNodeKey(ticket, node.id)] ?? 0) > node.max_visits) throw new HttpError(409, `Node ${node.name} exceeded its visit limit; migrate the ticket before retrying`);
         nodeAttemptCounter(ticket, node.id).consecutive_lease_losses = 0;
@@ -1442,14 +1443,17 @@ export function createApp(
     const leaseId = String(request.params.lease);
     const leased = await store.byLease(leaseId);
     const pendingInterrupt = leased.execution.interrupt_request;
-    const migrationTarget = pendingInterrupt?.target_workflow_id && pendingInterrupt.target_workflow_revision
+    const costLimitExceeded = pendingInterrupt?.reason_code === "cost_limit_exceeded";
+    const migrationTarget = !costLimitExceeded && pendingInterrupt?.target_workflow_id && pendingInterrupt.target_workflow_revision
       ? await workflowLibrary.get(pendingInterrupt.target_workflow_id, pendingInterrupt.target_workflow_revision) : null;
     const migrationArtifacts = migrationTarget ? await workflowArtifacts(migrationTarget) : null;
     response.json(ticketJson(await store.command(
       leased.frontmatter.id,
       {
-        event: "work.interrupted",
-        message: pendingInterrupt?.terminal_status
+        event: costLimitExceeded ? "work.cost_limit_paused" : "work.interrupted",
+        message: costLimitExceeded
+          ? `${pendingInterrupt?.terminal_reason ?? "The node exceeded its cumulative cost limit."} Ticket paused for operator attention.`
+          : pendingInterrupt?.terminal_status
           ? `Active execution interrupted; ticket ${pendingInterrupt.terminal_status}.`
           : "Active execution interrupted; requested workflow node is ready.",
       },
@@ -1458,10 +1462,19 @@ export function createApp(
         const interrupt = ticket.execution.interrupt_request;
         if (!interrupt) throw new HttpError(409, "No agent interruption is pending");
         const run = ticket.workflow?.node_runs.find((candidate) => candidate.id === ticket.execution?.node_run_id);
-        const interruptionOutcome = interrupt.terminal_status ? `operator_${interrupt.terminal_status}` : "operator_interrupt";
+        const interruptionOutcome = interrupt.reason_code === "cost_limit_exceeded" ? "cost_limit_exceeded" : interrupt.terminal_status ? `operator_${interrupt.terminal_status}` : "operator_interrupt";
         const interruptionSummary = interrupt.terminal_reason ?? "Active node interrupted by operator.";
         if (run?.status === "running") { const now = new Date().toISOString(); accountNodeRunTiming(run, now); run.status = "interrupted"; run.completed_at = now; run.outcome = interruptionOutcome; run.summary = interruptionSummary; }
-        if (interrupt.terminal_status) {
+        if (interrupt.reason_code === "cost_limit_exceeded") {
+          ticket.status = "blocked";
+          if (ticket.workflow && interrupt.target_node) ticket.workflow.cost_limit_pause = {
+            workflow_id: interrupt.target_workflow_id ?? activeWorkflowIdentity(ticket).id,
+            node_id: interrupt.target_node,
+            limit_usd: interrupt.cost_limit_usd ?? 50,
+            observed_usd: interrupt.cost_observed_usd ?? 0,
+            paused_at: new Date().toISOString(),
+          };
+        } else if (interrupt.terminal_status) {
           ticket.status = interrupt.terminal_status;
         } else if (migrationTarget && interrupt.target_node) {
           const samePinnedWorkflow = ticket.workflow?.id === migrationTarget.definition.id && ticket.workflow.revision === migrationTarget.revision;

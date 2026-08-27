@@ -40,6 +40,8 @@ The workflow list filters match the pinned workflow ID, displayed current-node n
 
 `metrics show` reports platform totals and completed-ticket node/branch reliability. `metrics compare` compares two immutable release cohorts. Cost and token summaries include only tickets with complete telemetry coverage; efficiency excludes tickets that crossed into another workflow revision. Treat manually assigned trial comparisons as observational because selection bias may remain.
 
+Agent workflow nodes default to a USD 50 cumulative known-cost limit across all visits. A ticket blocked with node-run outcome `cost_limit_exceeded` cannot be resumed by `ticket retry`; inspect the ticket, report the measured total and current limit, and require an operator-authored higher workflow revision plus `ticket workflow-migrate`. Unknown harness cost does not count as zero and cannot be enforced by this guard.
+
 ## Ticket authoring
 
 ```bash

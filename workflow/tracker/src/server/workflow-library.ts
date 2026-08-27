@@ -6,6 +6,7 @@ import { HttpError, type ActivityCapability, type JsonValue, type NodeTimingStat
 import { artifactVersion } from "./artifact-versions.js";
 
 export type WorkflowNodeType = "agent" | "script" | "checkpoint" | "restore_checkpoint" | "human_gate" | "wait" | "read" | "write" | "workflow" | "fan_out" | "fan_in" | "terminal";
+export const DEFAULT_AGENT_NODE_MAX_COST_USD = 50;
 export type WorkflowConversationPolicy = "resume" | "fresh_each_visit" | "reset_after_visits";
 
 export interface WorkflowInputOption { value: string; label: string }
@@ -106,6 +107,7 @@ export interface WorkflowNode {
   conversation_key?: string;
   conversation_policy?: WorkflowConversationPolicy;
   maximum_visits_per_session?: number;
+  max_cost_usd?: number;
   repository?: string;
   script_file?: WorkflowPathReference;
   working_directory?: WorkflowPathReference;
@@ -457,8 +459,9 @@ export const END_TO_END_WORKFLOW: WorkflowDefinition = {
 
 const FAILURE_METRIC_OUTCOMES = new Set(["changes_requested", "failure", "failed", "validation_failed", "deployment_failed"]);
 for (const definition of [STANDARD_WORKFLOW, DEV_ONLY_WORKFLOW, END_TO_END_WORKFLOW]) {
-  for (const node of definition.nodes) for (const route of workflowRoutes(node)) {
-    route.metric_class = FAILURE_METRIC_OUTCOMES.has(route.id) ? "failure" : "success";
+  for (const node of definition.nodes) {
+    if (node.type === "agent") node.max_cost_usd ??= DEFAULT_AGENT_NODE_MAX_COST_USD;
+    for (const route of workflowRoutes(node)) route.metric_class = FAILURE_METRIC_OUTCOMES.has(route.id) ? "failure" : "success";
   }
 }
 
@@ -560,6 +563,10 @@ function normalizeDefinition(value: unknown): WorkflowDefinition {
       ...(typeof node.conversation_key === "string" ? { conversation_key: node.conversation_key } : {}),
       ...(typeof node.conversation_policy === "string" ? { conversation_policy: node.conversation_policy as WorkflowConversationPolicy } : {}),
       ...(Number.isInteger(node.maximum_visits_per_session) ? { maximum_visits_per_session: Number(node.maximum_visits_per_session) } : {}),
+      ...(type === "agent"
+        ? { max_cost_usd: typeof node.max_cost_usd === "number" && Number.isFinite(node.max_cost_usd)
+          ? Number(node.max_cost_usd) : DEFAULT_AGENT_NODE_MAX_COST_USD }
+        : {}),
       ...(typeof node.repository === "string" ? { repository: node.repository } : {}),
       ...(record(node.script_file) ? { script_file: {
         relative_to: (typeof node.script_file.relative_to === "string" ? node.script_file.relative_to : "selected_repository") as WorkflowPathBase,
@@ -728,6 +735,7 @@ export function validateWorkflow(definition: WorkflowDefinition, promptIds?: Set
       if (!["resume", "fresh_each_visit", "reset_after_visits"].includes(conversationPolicy)) errors.push(`node ${node.id}: conversation_policy is invalid`);
       if (conversationPolicy === "reset_after_visits" && (!Number.isInteger(node.maximum_visits_per_session) || (node.maximum_visits_per_session ?? 0) < 1 || (node.maximum_visits_per_session ?? 0) > 100)) errors.push(`node ${node.id}: reset_after_visits requires maximum_visits_per_session between 1 and 100`);
       if (conversationPolicy !== "reset_after_visits" && node.maximum_visits_per_session !== undefined) errors.push(`node ${node.id}: maximum_visits_per_session is only valid with reset_after_visits`);
+      if (typeof node.max_cost_usd !== "number" || !Number.isFinite(node.max_cost_usd) || node.max_cost_usd <= 0) errors.push(`node ${node.id}: max_cost_usd must be a positive finite number`);
       if (node.conversation_key) {
         const selector = node.agent_profile ? `profile:${node.agent_profile}` : undefined;
         const priorProvider = conversationProviders.get(node.conversation_key);
@@ -739,7 +747,10 @@ export function validateWorkflow(definition: WorkflowDefinition, promptIds?: Set
         if (!["any", "primary"].includes(node.pull_request_requirement.scope)) errors.push(`node ${node.id}: pull request requirement scope must be any or primary`);
         if (!["specification", "implementation", "review"].includes(node.pull_request_requirement.phase)) errors.push(`node ${node.id}: pull request requirement phase is invalid`);
       }
-    } else if (node.pull_request_requirement) errors.push(`node ${node.id}: only agent nodes may require pull requests`);
+    } else {
+      if (node.pull_request_requirement) errors.push(`node ${node.id}: only agent nodes may require pull requests`);
+      if (node.max_cost_usd !== undefined) errors.push(`node ${node.id}: max_cost_usd is only valid for agent nodes`);
+    }
     if (node.type === "script") {
       if (!node.repository?.trim()) errors.push(`node ${node.id}: repository is required`);
       if (Boolean(node.script_file) === Boolean(node.inline)) errors.push(`node ${node.id}: define exactly one script file or inline activity`);

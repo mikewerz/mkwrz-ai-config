@@ -51,8 +51,14 @@ export interface Guidance {
 export interface InterruptRequest {
   target_phase: WorkPhase;
   requested_at: string;
+  target_node?: string;
+  target_workflow_id?: string;
+  target_workflow_revision?: string;
   terminal_status?: "failed" | "cancelled";
   terminal_reason?: string;
+  reason_code?: "cost_limit_exceeded";
+  cost_limit_usd?: number;
+  cost_observed_usd?: number;
 }
 
 export interface ClaimedTicket {

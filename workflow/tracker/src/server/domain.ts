@@ -146,6 +146,9 @@ export interface InterruptRequest {
   target_workflow_revision?: string | undefined;
   terminal_status?: "failed" | "cancelled" | undefined;
   terminal_reason?: string | undefined;
+  reason_code?: "cost_limit_exceeded" | undefined;
+  cost_limit_usd?: number | undefined;
+  cost_observed_usd?: number | undefined;
 }
 
 export interface HerdrObservation {
@@ -324,6 +327,14 @@ export interface WorkflowRunLedgerRef {
   sha256: string;
 }
 
+export interface WorkflowCostLimitPause {
+  workflow_id: string;
+  node_id: string;
+  limit_usd: number;
+  observed_usd: number;
+  paused_at: string;
+}
+
 export interface WorkflowRuntime {
   id: string;
   revision: string;
@@ -346,6 +357,7 @@ export interface WorkflowRuntime {
   workflow_stack?: WorkflowCallFrame[];
   fan_out_stack?: WorkflowFanOutFrame[];
   wait_states?: Record<string, WorkflowWaitState>;
+  cost_limit_pause?: WorkflowCostLimitPause | null;
   resolved_agent_profiles?: Record<string, ResolvedAgentProfile>;
 }
 

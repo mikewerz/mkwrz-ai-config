@@ -477,6 +477,40 @@ describe("operator UI", () => {
     expect(screen.getByText("Elapsed")).toBeInTheDocument();
   });
 
+  it("explains a cumulative node-cost pause and requires workflow migration instead of retry", async () => {
+    current.frontmatter.status = "blocked";
+    current.frontmatter.execution = null;
+    current.frontmatter.workflow.cost_limit_pause = {
+      workflow_id: "standard-delivery", node_id: "implementation", limit_usd: 50, observed_usd: 52.75, paused_at: "2026-08-14T12:02:00Z",
+    };
+
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: /APT-42 UI ticket/ }));
+
+    expect(await screen.findByText("Node cost limit reached")).toBeInTheDocument();
+    expect(screen.getByText(/accumulated \$52\.75 against its \$50\.00 limit/)).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Retry node" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Migrate workflow" })).toBeInTheDocument();
+  });
+
+  it("offers workflow migration for an inactive cancelled ticket", async () => {
+    current.frontmatter.status = "cancelled";
+    current.frontmatter.execution = null;
+    const prompt = vi.spyOn(window, "prompt")
+      .mockReturnValueOnce("standard-delivery")
+      .mockReturnValueOnce("implementation");
+
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: /APT-42 UI ticket/ }));
+    fireEvent.click(await screen.findByRole("button", { name: "Migrate workflow" }));
+
+    await waitFor(() => expect(fetch).toHaveBeenCalledWith("/api/tickets/APT-42/workflow/migrate", expect.objectContaining({
+      method: "POST",
+      body: expect.stringContaining('"node_id":"implementation"'),
+    })));
+    expect(prompt).toHaveBeenCalledTimes(2);
+  });
+
   it("keeps a long Herdr pane name inside the responsive runtime heading", async () => {
     const paneName = "apt_agent00_b30459488a_claude_wg";
     current.frontmatter.execution.herdr_observation.display_name = paneName;
@@ -971,9 +1005,12 @@ describe("operator UI", () => {
     expect(screen.getByRole("heading", { name: "Stages" })).toBeInTheDocument();
     expect(screen.getByLabelText("Outcome 1 label")).toHaveValue("Specification completed");
     expect(screen.getByLabelText("Outcome 1 target").tagName).toBe("SELECT");
+    expect(screen.getByLabelText("Node maximum cost")).toHaveValue(50);
 
     fireEvent.change(screen.getByLabelText("Node name"), { target: { value: "Write specification" } });
+    fireEvent.change(screen.getByLabelText("Node maximum cost"), { target: { value: "75" } });
     expect((screen.getByLabelText("Workflow YAML") as HTMLTextAreaElement).value).toContain("name: Write specification");
+    expect((screen.getByLabelText("Workflow YAML") as HTMLTextAreaElement).value).toContain("max_cost_usd: 75");
     fireEvent.click(screen.getByRole("button", { name: "Publish as trial" }));
     await waitFor(() => expect(fetch).toHaveBeenCalledWith("/api/workflows/standard-delivery", expect.objectContaining({
       method: "PUT", body: expect.stringContaining("Write specification"),

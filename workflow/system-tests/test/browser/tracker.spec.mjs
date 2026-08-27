@@ -32,8 +32,10 @@ test("navigates to the production configuration and workflow screens", async ({ 
   await page.getByRole("tab", { name: /Cost & metrics/ }).click();
   await expect(page.getByRole("heading", { name: "Weekly allowances" })).toBeVisible();
   await expect(page.getByText("No subscription quota observations")).toBeVisible();
+
   await page.getByRole("tab", { name: /Quality & artifacts/ }).click();
   await expect(page.getByRole("heading", { name: "Artifact retention & quotas" })).toBeVisible();
+
   await page.getByRole("button", { name: "Workflows", exact: true }).click();
   await expect(page.getByRole("heading", { name: "Workflow editor" })).toBeVisible();
 });

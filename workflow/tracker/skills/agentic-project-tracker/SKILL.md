@@ -22,6 +22,8 @@ Set `AGENTIC_PROJECT_TRACKER_URL` when the tracker is remote. The client uses on
 5. Read the resource again after a successful mutation and report the server-confirmed state.
 6. On HTTP `409`, do not retry silently. Reread the resource and reconsider the requested operation.
 
+A blocked ticket whose latest current-node run has outcome `cost_limit_exceeded` is intentionally paused, not an ordinary transient failure. Do not issue `ticket retry`: report the node's accumulated and configured cost and ask the operator to publish a workflow revision with a higher `max_cost_usd`, then use an explicit workflow migration if they authorize continued spend.
+
 Use `ticket comment` for durable context that should not steer an active agent. Use `ticket guidance` when the message should be delivered to the currently running ticket conversation. Use `ticket edit` to replace authoritative Markdown. Editing a running ticket queues guidance to reread it; use an explicit workflow migration when the user asks to restart at another node.
 
 Use `ticket metadata-list` and `ticket metadata-get` for deterministic workflow state. `ticket metadata-set` and `ticket metadata-delete` are external writes: read the ticket immediately first and supply its exact revision. Values are JSON, remain bounded by the tracker, and should be small coordination facts rather than logs or repository artifacts.

@@ -299,6 +299,62 @@ async function completedTicket(tracker, id, timeoutMs = 20_000) {
   }, { timeoutMs });
 }
 
+function costTelemetry(totalUsd, totalTokens) {
+  return {
+    schema_version: 1, harness: "claude", session_ref: "fake-cost-session", observed_at: new Date().toISOString(),
+    source: { kind: "system_test", detail: null },
+    model: { id: "fake-model", provider: "fake", observed_ids: ["fake-model"] },
+    reasoning: { effort: "test", enabled: true, source: "system_test" },
+    usage: { input_tokens: totalTokens, cached_input_tokens: 0, cache_write_input_tokens: 0, output_tokens: 0, reasoning_output_tokens: 0, total_tokens: totalTokens },
+    cost: { total_usd: totalUsd, kind: "reported" }, context: { used_tokens: null, window_tokens: null, used_percent: null },
+    rate_limits: [], attributes: {},
+  };
+}
+
+test("tracker enforces cumulative Agent-node cost across loop visits without a real harness", { timeout: 30_000 }, async () => {
+  let tracker;
+  try {
+    tracker = await startTracker();
+    await configureTracker(tracker, null);
+    const workflow = await publishWorkflow(tracker, {
+      version: 2, id: "system-cost-loop", name: "System cost loop", description: "Cost pause contract", start: "work", max_transitions: 10,
+      inputs: [], stages: [
+        { id: "work", name: "Work", phase: "implementation", skippable: false, default_enabled: true },
+        { id: "done", name: "Done", phase: "done", skippable: false, default_enabled: true },
+      ],
+      nodes: [
+        { id: "work", name: "Budgeted work", type: "agent", phase: "implementation", stage: "work", prompt: "implementation", agent_profile: "fake-claude", conversation_key: "work", max_cost_usd: 0.5, outcomes: [
+          { id: "again", label: "Again", description: "Repeat this node.", target: "work" },
+          { id: "completed", label: "Complete", description: "Complete the workflow.", target: "done" },
+        ], choices: [], exit_codes: [] },
+        { id: "done", name: "Done", type: "terminal", phase: "done", stage: "done", terminal_status: "completed", outcomes: [], choices: [], exit_codes: [] },
+      ],
+    });
+    await createReadyTicket(tracker, "SYSTEM-COST", workflow.definition.id);
+    const claim = async () => (await jsonRequest(tracker.baseUrl, "/api/work/claim", {
+      method: "POST", body: { supervisor_id: "direct-system-test", provider: "claude", available_providers: ["claude"] },
+    })).body;
+    const first = await claim();
+    await jsonRequest(tracker.baseUrl, `/api/work/${first.frontmatter.execution.lease_id}/heartbeat`, { method: "POST", body: {
+      telemetry: costTelemetry(1.3, 130), telemetry_baseline: costTelemetry(1, 100),
+    } });
+    await jsonRequest(tracker.baseUrl, `/api/work/${first.frontmatter.execution.lease_id}/complete`, { method: "POST", body: { outcome: "again", summary: "Loop" } });
+    const second = await claim();
+    const exceeded = (await jsonRequest(tracker.baseUrl, `/api/work/${second.frontmatter.execution.lease_id}/heartbeat`, { method: "POST", body: {
+      telemetry: costTelemetry(1.51, 151), telemetry_baseline: costTelemetry(1.3, 130),
+    } })).body.ticket;
+    assert.deepEqual(exceeded.frontmatter.execution.interrupt_request.reason_code, "cost_limit_exceeded");
+    assert.equal(exceeded.frontmatter.execution.interrupt_request.cost_observed_usd, 0.51);
+    const paused = (await jsonRequest(tracker.baseUrl, `/api/work/${second.frontmatter.execution.lease_id}/interrupt-ack`, { method: "POST", body: {} })).body;
+    assert.equal(paused.frontmatter.status, "blocked");
+    assert.equal(paused.frontmatter.workflow.current_node, "work");
+    assert.equal(paused.frontmatter.workflow.node_runs.at(-1).outcome, "cost_limit_exceeded");
+  } finally {
+    await stopProcess(tracker?.process);
+    await cleanup([tracker?.ticketRoot]);
+  }
+});
+
 test("tracker serves its production UI and preserves attachment bytes across a restart", { timeout: 30_000 }, async () => {
   const ticketRoot = await mkdtemp(join(tmpdir(), "agentic-system-persistence-"));
   let tracker;

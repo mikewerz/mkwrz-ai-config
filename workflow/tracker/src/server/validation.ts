@@ -269,10 +269,20 @@ function execution(value: unknown, errors: string[]): Execution | null {
         ...(value.interrupt_request.terminal_status === "failed" || value.interrupt_request.terminal_status === "cancelled"
           ? { terminal_status: value.interrupt_request.terminal_status } : {}),
         ...(typeof value.interrupt_request.terminal_reason === "string" ? { terminal_reason: value.interrupt_request.terminal_reason } : {}),
+        ...(value.interrupt_request.reason_code === "cost_limit_exceeded" ? { reason_code: value.interrupt_request.reason_code } : {}),
+        ...(typeof value.interrupt_request.cost_limit_usd === "number" && Number.isFinite(value.interrupt_request.cost_limit_usd)
+          ? { cost_limit_usd: value.interrupt_request.cost_limit_usd } : {}),
+        ...(typeof value.interrupt_request.cost_observed_usd === "number" && Number.isFinite(value.interrupt_request.cost_observed_usd)
+          ? { cost_observed_usd: value.interrupt_request.cost_observed_usd } : {}),
       };
       if (value.interrupt_request.terminal_status !== undefined
         && value.interrupt_request.terminal_status !== "failed" && value.interrupt_request.terminal_status !== "cancelled") {
         errors.push("execution.interrupt_request.terminal_status must be failed or cancelled");
+      }
+      if (value.interrupt_request.reason_code !== undefined && value.interrupt_request.reason_code !== "cost_limit_exceeded") errors.push("execution.interrupt_request.reason_code is invalid");
+      for (const field of ["cost_limit_usd", "cost_observed_usd"] as const) {
+        const amount = value.interrupt_request[field];
+        if (amount !== undefined && (typeof amount !== "number" || !Number.isFinite(amount) || amount < 0)) errors.push(`execution.interrupt_request.${field} must be a non-negative finite number`);
       }
     }
   }
@@ -522,6 +532,15 @@ function workflowRuntime(value: unknown, errors: string[], now: string): Workflo
     sha256: typeof value.run_ledger.sha256 === "string" && /^[a-f0-9]{64}$/.test(value.run_ledger.sha256)
       ? value.run_ledger.sha256 : (errors.push("workflow.run_ledger.sha256 must be a SHA-256 digest"), ""),
   } : undefined;
+  const costLimitPause = isRecord(value.cost_limit_pause) ? {
+    workflow_id: asString(value.cost_limit_pause.workflow_id, "workflow.cost_limit_pause.workflow_id", errors),
+    node_id: asString(value.cost_limit_pause.node_id, "workflow.cost_limit_pause.node_id", errors),
+    limit_usd: typeof value.cost_limit_pause.limit_usd === "number" && Number.isFinite(value.cost_limit_pause.limit_usd) && value.cost_limit_pause.limit_usd > 0
+      ? value.cost_limit_pause.limit_usd : (errors.push("workflow.cost_limit_pause.limit_usd must be positive"), 0),
+    observed_usd: typeof value.cost_limit_pause.observed_usd === "number" && Number.isFinite(value.cost_limit_pause.observed_usd) && value.cost_limit_pause.observed_usd >= 0
+      ? value.cost_limit_pause.observed_usd : (errors.push("workflow.cost_limit_pause.observed_usd must be non-negative"), 0),
+    paused_at: timestamp(value.cost_limit_pause.paused_at, "workflow.cost_limit_pause.paused_at", errors),
+  } : null;
   return {
     id: asString(value.id, "workflow.id", errors), revision: asString(value.revision, "workflow.revision", errors),
     current_node: asString(value.current_node, "workflow.current_node", errors),
@@ -533,6 +552,7 @@ function workflowRuntime(value: unknown, errors: string[], now: string): Workflo
     active_workflow_id: typeof value.active_workflow_id === "string" ? value.active_workflow_id : asString(value.id, "workflow.id", errors),
     active_workflow_revision: typeof value.active_workflow_revision === "string" ? value.active_workflow_revision : asString(value.revision, "workflow.revision", errors),
     workflow_revisions: Object.keys(workflowRevisions).length ? workflowRevisions : { [String(value.id ?? "")]: String(value.revision ?? "") },
+    cost_limit_pause: costLimitPause,
     workflow_stack: workflowStack, fan_out_stack: fanOutStack, wait_states: waitStates, resolved_agent_profiles: resolvedProfiles,
   };
 }

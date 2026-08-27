@@ -556,7 +556,7 @@ This example deliberately uses broad nodes. The implementation agent owns its in
 - Artifact, input, stage, node, prompt, and profile IDs start with a lowercase letter and contain lowercase letters, numbers, or hyphens. They are at most 64 characters.
 - Outcome IDs additionally allow underscores because they are callback-facing contract values.
 - Every non-terminal route target must exist, and every node must be reachable from `start` through normal, conditional, stage-bypass, or GitHub-follow-up edges.
-- `max_transitions` bounds the entire ticket graph. `max_visits` bounds repeat visits to an individual node. Use both for loops.
+- `max_transitions` bounds the entire ticket graph. `max_visits` bounds repeat visits to an individual node. Agent nodes also use `max_cost_usd` to bound cumulative known cost. Use all three for potentially expensive loops.
 - A node's `phase` must match its stage's phase. A terminal node must use `done`; a non-terminal node cannot use `done`.
 - A terminal node has no outgoing workflow routes, other than an optional completed-ticket GitHub feedback target.
 
@@ -619,7 +619,10 @@ Optional behavior:
 
 - `pull_request_requirement` requires a reported PR before completion. Its `scope` is `primary` or `any`, and its `phase` selects the PR association.
 - `max_visits` bounds feedback and repair loops.
+- `max_cost_usd` is the cumulative known-cost ceiling for this node across all of its visits in the ticket. It defaults to `50`. The tracker requests a clean supervisor interruption when observed cost becomes greater than the ceiling, then leaves the current node blocked for operator attention. Unknown cost is not treated as zero and cannot trigger the guard. To continue, publish a workflow revision with a higher ceiling and migrate the ticket; ordinary retry cannot bypass the same limit.
 - `conversation_policy` explicitly chooses `resume`, `fresh_each_visit`, or `reset_after_visits`. The last form also requires `maximum_visits_per_session`.
+
+Cost is sampled through harness telemetry, so this is a bounded operational guard rather than an exact provider-side spend authorization. A run can exceed the configured amount between telemetry samples before the supervisor observes and stops it.
 
 Input to the agent includes the durable ticket, current node instructions, incoming transition, repository and PR context, callback schemas, and live updates. The supervisor writes this material to a durable assignment directory and sends Herdr a small bootstrap pointing to `START_HERE.md` and the generated `callback` helper.
 

@@ -184,6 +184,34 @@ describe("tracker API", () => {
     expect(promotedTicket.body.frontmatter.workflow_assignment).toMatchObject({ revision: trial.body.workflow.revision, selection: "default" });
   }, 15_000);
 
+  it.each([
+    { action: "cancel", status: "cancelled", id: "APT-CANCELLED" },
+    { action: "fail", status: "failed", id: "APT-FAILED" },
+  ] as const)("migrates an inactive $status ticket to a non-terminal workflow node", async ({ action, status, id }) => {
+    // Arrange
+    const app = createApp(store, join(root, "missing-client"));
+    const created = await request(app).post("/api/tickets").send({
+      markdown: ticketMarkdown({ id }), workflow_id: "standard-delivery",
+    }).expect(201);
+    const inactive = await request(app).post(`/api/tickets/${id}/${action}`).send({
+      expected_revision: created.body.frontmatter.revision, message: `${action} for migration coverage`,
+    }).expect(200);
+    expect(inactive.body.frontmatter).toMatchObject({ status, execution: null });
+
+    // Execute
+    const migrated = await request(app).post(`/api/tickets/${id}/workflow/migrate`).send({
+      expected_revision: inactive.body.frontmatter.revision,
+      workflow_id: "standard-delivery",
+      node_id: "implementation",
+    }).expect(200);
+
+    // Verify
+    expect(migrated.body.frontmatter).toMatchObject({
+      status: "ready", phase: "implementation", archived_at: null,
+      workflow: { id: "standard-delivery", current_node: "implementation" },
+    });
+  });
+
   it("stores, serves, and removes revision-fenced ticket attachments", async () => {
     const app = createApp(store, join(root, "missing-client"));
     const created = await request(app).post("/api/tickets").send({ markdown: ticketMarkdown(), stage_enabled: { specification: false, review: false } }).expect(201);
@@ -251,6 +279,54 @@ describe("tracker API", () => {
     const unchanged = await request(app).post(`/api/work/${lease}/telemetry`).send({ telemetry: stale, telemetry_baseline: baseline }).expect(200);
     expect(unchanged.body.ticket.frontmatter.workflow.node_runs.find((item: { lease_id: string }) => item.lease_id === lease).telemetry.delta).toMatchObject({ usage: { total_tokens: 100 }, cost_usd: 0.5 });
     await request(app).post(`/api/work/${lease}/telemetry`).send({ telemetry: { nope: true } }).expect(422);
+  }, 15_000);
+
+  it("pauses an agent node when known cost across loop visits exceeds its cumulative limit", async () => {
+    // Arrange
+    const app = createApp(store, join(root, "missing-client"));
+    const workflow = {
+      version: 2, id: "cost-loop", name: "Cost loop", description: "Cumulative agent-node budget", start: "work", max_transitions: 10,
+      inputs: [], stages: [
+        { id: "work", name: "Work", phase: "implementation", skippable: false, default_enabled: true },
+        { id: "done", name: "Done", phase: "done", skippable: false, default_enabled: true },
+      ],
+      nodes: [
+        { id: "work", name: "Budgeted work", type: "agent", phase: "implementation", stage: "work", prompt: "implementation", agent_profile: "claude", conversation_key: "work", max_cost_usd: 0.5, outcomes: [
+          { id: "again", label: "Run again", description: "Loop through the same node.", target: "work" },
+          { id: "completed", label: "Complete", description: "Finish the workflow.", target: "done" },
+        ], choices: [], exit_codes: [] },
+        { id: "done", name: "Done", type: "terminal", phase: "done", stage: "done", terminal_status: "completed", outcomes: [], choices: [], exit_codes: [] },
+      ],
+    };
+    await request(app).post("/api/workflows").send({ content: stringify(workflow) }).expect(201);
+    const created = await request(app).post("/api/tickets").send({ markdown: ticketMarkdown(), workflow_id: "cost-loop" }).expect(201);
+    await request(app).post("/api/tickets/APT-0001/ready").send({ expected_revision: created.body.frontmatter.revision }).expect(200);
+    const first = await request(app).post("/api/work/claim").send({ supervisor_id: "vm", provider: "claude", available_providers: ["claude"] }).expect(200);
+    const firstLease = first.body.frontmatter.execution.lease_id;
+
+    // Execute the first visit below budget, loop, then cross the same node's limit on visit two.
+    await request(app).post(`/api/work/${firstLease}/heartbeat`).send({
+      telemetry: telemetry(130, 1.3), telemetry_baseline: telemetry(100, 1),
+    }).expect(200);
+    await request(app).post(`/api/work/${firstLease}/complete`).send({ summary: "More work required", outcome: "again" }).expect(200);
+    const second = await request(app).post("/api/work/claim").send({ supervisor_id: "vm", provider: "claude", available_providers: ["claude"] }).expect(200);
+    const secondLease = second.body.frontmatter.execution.lease_id;
+    const exceeded = await request(app).post(`/api/work/${secondLease}/heartbeat`).send({
+      telemetry: telemetry(151, 1.51), telemetry_baseline: telemetry(130, 1.3),
+    }).expect(200);
+
+    // Verify the existing interruption protocol fences the agent and leaves an operator-visible pause.
+    expect(exceeded.body.ticket.frontmatter.execution.interrupt_request).toMatchObject({
+      reason_code: "cost_limit_exceeded", target_node: "work", cost_limit_usd: 0.5, cost_observed_usd: 0.51,
+    });
+    const paused = await request(app).post(`/api/work/${secondLease}/interrupt-ack`).send({}).expect(200);
+    expect(paused.body.frontmatter).toMatchObject({ status: "blocked", workflow: { current_node: "work", cost_limit_pause: { workflow_id: "cost-loop", node_id: "work", limit_usd: 0.5, observed_usd: 0.51 } }, execution: null });
+    expect(paused.body.frontmatter.workflow.node_runs.filter((run: { node_id: string }) => run.node_id === "work")).toEqual(expect.arrayContaining([
+      expect.objectContaining({ status: "completed", outcome: "again", telemetry: expect.objectContaining({ delta: expect.objectContaining({ cost_usd: 0.3 }) }) }),
+      expect.objectContaining({ status: "interrupted", outcome: "cost_limit_exceeded", telemetry: expect.objectContaining({ delta: expect.objectContaining({ cost_usd: 0.21 }) }) }),
+    ]));
+    const retry = await request(app).post("/api/tickets/APT-0001/retry").send({ expected_revision: paused.body.frontmatter.revision }).expect(409);
+    expect(retry.body.error).toContain("higher max_cost_usd");
   }, 15_000);
 
   it("keeps heartbeats alive when optional telemetry is invalid and accounts a fresh zero-cost baseline", async () => {
