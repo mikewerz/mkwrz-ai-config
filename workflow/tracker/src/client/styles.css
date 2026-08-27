@@ -330,7 +330,8 @@ input:focus, textarea:focus, select:focus { border-color: #668ce1; box-shadow: 0
 .factory-graph { position: relative; min-height: 190px; }
 .factory-connectors { position: absolute; inset: 0; overflow: visible; }
 .factory-connectors marker path { fill: #526581; }
-.factory-connector path { fill: none; stroke: #526581; stroke-width: 1.5; }
+.factory-connectors marker.loop-marker path { fill: #9d7641; }
+.factory-connector path { fill: none; stroke: #526581; stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; }
 .factory-connector.loop path { stroke: #9d7641; stroke-dasharray: 5 4; }
 .factory-connector text { fill: #8491a7; font: 700 8px/1 Inter, sans-serif; paint-order: stroke; stroke: #090e16; stroke-width: 5px; stroke-linejoin: round; }
 .factory-connector.loop text { fill: #c49a5f; }

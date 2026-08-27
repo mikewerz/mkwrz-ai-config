@@ -809,6 +809,7 @@ describe("operator UI", () => {
   });
 
   it("shows revision-aware workflow reliability, distributions, and production outcomes on the metrics page", async () => {
+    workflowReleases.releases[0].version = 15;
     workflowReleases.releases.push({ ...workflowReleases.releases[0], revision: "workflow-r2", version: 2, label: "Review trial", status: "trial", is_default: false });
     render(<App />);
     fireEvent.click(await screen.findByRole("button", { name: "Metrics" }));
@@ -818,6 +819,9 @@ describe("operator UI", () => {
     expect(screen.getByText("Completion rate")).toBeInTheDocument();
     expect(screen.getByText("Median factory cost")).toBeInTheDocument();
     expect(screen.getByRole("heading", { name: "Operational signals" })).toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText("Metrics workflow"), { target: { value: "standard-delivery" } });
+    expect(within(screen.getByLabelText("Metrics workflow revision")).getByRole("option", { name: "v15" })).toHaveValue("workflow-r1");
+    expect(within(screen.getByLabelText("Metrics workflow revision")).queryByRole("option", { name: "workflow-r1" })).not.toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("tab", { name: "Reliability" }));
     expect(await screen.findByText("Nodes and branches")).toBeInTheDocument();
@@ -1001,6 +1005,8 @@ describe("operator UI", () => {
     expect(within(graph).getAllByRole("button")[0]).toHaveTextContent("Specification");
     expect(graph.querySelectorAll(".factory-connector").length).toBeGreaterThan(0);
     expect(graph.querySelectorAll(".factory-connector.loop").length).toBeGreaterThan(0);
+    expect(graph.querySelector('[data-route="row-return"]')).toBeInTheDocument();
+    expect(graph.querySelector('.factory-connector.loop[data-route="previous-row"]')).toBeInTheDocument();
     expect(screen.getByRole("heading", { name: "Conditions & parameters" })).toBeInTheDocument();
     expect(screen.getByRole("heading", { name: "Stages" })).toBeInTheDocument();
     expect(screen.getByLabelText("Outcome 1 label")).toHaveValue("Specification completed");
@@ -1015,6 +1021,39 @@ describe("operator UI", () => {
     await waitFor(() => expect(fetch).toHaveBeenCalledWith("/api/workflows/standard-delivery", expect.objectContaining({
       method: "PUT", body: expect.stringContaining("Write specification"),
     })));
+  });
+
+  it("routes dense workflow feedback through local and reusable side lanes without extending the canvas per loop", async () => {
+    const nodes = Array.from({ length: 20 }, (_, index) => index === 19
+      ? { id: `node-${index}`, name: "Done", type: "terminal", phase: "done", stage: "done", terminal_status: "completed", outcomes: [], choices: [], exit_codes: [] }
+      : {
+          id: `node-${index}`, name: `Step ${index + 1}`, type: "agent", phase: "implementation", stage: "implementation",
+          prompt: "implementation", agent_profile: "default", conversation_key: "work", max_visits: 20, max_cost_usd: 50,
+          outcomes: [
+            { id: "completed", label: "Continue", description: "Continue forward.", target: `node-${index + 1}` },
+            ...(index >= 4 ? [{ id: "changes_requested", label: `Repair step ${index - 3}`, description: "Return for repair.", target: `node-${index - (index >= 8 ? 8 : 4)}` }] : []),
+          ], choices: [], exit_codes: [],
+        });
+    const dense = {
+      version: 2, id: "dense-delivery", name: "Dense delivery", description: "Twenty-node rendering fixture.",
+      start: "node-0", max_transitions: 100, inputs: [],
+      stages: [
+        { id: "implementation", name: "Implementation", phase: "implementation", skippable: false, default_enabled: true },
+        { id: "done", name: "Done", phase: "done", skippable: false, default_enabled: true },
+      ], nodes,
+    };
+    workflows = [{ definition: dense, content: stringify(dense), revision: "dense-r1", version: 1, valid: true, errors: [], referenced_prompts: ["implementation"] }];
+
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: "Workflows" }));
+    const graph = await screen.findByLabelText("Workflow graph");
+    const canvas = graph.querySelector<HTMLElement>(".factory-graph")!;
+
+    expect(within(graph).getAllByRole("button")).toHaveLength(20);
+    expect(graph.querySelectorAll('.factory-connector.loop[data-route="previous-row"]')).toHaveLength(4);
+    expect(graph.querySelectorAll('.factory-connector.loop[data-route="side-return"]')).toHaveLength(11);
+    expect(graph.querySelectorAll('.factory-connector.loop[data-route="row-return"]')).toHaveLength(0);
+    expect(Number.parseFloat(canvas.style.height)).toBeLessThan(1_450);
   });
 
   it("shows only the current default and trials until workflow history is requested", async () => {

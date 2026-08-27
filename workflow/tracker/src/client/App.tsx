@@ -1441,7 +1441,9 @@ function PromptEditorPage({ prompts, onUpdated, onError }: {
 
 const GRAPH_NODE_WIDTH = 208;
 const GRAPH_NODE_HEIGHT = 166;
-const GRAPH_COLUMN_GAP = 92;
+const GRAPH_COLUMN_GAP = 126;
+const GRAPH_BASE_ROW_GAP = 104;
+const GRAPH_LANE_GAP = 18;
 
 type WorkflowRoute = WorkflowNode["outcomes"][number];
 
@@ -1480,49 +1482,175 @@ function WorkflowGraph({ workflow, currentNode, selectedNode, onSelect, ticket, 
   workflow: WorkflowDocument["definition"]; currentNode?: string; selectedNode?: string; onSelect?: (nodeId: string) => void; ticket?: TicketFrontmatter; zoom?: number;
 }) {
   const markerId = useId().replaceAll(":", "");
-  const columns = Math.min(3, Math.max(1, workflow.nodes.length));
+  const loopMarkerId = `${markerId}-loop`;
+  const columns = Math.min(workflow.nodes.length > 9 ? 4 : 3, Math.max(1, workflow.nodes.length));
   const rows = Math.ceil(workflow.nodes.length / columns);
-  const positions = new Map(workflow.nodes.map((node, index) => [node.id, {
-    x: 34 + (index % columns) * (GRAPH_NODE_WIDTH + GRAPH_COLUMN_GAP), y: 55 + Math.floor(index / columns) * 226, index,
-    row: Math.floor(index / columns), column: index % columns,
+  const grid = new Map(workflow.nodes.map((node, index) => [node.id, {
+    index, row: Math.floor(index / columns), column: index % columns,
   }]));
-  const edges = workflow.nodes.flatMap((node) => [
-    ...nodeRoutes(node).map((route) => ({ source: node.id, outcome: route.label, target: route.target })),
-    ...(node.otherwise ? [{ source: node.id, outcome: "Otherwise", target: node.otherwise }] : []),
-    ...(workflow.stages.find((stage) => stage.id === node.stage)?.skippable && workflow.stages.find((stage) => stage.id === node.stage)?.bypass_to
-      ? [{ source: node.id, outcome: "Stage disabled", target: workflow.stages.find((stage) => stage.id === node.stage)!.bypass_to! }] : []),
-    ...(node.github_watch?.feedback_target ? [{ source: node.id, outcome: "GitHub feedback", target: node.github_watch.feedback_target }] : []),
-  ]);
-  const backward = edges.filter((edge) => (positions.get(edge.target)?.index ?? Number.MAX_SAFE_INTEGER) <= (positions.get(edge.source)?.index ?? -1));
-  const width = Math.max(760, 68 + columns * GRAPH_NODE_WIDTH + Math.max(0, columns - 1) * GRAPH_COLUMN_GAP);
-  const loopBase = 55 + rows * 226 - 35;
-  const height = loopBase + Math.max(1, backward.length) * 34 + 26;
+  const stageEntries = new Map<string, string>();
+  for (const node of workflow.nodes) if (!stageEntries.has(node.stage)) stageEntries.set(node.stage, node.id);
+  const stages = new Map(workflow.stages.map((stage) => [stage.id, stage]));
+  const rawEdges = workflow.nodes.flatMap((node) => {
+    const stage = stages.get(node.stage);
+    return [
+      ...nodeRoutes(node).map((route) => ({ source: node.id, outcome: route.label, target: route.target })),
+      ...(node.otherwise ? [{ source: node.id, outcome: "Otherwise", target: node.otherwise }] : []),
+      ...(stageEntries.get(node.stage) === node.id && stage?.skippable && stage.bypass_to
+        ? [{ source: node.id, outcome: "Stage disabled", target: stage.bypass_to }] : []),
+      ...(node.github_watch?.feedback_target ? [{ source: node.id, outcome: "GitHub feedback", target: node.github_watch.feedback_target }] : []),
+    ];
+  });
+  const groupedEdges = new Map<string, { source: string; target: string; outcomes: string[] }>();
+  for (const edge of rawEdges) {
+    const key = `${edge.source}\u0000${edge.target}`;
+    const grouped = groupedEdges.get(key) ?? { source: edge.source, target: edge.target, outcomes: [] };
+    if (!grouped.outcomes.includes(edge.outcome)) grouped.outcomes.push(edge.outcome);
+    groupedEdges.set(key, grouped);
+  }
+  const edges = [...groupedEdges.values()].map((edge, index) => {
+    const primary = edge.outcomes.find((outcome) => outcome !== "Stage disabled") ?? edge.outcomes[0]!;
+    const outcome = edge.outcomes.length === 1 ? primary : edge.outcomes.includes("Stage disabled") ? `${primary} / bypass` : `${primary} / +${edge.outcomes.length - 1}`;
+    return { ...edge, outcome, fullOutcome: edge.outcomes.join(" / "), id: `${index}:${edge.source}:${edge.target}` };
+  });
+
+  type LaneInterval = { start: number; end: number };
+  const rowArcLanes = new Map<number, LaneInterval[][]>();
+  const adjacentLanes = new Map<number, LaneInterval[][]>();
+  const previousLanes = new Map<number, LaneInterval[][]>();
+  const sideLanes: Record<"left" | "right", LaneInterval[][]> = { left: [], right: [] };
+  const allocateLane = (lanes: LaneInterval[][], start: number, end: number): number => {
+    const lane = lanes.findIndex((intervals) => intervals.every((interval) => end < interval.start || start > interval.end));
+    const index = lane >= 0 ? lane : lanes.length;
+    (lanes[index] ??= []).push({ start, end });
+    return index;
+  };
+  const routedEdges = edges.map((edge) => {
+    const source = grid.get(edge.source); const target = grid.get(edge.target);
+    if (!source || !target) return { ...edge, route: "missing" as const, backward: false, lane: 0 };
+    const backward = target.index <= source.index;
+    if (source.row === target.row && !backward && target.column === source.column + 1) {
+      return { ...edge, route: "direct" as const, backward, lane: 0 };
+    }
+    if (source.row === target.row) {
+      const lanes = rowArcLanes.get(source.row) ?? [];
+      rowArcLanes.set(source.row, lanes);
+      return { ...edge, route: "row-return" as const, backward, lane: allocateLane(lanes, Math.min(source.column, target.column), Math.max(source.column, target.column)) };
+    }
+    if (backward && target.row === source.row - 1) {
+      const lanes = previousLanes.get(target.row) ?? [];
+      previousLanes.set(target.row, lanes);
+      return { ...edge, route: "previous-row" as const, backward, lane: allocateLane(lanes, Math.min(source.column, target.column), Math.max(source.column, target.column)) };
+    }
+    if (!backward && target.row === source.row + 1) {
+      const lanes = adjacentLanes.get(source.row) ?? [];
+      adjacentLanes.set(source.row, lanes);
+      return { ...edge, route: "next-row" as const, backward, lane: allocateLane(lanes, Math.min(source.column, target.column), Math.max(source.column, target.column)) };
+    }
+    const leftDistance = source.column + target.column;
+    const rightDistance = (columns - 1 - source.column) + (columns - 1 - target.column);
+    const side: "left" | "right" = leftDistance === rightDistance
+      ? (sideLanes.left.length <= sideLanes.right.length ? "left" : "right")
+      : leftDistance < rightDistance ? "left" : "right";
+    return {
+      ...edge, route: "side-return" as const, backward, side,
+      lane: allocateLane(sideLanes[side], Math.min(source.row, target.row), Math.max(source.row, target.row)),
+    };
+  });
+  const upperCorridors = new Map<number, LaneInterval[][]>();
+  const lowerCorridors = new Map<number, LaneInterval[][]>();
+  for (let gap = 0; gap < rows - 1; gap += 1) {
+    upperCorridors.set(gap, (adjacentLanes.get(gap) ?? []).map((lane) => [...lane]));
+    lowerCorridors.set(gap, [
+      ...(rowArcLanes.get(gap + 1) ?? []).map((lane) => [...lane]),
+      ...(previousLanes.get(gap) ?? []).map((lane) => [...lane]),
+    ]);
+  }
+  const corridor = (collection: Map<number, LaneInterval[][]>, gap: number, side: "left" | "right", column: number) => {
+    const lanes = collection.get(gap) ?? [];
+    collection.set(gap, lanes);
+    return allocateLane(lanes, side === "left" ? -1 : column, side === "left" ? column : columns);
+  };
+  const positionedEdges = routedEdges.map((edge) => {
+    if (edge.route !== "side-return") return edge;
+    const source = grid.get(edge.source)!; const target = grid.get(edge.target)!;
+    const travelsBackward = target.row < source.row;
+    return {
+      ...edge,
+      sourceTrackLane: corridor(travelsBackward ? lowerCorridors : upperCorridors, travelsBackward ? source.row - 1 : source.row, edge.side, source.column),
+      targetTrackLane: corridor(lowerCorridors, travelsBackward ? target.row : target.row - 1, edge.side, target.column),
+    };
+  });
+  const gapLaneCount = Array.from({ length: Math.max(0, rows - 1) }, (_, row) =>
+    (upperCorridors.get(row)?.length ?? 0) + (lowerCorridors.get(row)?.length ?? 0));
+  const rowGap = Math.max(GRAPH_BASE_ROW_GAP, 34 + Math.max(0, ...gapLaneCount) * GRAPH_LANE_GAP);
+  const topPadding = Math.max(70, 38 + (rowArcLanes.get(0)?.length ?? 0) * GRAPH_LANE_GAP);
+  const leftPadding = sideLanes.left.length ? 190 + Math.max(0, sideLanes.left.length - 1) * 22 : 34;
+  const rightPadding = sideLanes.right.length ? 190 + Math.max(0, sideLanes.right.length - 1) * 22 : 34;
+  const gridWidth = columns * GRAPH_NODE_WIDTH + Math.max(0, columns - 1) * GRAPH_COLUMN_GAP;
+  const positions = new Map(workflow.nodes.map((node) => {
+    const position = grid.get(node.id)!;
+    return [node.id, {
+      ...position,
+      x: leftPadding + position.column * (GRAPH_NODE_WIDTH + GRAPH_COLUMN_GAP),
+      y: topPadding + position.row * (GRAPH_NODE_HEIGHT + rowGap),
+    }];
+  }));
+  const width = Math.max(760, leftPadding + gridWidth + rightPadding);
+  const height = topPadding + rows * GRAPH_NODE_HEIGHT + Math.max(0, rows - 1) * rowGap + 52;
   return <div className="factory-graph-scroll" aria-label="Workflow graph">
     <div className="factory-graph-scale" style={{ width: width * zoom, height: height * zoom }}>
     <div className="factory-graph" style={{ width, height, transform: `scale(${zoom})`, transformOrigin: "top left" }}>
       <svg className="factory-connectors" width={width} height={height} aria-hidden="true">
-        <defs><marker id={markerId} markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" /></marker></defs>
-        {edges.map((edge) => {
+        <defs>
+          <marker id={markerId} markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" /></marker>
+          <marker className="loop-marker" id={loopMarkerId} markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" /></marker>
+        </defs>
+        {positionedEdges.map((edge) => {
           const source = positions.get(edge.source); const target = positions.get(edge.target);
-          if (!source || !target) return null;
-          const isBackward = target.index <= source.index;
-          const loopIndex = isBackward ? backward.findIndex((item) => item === edge) : -1;
-          const isJump = !isBackward && source.row === target.row && target.index > source.index + 1;
-          const changesRow = !isBackward && source.row !== target.row;
-          const loopY = loopBase + loopIndex * 34;
-          const jumpY = Math.max(18, source.y - 24 - (target.index - source.index - 2) * 13);
-          const path = isBackward
-            ? `M ${source.x + GRAPH_NODE_WIDTH / 2} ${source.y + GRAPH_NODE_HEIGHT} C ${source.x + GRAPH_NODE_WIDTH / 2} ${loopY}, ${target.x + GRAPH_NODE_WIDTH / 2} ${loopY}, ${target.x + GRAPH_NODE_WIDTH / 2} ${target.y + GRAPH_NODE_HEIGHT}`
-            : isJump
-              ? `M ${source.x + GRAPH_NODE_WIDTH / 2} ${source.y} C ${source.x + GRAPH_NODE_WIDTH / 2} ${jumpY}, ${target.x + GRAPH_NODE_WIDTH / 2} ${jumpY}, ${target.x + GRAPH_NODE_WIDTH / 2} ${target.y}`
-              : changesRow
-                ? `M ${source.x + GRAPH_NODE_WIDTH / 2} ${source.y + GRAPH_NODE_HEIGHT} C ${source.x + GRAPH_NODE_WIDTH / 2} ${source.y + GRAPH_NODE_HEIGHT + 46}, ${target.x + GRAPH_NODE_WIDTH / 2} ${target.y - 46}, ${target.x + GRAPH_NODE_WIDTH / 2} ${target.y}`
-                : `M ${source.x + GRAPH_NODE_WIDTH} ${source.y + GRAPH_NODE_HEIGHT / 2} C ${source.x + GRAPH_NODE_WIDTH + 36} ${source.y + GRAPH_NODE_HEIGHT / 2}, ${target.x - 36} ${target.y + GRAPH_NODE_HEIGHT / 2}, ${target.x} ${target.y + GRAPH_NODE_HEIGHT / 2}`;
-          const labelX = isBackward || isJump || changesRow ? (source.x + target.x + GRAPH_NODE_WIDTH) / 2 : (source.x + GRAPH_NODE_WIDTH + target.x) / 2;
-          const labelY = isBackward ? loopY - 3 : isJump ? jumpY - 3 : changesRow ? (source.y + GRAPH_NODE_HEIGHT + target.y) / 2 : source.y + GRAPH_NODE_HEIGHT / 2 - 10;
-          return <g key={`${edge.source}:${edge.outcome}`} className={isBackward ? "factory-connector loop" : "factory-connector"}>
-            <path d={path} markerEnd={`url(#${markerId})`} />
-            <text x={labelX} y={labelY} textAnchor="middle">{humanize(edge.outcome)}</text>
+          if (!source || !target || edge.route === "missing") return null;
+          let path: string; let labelX: number; let labelY: number; let textAnchor: "start" | "middle" | "end" = "middle";
+          if (edge.route === "direct") {
+            const y = source.y + GRAPH_NODE_HEIGHT / 2;
+            path = `M ${source.x + GRAPH_NODE_WIDTH} ${y} C ${source.x + GRAPH_NODE_WIDTH + 42} ${y}, ${target.x - 42} ${y}, ${target.x} ${y}`;
+            labelX = (source.x + GRAPH_NODE_WIDTH + target.x) / 2; labelY = y - 10;
+          } else if (edge.route === "row-return") {
+            const arcY = source.y - 24 - edge.lane * GRAPH_LANE_GAP;
+            path = `M ${source.x + GRAPH_NODE_WIDTH / 2} ${source.y} V ${arcY} H ${target.x + GRAPH_NODE_WIDTH / 2} V ${target.y}`;
+            labelX = (source.x + target.x + GRAPH_NODE_WIDTH) / 2; labelY = arcY - 4;
+          } else if (edge.route === "next-row") {
+            const trackY = source.y + GRAPH_NODE_HEIGHT + 26 + edge.lane * GRAPH_LANE_GAP;
+            path = `M ${source.x + GRAPH_NODE_WIDTH / 2} ${source.y + GRAPH_NODE_HEIGHT} V ${trackY} H ${target.x + GRAPH_NODE_WIDTH / 2} V ${target.y}`;
+            labelX = (source.x + target.x + GRAPH_NODE_WIDTH) / 2; labelY = trackY - 4;
+          } else if (edge.route === "previous-row") {
+            const trackLane = (rowArcLanes.get(source.row)?.length ?? 0) + edge.lane;
+            const trackY = source.y - 24 - trackLane * GRAPH_LANE_GAP;
+            path = `M ${source.x + GRAPH_NODE_WIDTH / 2} ${source.y} V ${trackY} H ${target.x + GRAPH_NODE_WIDTH / 2} V ${target.y + GRAPH_NODE_HEIGHT}`;
+            labelX = (source.x + target.x + GRAPH_NODE_WIDTH) / 2; labelY = trackY - 4;
+          } else {
+            const side = edge.side!;
+            const railX = side === "left"
+              ? leftPadding - 34 - edge.lane * 22
+              : leftPadding + gridWidth + 34 + edge.lane * 22;
+            const travelsBackward = target.row < source.row;
+            const sourceX = source.x + GRAPH_NODE_WIDTH / 2;
+            const targetX = target.x + GRAPH_NODE_WIDTH / 2;
+            const sourceY = travelsBackward ? source.y : source.y + GRAPH_NODE_HEIGHT;
+            const targetY = travelsBackward ? target.y + GRAPH_NODE_HEIGHT : target.y;
+            const sourceTrackY = travelsBackward
+              ? source.y - 24 - edge.sourceTrackLane * GRAPH_LANE_GAP
+              : source.y + GRAPH_NODE_HEIGHT + 26 + edge.sourceTrackLane * GRAPH_LANE_GAP;
+            const targetTrackY = travelsBackward
+              ? target.y + GRAPH_NODE_HEIGHT + rowGap - 24 - edge.targetTrackLane * GRAPH_LANE_GAP
+              : target.y - 24 - edge.targetTrackLane * GRAPH_LANE_GAP;
+            path = `M ${sourceX} ${sourceY} V ${sourceTrackY} H ${railX} V ${targetTrackY} H ${targetX} V ${targetY}`;
+            labelX = railX + (side === "left" ? -7 : 7);
+            labelY = (sourceTrackY + targetTrackY) / 2 + (edge.lane % 2 === 0 ? -7 : 11);
+            textAnchor = side === "left" ? "end" : "start";
+          }
+          return <g key={edge.id} data-route={edge.route} className={`factory-connector ${edge.backward ? "loop" : ""}`}>
+            <path d={path} markerEnd={`url(#${edge.backward ? loopMarkerId : markerId})`} />
+            <text x={labelX} y={labelY} textAnchor={textAnchor}><title>{humanize(edge.fullOutcome)}</title>{humanize(edge.outcome)}</text>
           </g>;
         })}
       </svg>
@@ -2051,6 +2179,10 @@ function MetricsPage({ releases, onError }: { releases: WorkflowReleaseCatalog |
     return () => { active = false; };
   }, [tab, compareLeft, compareRight, filterKey, releaseKey]);
   const toggleLabel = (label: string) => setFilters((current) => ({ ...current, labels: current.labels.includes(label) ? current.labels.filter((item) => item !== label) : [...current.labels, label] }));
+  const revisionName = (workflowId: string, revision: string) => {
+    const release = releaseOptions.find((item) => item.workflow_id === workflowId && item.revision === revision);
+    return release ? `v${release.version}` : revision.slice(0, 12);
+  };
   const releaseName = (value: string) => { const release = releaseOptions.find((item) => `${item.workflow_id}@${item.revision}` === value); return release ? `${release.definition.name} · v${release.version} · ${release.is_default ? "Default" : release.label}` : value; };
   const delta = (metric: keyof WorkflowComparisonReport["deltas"], kind: "rate" | "duration" | "cost" | "tokens") => {
     const value = comparison?.deltas[metric]; if (!value || value.absolute === null) return "—";
@@ -2090,7 +2222,7 @@ function MetricsPage({ releases, onError }: { releases: WorkflowReleaseCatalog |
       <label>From<input aria-label="Metrics from date" type="date" value={filters.from} onChange={(event) => setFilters({ ...filters, from: event.target.value })} /></label>
       <label>To<input aria-label="Metrics to date" type="date" value={filters.to} onChange={(event) => setFilters({ ...filters, to: event.target.value })} /></label>
       <label>Workflow<select aria-label="Metrics workflow" value={filters.workflowId} onChange={(event) => setFilters({ ...filters, workflowId: event.target.value, workflowRevision: "" })}><option value="">All workflows</option>{[...new Set(report?.available.workflows.map((item) => item.id) ?? [])].map((id) => <option key={id} value={id}>{humanize(id)}</option>)}</select></label>
-      <label>Revision<select aria-label="Metrics workflow revision" disabled={!filters.workflowId} value={filters.workflowRevision} onChange={(event) => setFilters({ ...filters, workflowRevision: event.target.value })}><option value="">All revisions</option>{report?.available.workflows.filter((item) => item.id === filters.workflowId).map((item) => <option key={item.revision} value={item.revision}>{item.revision.slice(0, 12)}</option>)}</select></label>
+      <label>Revision<select aria-label="Metrics workflow revision" disabled={!filters.workflowId} value={filters.workflowRevision} onChange={(event) => setFilters({ ...filters, workflowRevision: event.target.value })}><option value="">All revisions</option>{report?.available.workflows.filter((item) => item.id === filters.workflowId).map((item) => <option key={item.revision} value={item.revision}>{revisionName(item.id, item.revision)}</option>)}</select></label>
       <details className="metrics-more-filters"><summary>More filters{activeFilterCount > 0 ? ` (${activeFilterCount})` : ""}</summary><div>
       <label>Production<select aria-label="Metrics production result" value={filters.productionResult} onChange={(event) => setFilters({ ...filters, productionResult: event.target.value })}><option value="">All outcomes</option><option value="unassessed">Unassessed</option><option value="succeeded">Succeeded</option><option value="failed">Failed</option><option value="rolled_back">Rolled back</option><option value="not_deployed">Not deployed</option></select></label>
       <label>Label matching<select aria-label="Metrics label matching" value={filters.labelMode} onChange={(event) => setFilters({ ...filters, labelMode: event.target.value as "any" | "all" })}><option value="any">Any selected label</option><option value="all">All selected labels</option></select></label>
@@ -2098,7 +2230,7 @@ function MetricsPage({ releases, onError }: { releases: WorkflowReleaseCatalog |
       </div></details>
       <button className="button-secondary" disabled={activeFilterCount === 0} onClick={clearFilters}>Clear</button>
       </div>
-      {activeFilterCount > 0 && <div className="metrics-filter-chips"><span>Active:</span>{filters.from && <button onClick={() => setFilters({ ...filters, from: "" })}>From {filters.from} ×</button>}{filters.to && <button onClick={() => setFilters({ ...filters, to: "" })}>To {filters.to} ×</button>}{filters.workflowId && <button onClick={() => setFilters({ ...filters, workflowId: "", workflowRevision: "" })}>{humanize(filters.workflowId)} ×</button>}{filters.workflowRevision && <button onClick={() => setFilters({ ...filters, workflowRevision: "" })}>{filters.workflowRevision.slice(0, 12)} ×</button>}{filters.productionResult && <button onClick={() => setFilters({ ...filters, productionResult: "" })}>{humanize(filters.productionResult)} ×</button>}{filters.labels.map((label) => <button key={label} onClick={() => toggleLabel(label)}>{label} ×</button>)}</div>}
+      {activeFilterCount > 0 && <div className="metrics-filter-chips"><span>Active:</span>{filters.from && <button onClick={() => setFilters({ ...filters, from: "" })}>From {filters.from} ×</button>}{filters.to && <button onClick={() => setFilters({ ...filters, to: "" })}>To {filters.to} ×</button>}{filters.workflowId && <button onClick={() => setFilters({ ...filters, workflowId: "", workflowRevision: "" })}>{humanize(filters.workflowId)} ×</button>}{filters.workflowRevision && <button onClick={() => setFilters({ ...filters, workflowRevision: "" })}>{revisionName(filters.workflowId, filters.workflowRevision)} ×</button>}{filters.productionResult && <button onClick={() => setFilters({ ...filters, productionResult: "" })}>{humanize(filters.productionResult)} ×</button>}{filters.labels.map((label) => <button key={label} onClick={() => toggleLabel(label)}>{label} ×</button>)}</div>}
     </section>
     <nav className="metrics-tabs" role="tablist" aria-label="Metrics views">{([
       ["overview", "Overview"], ["runtime", "Runtime"], ["reliability", "Reliability"], ["cost", "Cost & usage"], ["compare", "Compare"],
