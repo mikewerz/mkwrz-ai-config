@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useId, useMemo, useState } from "react";
+import React, { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import { parse, stringify } from "yaml";
 import { api, type Execution, type HarnessTelemetryRecord, type IntakeCampaign, type IntakeLimits, type IntakeOverview, type IntakeSource, type MetricsReport, type NumberSummary, type OperationalStatus, type PromptDocument, type QuotaReport, type RepositoryClaimBlocker, type RepositoryConfig, type RuntimeAgent, type SupervisorHealth, type TicketDetail, type TicketFrontmatter, type TicketSummary, type TokenUsage, type TrackerConfig, type WorkflowComparisonReport, type WorkflowDocument, type WorkflowNode, type WorkflowReleaseCatalog } from "./api.js";
 
@@ -322,10 +322,9 @@ function NextActionSummary({ ticket, workflow }: { ticket: TicketFrontmatter; wo
 
 function WorkflowMap({ ticket, workflow }: { ticket: TicketFrontmatter; workflow: WorkflowDocument["definition"] | undefined }) {
   const [storedZoom, setStoredZoom] = useStoredState("agentic-project-tracker.graph.zoom", 1);
-  const zoom = [0.7, 0.85, 1, 1.15, 1.3].includes(storedZoom) ? storedZoom : 1;
-  const zoomIndex = [0.7, 0.85, 1, 1.15, 1.3].indexOf(zoom);
+  const zoom = Number.isFinite(storedZoom) ? clampGraphZoom(storedZoom) : 1;
   if (ticket.workflow && workflow) return <section className="workflow-panel" aria-label="Ticket workflow">
-    <div className="section-heading"><div><h2>Workflow · {workflow.name} · v{ticket.workflow_assignment?.version ?? 1}</h2></div><div className="workflow-heading-actions"><div className="graph-zoom" role="group" aria-label="Workflow zoom"><button aria-label="Zoom out" disabled={zoomIndex === 0} onClick={() => setStoredZoom([0.7, 0.85, 1, 1.15, 1.3][zoomIndex - 1] ?? zoom)}>−</button><button aria-label="Reset zoom" onClick={() => setStoredZoom(1)}>{Math.round(zoom * 100)}%</button><button aria-label="Zoom in" disabled={zoomIndex === 4} onClick={() => setStoredZoom([0.7, 0.85, 1, 1.15, 1.3][zoomIndex + 1] ?? zoom)}>＋</button></div></div></div>
+    <div className="section-heading"><div><h2>Workflow · {workflow.name} · v{ticket.workflow_assignment?.version ?? 1}</h2></div><div className="workflow-heading-actions"><div className="graph-zoom" role="group" aria-label="Workflow zoom"><button aria-label="Zoom out" disabled={zoom <= GRAPH_ZOOM_MIN} onClick={() => setStoredZoom(clampGraphZoom(zoom - GRAPH_ZOOM_STEP))}>−</button><button aria-label="Reset zoom" onClick={() => setStoredZoom(1)}>{Math.round(zoom * 100)}%</button><button aria-label="Zoom in" disabled={zoom >= GRAPH_ZOOM_MAX} onClick={() => setStoredZoom(clampGraphZoom(zoom + GRAPH_ZOOM_STEP))}>＋</button></div></div></div>
     <NextActionSummary ticket={ticket} workflow={workflow} />
     <WorkflowGraph workflow={workflow} currentNode={ticket.workflow.current_node} ticket={ticket} zoom={zoom} />
     <div className="workflow-loops"><span>{ticket.workflow.transition_count} / {workflow.max_transitions} transitions</span><span>{ticket.workflow.node_runs.length} durable node runs</span></div>
@@ -899,7 +898,14 @@ function TicketEvidence({ ticket, workflow, busy, now, onUpload, onRemoveAttachm
   const traceArtifacts = artifacts.filter((artifact) => artifact.kind === "execution_trace");
   const technicalArtifacts = artifacts.filter((artifact) => !reviewKinds.has(artifact.kind) && !provenanceKinds.has(artifact.kind) && artifact.kind !== "execution_trace");
   const agentRuns = agentExecutionRuns(runs);
-  const provenanceRunIds = new Set(provenanceArtifacts.filter((artifact) => artifact.kind === "agent_transcript" && artifact.node_run_id).map((artifact) => artifact.node_run_id));
+  const herdrRunIds = new Set(provenanceArtifacts.filter((artifact) => artifact.kind === "agent_transcript" && artifact.node_run_id).map((artifact) => artifact.node_run_id!));
+  const nativeRunIds = new Set(provenanceArtifacts.filter((artifact) => artifact.kind === "harness_session_log" && artifact.node_run_id).map((artifact) => artifact.node_run_id!));
+  const provenanceRunIds = new Set([...herdrRunIds, ...nativeRunIds]);
+  const traceRunIds = new Set(traceArtifacts.filter((artifact) => artifact.node_run_id).map((artifact) => artifact.node_run_id!));
+  const manifestRunIds = new Set([
+    ...artifacts.filter((artifact) => artifact.kind === "execution_manifest" && artifact.node_run_id).map((artifact) => artifact.node_run_id!),
+    ...agentRuns.filter((run) => run.manifest_artifact_id).map((run) => run.id),
+  ]);
   const traceGroups = [...traceArtifacts.reduce((groups, artifact) => {
     const key = String(artifact.metadata.trace_id ?? artifact.id);
     groups.set(key, [...(groups.get(key) ?? []), artifact]);
@@ -953,12 +959,14 @@ function TicketEvidence({ ticket, workflow, busy, now, onUpload, onRemoveAttachm
     return <article className="evidence-item" key={artifact.id}><div className="evidence-kind"><span>{presentation.category ?? humanize(artifact.kind)}</span><small>{artifact.content_type}</small></div><div><strong>{artifactTitle(artifact)}{presentation.featured ? " · Featured" : ""}</strong>{presentation.description && <p>{presentation.description}</p>}<small>{artifact.filename} · {fileSize(artifact.size_bytes)} · {timeAgo(artifact.created_at, now)}{run ? ` · ${nodeName(run.node_id)} attempt ${run.attempt}` : ""}</small><code>sha256:{artifact.sha256}</code></div><div className="evidence-actions"><button type="button" aria-expanded={previewing} onClick={() => setPreviewArtifactId(previewing ? null : artifact.id)}>{previewing ? "Close preview" : "Preview"}</button><a href={api.artifactUrl(frontmatter.id, artifact.id)} target="_blank" rel="noreferrer">Open ↗</a><a href={api.artifactUrl(frontmatter.id, artifact.id, true)}>Download</a></div>{previewing && <div className="evidence-inline-preview"><div className="artifact-preview-toolbar"><span>{itemIndex + 1} of {items.length}</span><button disabled={items.length < 2} onClick={() => movePreview(items, -1)}>← Previous</button><button disabled={items.length < 2} onClick={() => movePreview(items, 1)}>Next →</button><button onClick={() => setFullscreen(true)}>Fullscreen</button></div><ArtifactPreview ticketId={frontmatter.id} artifact={artifact} /></div>}</article>;
   })}</div> : <div className="evidence-empty">No evidence is available in this category.</div>;
   const runList = runs.length ? <div className="run-evidence-list">{runs.map((run) => <details className="run-evidence" key={run.id}><summary><span><strong>{nodeName(run.node_id)}</strong><small>{humanize(run.node_type)} · visit {run.visit} · attempt {run.attempt}{run.conversation_generation ? ` · conversation g${run.conversation_generation}` : ""}</small></span><span><StatusPill value={run.status} subtle /><small>{run.outcome ? humanize(run.outcome) : "No outcome"}</small></span></summary><div className="run-evidence-body"><NodeTimingDetails run={run} now={now} />{run.telemetry && <TelemetryDetails telemetry={run.telemetry} compact />}{(run.supervisor_id || run.provider) && <p><strong>Executor</strong>{[run.supervisor_id, run.provider && humanize(run.provider)].filter(Boolean).join(" · ")}</p>}{run.lease_id && <p><strong>Lease / run</strong><code>{run.lease_id} · {run.id}</code></p>}<p><strong>Workflow revision</strong><code>{run.workflow_revision}{run.input_revision === undefined ? "" : ` · ticket r${run.input_revision}`}</code></p>{run.wait && <p><strong>Durable wait</strong>Wake {timeAgo(run.wait.wake_at, now)} · deadline {timeAgo(run.wait.deadline_at, now)} · {run.wait.delay_seconds}s delay</p>}{run.summary && <p><strong>Summary</strong>{run.summary}</p>}{run.handoff && <p><strong>Handoff</strong>{run.handoff}</p>}{run.script_path && <p><strong>Script</strong><code>{run.script_path}</code></p>}{run.working_directory && <p><strong>Working directory</strong><code>{run.working_directory}</code></p>}{Object.keys(run.metadata_writes ?? {}).length > 0 && <p><strong>Metadata writes</strong><code>{JSON.stringify(run.metadata_writes)}</code></p>}{(run.external_references ?? []).map((reference) => <p key={`${reference.type}:${reference.id}`}><strong>{humanize(reference.type)}</strong>{reference.url ? <a href={reference.url} target="_blank" rel="noreferrer">{reference.id} ↗</a> : reference.id}</p>)}<div className="evidence-actions">{run.output_path && <a href={`/api/tickets/${encodeURIComponent(frontmatter.id)}/runs/${encodeURIComponent(run.id)}/output`} target="_blank" rel="noreferrer">Full output ({fileSize(run.output_bytes ?? 0)}) ↗</a>}{run.manifest_artifact_id && <a href={api.artifactUrl(frontmatter.id, run.manifest_artifact_id)} target="_blank" rel="noreferrer">Execution manifest ↗</a>}</div></div></details>)}</div> : <div className="evidence-empty">No node runs have been recorded.</div>;
+  const captureStatus = (captured: boolean) => <span className={`provenance-status ${captured ? "captured" : "missing"}`}>{captured ? "Captured" : "Missing"}</span>;
+  const provenanceMatrix = agentRuns.length ? <div className="provenance-matrix"><div className="provenance-summary"><strong>{provenanceRunIds.size}/{agentRuns.length} runs have session provenance</strong><span>Native {nativeRunIds.size}/{agentRuns.length} · Herdr {herdrRunIds.size}/{agentRuns.length}</span></div><div className="provenance-table" role="table" aria-label="Agent run provenance coverage"><div className="provenance-row provenance-header" role="row"><span role="columnheader">Agent run</span><span role="columnheader">Native session</span><span role="columnheader">Herdr transcript</span><span role="columnheader">Operational trace</span><span role="columnheader">Manifest</span></div>{agentRuns.map((run) => <div className="provenance-row" role="row" key={run.id}><span role="cell"><strong>{nodeName(run.node_id)}</strong><small>Visit {run.visit} · attempt {run.attempt}</small></span><span role="cell">{captureStatus(nativeRunIds.has(run.id))}</span><span role="cell">{captureStatus(herdrRunIds.has(run.id))}</span><span role="cell">{captureStatus(traceRunIds.has(run.id))}</span><span role="cell">{captureStatus(manifestRunIds.has(run.id))}</span></div>)}</div></div> : <div className="evidence-empty">No executed agent runs are available for provenance coverage.</div>;
   return <section className="content-card evidence-card" aria-label="Evidence and artifacts">
-    <div className="section-heading"><div><span>Durable execution record</span><h2>Evidence &amp; artifacts</h2><p>Review readable evidence first; transcripts and native session records are grouped as execution provenance.</p></div><strong>{provenanceRunIds.size}/{agentRuns.length} executed agent runs captured · {artifacts.length} stored</strong></div>
+    <div className="section-heading"><div><span>Durable execution record</span><h2>Evidence &amp; artifacts</h2><p>Review readable evidence first; transcripts and native session records are grouped as execution provenance.</p></div><strong>{provenanceRunIds.size}/{agentRuns.length} runs with session provenance · Native {nativeRunIds.size}/{agentRuns.length} · Herdr {herdrRunIds.size}/{agentRuns.length} · {artifacts.length} stored</strong></div>
     <div className="evidence-tabs" role="tablist" aria-label="Evidence categories">{tabs.map((item) => <button type="button" role="tab" aria-selected={tab === item.id} className={tab === item.id ? "active" : ""} key={item.id} onClick={() => setTab(item.id)}>{item.label}<span>{item.count}</span></button>)}</div>
     <div className="evidence-panel" role="tabpanel">
       {tab === "review" && <><div className="artifact-review-filters"><label><input type="checkbox" checked={featuredOnly} onChange={(event) => setFeaturedOnly(event.target.checked)} /> Featured only</label><label><input type="checkbox" checked={latestPerNode} onChange={(event) => setLatestPerNode(event.target.checked)} /> Latest from each node</label><select aria-label="Artifact node" value={nodeFilter} onChange={(event) => setNodeFilter(event.target.value)}><option value="">All nodes</option>{nodeOptions.map((node) => <option value={node} key={node}>{nodeName(node)}</option>)}</select><select aria-label="Artifact category" value={categoryFilter} onChange={(event) => setCategoryFilter(event.target.value)}><option value="">All categories</option>{categoryOptions.map((category) => <option value={category} key={category}>{humanize(category)}</option>)}</select><select aria-label="Artifact type" value={typeFilter} onChange={(event) => setTypeFilter(event.target.value)}><option value="">All types</option>{typeOptions.map((type) => <option value={type} key={type}>{type}</option>)}</select></div>{outputRuns.length > 0 && <div className="persisted-output-list">{outputRuns.map((run) => <a key={run.id} href={`/api/tickets/${encodeURIComponent(frontmatter.id)}/runs/${encodeURIComponent(run.id)}/output`} target="_blank" rel="noreferrer"><span><strong>{nodeName(run.node_id)} output</strong><small>Visit {run.visit} · attempt {run.attempt} · {fileSize(run.output_bytes ?? 0)}</small></span><span>Open ↗</span></a>)}</div>}{artifactList(filteredReview)}</>}
-      {tab === "provenance" && artifactList(provenanceArtifacts)}
+      {tab === "provenance" && <>{provenanceMatrix}{artifactList(provenanceArtifacts)}</>}
       {tab === "runs" && runList}
       {tab === "traces" && (traceGroups.length ? <div className="run-evidence-list">{traceGroups.map((group) => { const run = group[0]?.node_run_id ? runById.get(group[0].node_run_id) : undefined; return <OperationalTrace key={String(group[0]?.metadata.trace_id ?? group[0]?.id)} ticketId={frontmatter.id} artifacts={group} {...(run ? { run } : {})} now={now} nodeName={nodeName} />; })}</div> : <div className="evidence-empty">No Herdr operational traces have been recorded.</div>)}
       {tab === "technical" && artifactList(technicalArtifacts)}
@@ -1249,13 +1257,15 @@ function ExecutionRecap({ ticket, workflow, now }: { ticket: TicketFrontmatter; 
   const operationalInterventions = runs.filter((run) => ["delivery_failed", "lease_lost", "operator_interrupt"].includes(run.outcome ?? "")).length;
   const humanGates = runs.filter((run) => run.node_type === "human_gate" && run.status === "completed").length;
   const interventions = ticket.questions.length + humanGates + operationalInterventions;
-  const provenanceAgentRuns = new Set((ticket.artifacts ?? []).filter((artifact) => artifact.kind === "agent_transcript" && artifact.node_run_id).map((artifact) => artifact.node_run_id)).size;
+  const herdrAgentRuns = new Set((ticket.artifacts ?? []).filter((artifact) => artifact.kind === "agent_transcript" && artifact.node_run_id).map((artifact) => artifact.node_run_id));
+  const nativeAgentRuns = new Set((ticket.artifacts ?? []).filter((artifact) => artifact.kind === "harness_session_log" && artifact.node_run_id).map((artifact) => artifact.node_run_id));
+  const provenanceAgentRuns = new Set([...herdrAgentRuns, ...nativeAgentRuns]).size;
   const importantArtifacts = [...(ticket.artifacts ?? [])].filter((artifact) => ["evidence", "script_artifact", "quality_report", "script_output"].includes(artifact.kind)).sort((left, right) => Number(Boolean(artifactPresentation(right).featured)) - Number(Boolean(artifactPresentation(left).featured)) || right.created_at.localeCompare(left.created_at)).slice(0, 5);
   const productionResult = ticket.production_result ?? "unassessed";
   const nodeName = (id: string) => workflow?.nodes.find((node) => node.id === id)?.name ?? humanize(id);
   return <section className="execution-recap" aria-label="Execution recap">
     <div className="section-heading"><div><span>Completed workflow</span><h2>Execution recap</h2><p>A compact summary derived from the immutable node-run ledger and ticket artifacts.</p></div><StatusPill value={productionResult === "unassessed" ? "pending" : productionResult} /></div>
-    <div className="recap-metrics"><div><span>Elapsed</span><strong>{duration(elapsed)}</strong></div><div><span>Uncached input</span><strong>{tokenCount(usage?.input_tokens)}</strong><small>{tokenRuns.length}/{agentRuns.length} executed agent runs</small></div><div><span>Cached input</span><strong>{tokenCount(usage?.cached_input_tokens)}</strong></div><div><span>Cache write</span><strong>{tokenCount(usage?.cache_write_input_tokens)}</strong></div><div><span>Output tokens</span><strong>{tokenCount(usage?.output_tokens)}</strong></div><div><span>Reasoning output</span><strong>{tokenCount(usage?.reasoning_output_tokens)}</strong></div><div><span>{costLabel(costRuns.map((run) => run.telemetry!.latest.cost.kind))}</span><strong>{costRuns.length ? usd(cost) : "Unavailable"}</strong><small>{costRuns.length}/{agentRuns.length} executed agent runs</small></div><div><span>Provenance</span><strong>{provenanceAgentRuns}/{agentRuns.length}</strong><small>executed agent runs captured</small></div><div><span>Interventions</span><strong>{interventions}</strong><small>{ticket.questions.length} questions · {humanGates} gates · {operationalInterventions} operational</small></div></div>
+    <div className="recap-metrics"><div><span>Elapsed</span><strong>{duration(elapsed)}</strong></div><div><span>Uncached input</span><strong>{tokenCount(usage?.input_tokens)}</strong><small>{tokenRuns.length}/{agentRuns.length} executed agent runs</small></div><div><span>Cached input</span><strong>{tokenCount(usage?.cached_input_tokens)}</strong></div><div><span>Cache write</span><strong>{tokenCount(usage?.cache_write_input_tokens)}</strong></div><div><span>Output tokens</span><strong>{tokenCount(usage?.output_tokens)}</strong></div><div><span>Reasoning output</span><strong>{tokenCount(usage?.reasoning_output_tokens)}</strong></div><div><span>{costLabel(costRuns.map((run) => run.telemetry!.latest.cost.kind))}</span><strong>{costRuns.length ? usd(cost) : "Unavailable"}</strong><small>{costRuns.length}/{agentRuns.length} executed agent runs</small></div><div><span>Provenance coverage</span><strong>{provenanceAgentRuns}/{agentRuns.length}</strong><small>Native {nativeAgentRuns.size}/{agentRuns.length} · Herdr {herdrAgentRuns.size}/{agentRuns.length}</small></div><div><span>Interventions</span><strong>{interventions}</strong><small>{ticket.questions.length} questions · {humanGates} gates · {operationalInterventions} operational</small></div></div>
     <div className="recap-path"><span>Path taken</span><div>{runs.map((run, index) => <React.Fragment key={run.id}><span className={`recap-node recap-${run.status}`}>{nodeName(run.node_id)}<small>{run.outcome ? humanize(run.outcome) : humanize(run.status)}</small></span>{index < runs.length - 1 && <i aria-hidden="true">→</i>}</React.Fragment>)}</div></div>
     <div className="recap-columns"><div><span>Pull requests</span>{ticket.pull_requests.length ? ticket.pull_requests.map((pr) => <a href={pr.url} target="_blank" rel="noreferrer" key={pr.url}>{pr.repository} · {pr.phase ? humanize(pr.phase) : "PR"} ↗</a>) : <small>No PRs were reported.</small>}</div><div><span>Important evidence</span>{importantArtifacts.length ? importantArtifacts.map((artifact) => <a href={api.artifactUrl(ticket.id, artifact.id)} target="_blank" rel="noreferrer" key={artifact.id}>{artifactTitle(artifact)} ↗</a>) : <small>No review artifacts were published.</small>}</div><div><span>Production</span><strong>{humanize(productionResult)}</strong>{ticket.production_assessment_note && <small>{ticket.production_assessment_note}</small>}</div></div>
   </section>;
@@ -1441,9 +1451,16 @@ function PromptEditorPage({ prompts, onUpdated, onError }: {
 
 const GRAPH_NODE_WIDTH = 208;
 const GRAPH_NODE_HEIGHT = 166;
+const GRAPH_TICKET_NODE_HEIGHT = 224;
 const GRAPH_COLUMN_GAP = 126;
 const GRAPH_BASE_ROW_GAP = 104;
 const GRAPH_LANE_GAP = 18;
+const GRAPH_PRIMARY_PORT_RATIO = 0.25;
+const GRAPH_ALTERNATE_PORT_RATIO = 0.75;
+const GRAPH_ZOOM_MIN = 0.5;
+const GRAPH_ZOOM_MAX = 2;
+const GRAPH_ZOOM_STEP = 0.1;
+const clampGraphZoom = (zoom: number) => Math.min(GRAPH_ZOOM_MAX, Math.max(GRAPH_ZOOM_MIN, Math.round(zoom * 100) / 100));
 
 type WorkflowRoute = WorkflowNode["outcomes"][number];
 
@@ -1481,8 +1498,32 @@ function replaceNodeTargets(node: WorkflowNode, from: string, to: string): Workf
 function WorkflowGraph({ workflow, currentNode, selectedNode, onSelect, ticket, zoom = 1 }: {
   workflow: WorkflowDocument["definition"]; currentNode?: string; selectedNode?: string; onSelect?: (nodeId: string) => void; ticket?: TicketFrontmatter; zoom?: number;
 }) {
+  const viewportRef = useRef<HTMLDivElement>(null);
+  const panRef = useRef<{ pointerId: number; clientX: number; scrollLeft: number } | null>(null);
+  const interactiveZoom = clampGraphZoom(zoom);
+  const [panning, setPanning] = useState(false);
+  const onPointerDown = (event: React.PointerEvent<HTMLDivElement>) => {
+    if (event.button !== 1) return;
+    event.preventDefault();
+    panRef.current = { pointerId: event.pointerId, clientX: event.clientX, scrollLeft: event.currentTarget.scrollLeft };
+    event.currentTarget.setPointerCapture?.(event.pointerId);
+    setPanning(true);
+  };
+  const onPointerMove = (event: React.PointerEvent<HTMLDivElement>) => {
+    const pan = panRef.current;
+    if (!pan || pan.pointerId !== event.pointerId) return;
+    event.preventDefault();
+    event.currentTarget.scrollLeft = pan.scrollLeft - (event.clientX - pan.clientX);
+  };
+  const stopPanning = (event: React.PointerEvent<HTMLDivElement>) => {
+    if (!panRef.current || panRef.current.pointerId !== event.pointerId) return;
+    if (event.currentTarget.hasPointerCapture?.(event.pointerId)) event.currentTarget.releasePointerCapture?.(event.pointerId);
+    panRef.current = null;
+    setPanning(false);
+  };
   const markerId = useId().replaceAll(":", "");
   const loopMarkerId = `${markerId}-loop`;
+  const nodeHeight = ticket ? GRAPH_TICKET_NODE_HEIGHT : GRAPH_NODE_HEIGHT;
   const columns = Math.min(workflow.nodes.length > 9 ? 4 : 3, Math.max(1, workflow.nodes.length));
   const rows = Math.ceil(workflow.nodes.length / columns);
   const grid = new Map(workflow.nodes.map((node, index) => [node.id, {
@@ -1593,14 +1634,14 @@ function WorkflowGraph({ workflow, currentNode, selectedNode, onSelect, ticket, 
     return [node.id, {
       ...position,
       x: leftPadding + position.column * (GRAPH_NODE_WIDTH + GRAPH_COLUMN_GAP),
-      y: topPadding + position.row * (GRAPH_NODE_HEIGHT + rowGap),
+      y: topPadding + position.row * (nodeHeight + rowGap),
     }];
   }));
   const width = Math.max(760, leftPadding + gridWidth + rightPadding);
-  const height = topPadding + rows * GRAPH_NODE_HEIGHT + Math.max(0, rows - 1) * rowGap + 52;
-  return <div className="factory-graph-scroll" aria-label="Workflow graph">
-    <div className="factory-graph-scale" style={{ width: width * zoom, height: height * zoom }}>
-    <div className="factory-graph" style={{ width, height, transform: `scale(${zoom})`, transformOrigin: "top left" }}>
+  const height = topPadding + rows * nodeHeight + Math.max(0, rows - 1) * rowGap + 52;
+  return <div ref={viewportRef} className={`factory-graph-scroll ${panning ? "is-panning" : ""}`} aria-label="Workflow graph" title="Middle-click and drag left or right to pan." onPointerDown={onPointerDown} onPointerMove={onPointerMove} onPointerUp={stopPanning} onPointerCancel={stopPanning} onAuxClick={(event) => { if (event.button === 1) event.preventDefault(); }}>
+    <div className="factory-graph-scale" style={{ width: width * interactiveZoom, height: height * interactiveZoom }}>
+    <div className="factory-graph" style={{ width, height, transform: `scale(${interactiveZoom})`, transformOrigin: "top left" }}>
       <svg className="factory-connectors" width={width} height={height} aria-hidden="true">
         <defs>
           <marker id={markerId} markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" /></marker>
@@ -1609,23 +1650,26 @@ function WorkflowGraph({ workflow, currentNode, selectedNode, onSelect, ticket, 
         {positionedEdges.map((edge) => {
           const source = positions.get(edge.source); const target = positions.get(edge.target);
           if (!source || !target || edge.route === "missing") return null;
+          const portRatio = edge.backward ? GRAPH_ALTERNATE_PORT_RATIO : GRAPH_PRIMARY_PORT_RATIO;
+          const sourcePortX = source.x + GRAPH_NODE_WIDTH * portRatio;
+          const targetPortX = target.x + GRAPH_NODE_WIDTH * portRatio;
           let path: string; let labelX: number; let labelY: number; let textAnchor: "start" | "middle" | "end" = "middle";
           if (edge.route === "direct") {
-            const y = source.y + GRAPH_NODE_HEIGHT / 2;
+            const y = source.y + nodeHeight / 2;
             path = `M ${source.x + GRAPH_NODE_WIDTH} ${y} C ${source.x + GRAPH_NODE_WIDTH + 42} ${y}, ${target.x - 42} ${y}, ${target.x} ${y}`;
             labelX = (source.x + GRAPH_NODE_WIDTH + target.x) / 2; labelY = y - 10;
           } else if (edge.route === "row-return") {
             const arcY = source.y - 24 - edge.lane * GRAPH_LANE_GAP;
-            path = `M ${source.x + GRAPH_NODE_WIDTH / 2} ${source.y} V ${arcY} H ${target.x + GRAPH_NODE_WIDTH / 2} V ${target.y}`;
+            path = `M ${sourcePortX} ${source.y} V ${arcY} H ${targetPortX} V ${target.y}`;
             labelX = (source.x + target.x + GRAPH_NODE_WIDTH) / 2; labelY = arcY - 4;
           } else if (edge.route === "next-row") {
-            const trackY = source.y + GRAPH_NODE_HEIGHT + 26 + edge.lane * GRAPH_LANE_GAP;
-            path = `M ${source.x + GRAPH_NODE_WIDTH / 2} ${source.y + GRAPH_NODE_HEIGHT} V ${trackY} H ${target.x + GRAPH_NODE_WIDTH / 2} V ${target.y}`;
+            const trackY = source.y + nodeHeight + 26 + edge.lane * GRAPH_LANE_GAP;
+            path = `M ${sourcePortX} ${source.y + nodeHeight} V ${trackY} H ${targetPortX} V ${target.y}`;
             labelX = (source.x + target.x + GRAPH_NODE_WIDTH) / 2; labelY = trackY - 4;
           } else if (edge.route === "previous-row") {
             const trackLane = (rowArcLanes.get(source.row)?.length ?? 0) + edge.lane;
             const trackY = source.y - 24 - trackLane * GRAPH_LANE_GAP;
-            path = `M ${source.x + GRAPH_NODE_WIDTH / 2} ${source.y} V ${trackY} H ${target.x + GRAPH_NODE_WIDTH / 2} V ${target.y + GRAPH_NODE_HEIGHT}`;
+            path = `M ${sourcePortX} ${source.y} V ${trackY} H ${targetPortX} V ${target.y + nodeHeight}`;
             labelX = (source.x + target.x + GRAPH_NODE_WIDTH) / 2; labelY = trackY - 4;
           } else {
             const side = edge.side!;
@@ -1633,22 +1677,20 @@ function WorkflowGraph({ workflow, currentNode, selectedNode, onSelect, ticket, 
               ? leftPadding - 34 - edge.lane * 22
               : leftPadding + gridWidth + 34 + edge.lane * 22;
             const travelsBackward = target.row < source.row;
-            const sourceX = source.x + GRAPH_NODE_WIDTH / 2;
-            const targetX = target.x + GRAPH_NODE_WIDTH / 2;
-            const sourceY = travelsBackward ? source.y : source.y + GRAPH_NODE_HEIGHT;
-            const targetY = travelsBackward ? target.y + GRAPH_NODE_HEIGHT : target.y;
+            const sourceY = travelsBackward ? source.y : source.y + nodeHeight;
+            const targetY = travelsBackward ? target.y + nodeHeight : target.y;
             const sourceTrackY = travelsBackward
               ? source.y - 24 - edge.sourceTrackLane * GRAPH_LANE_GAP
-              : source.y + GRAPH_NODE_HEIGHT + 26 + edge.sourceTrackLane * GRAPH_LANE_GAP;
+              : source.y + nodeHeight + 26 + edge.sourceTrackLane * GRAPH_LANE_GAP;
             const targetTrackY = travelsBackward
-              ? target.y + GRAPH_NODE_HEIGHT + rowGap - 24 - edge.targetTrackLane * GRAPH_LANE_GAP
+              ? target.y + nodeHeight + rowGap - 24 - edge.targetTrackLane * GRAPH_LANE_GAP
               : target.y - 24 - edge.targetTrackLane * GRAPH_LANE_GAP;
-            path = `M ${sourceX} ${sourceY} V ${sourceTrackY} H ${railX} V ${targetTrackY} H ${targetX} V ${targetY}`;
+            path = `M ${sourcePortX} ${sourceY} V ${sourceTrackY} H ${railX} V ${targetTrackY} H ${targetPortX} V ${targetY}`;
             labelX = railX + (side === "left" ? -7 : 7);
             labelY = (sourceTrackY + targetTrackY) / 2 + (edge.lane % 2 === 0 ? -7 : 11);
             textAnchor = side === "left" ? "end" : "start";
           }
-          return <g key={edge.id} data-route={edge.route} className={`factory-connector ${edge.backward ? "loop" : ""}`}>
+          return <g key={edge.id} data-route={edge.route} data-source={edge.source} data-target={edge.target} data-port={edge.backward ? "alternate-right" : "primary-left"} className={`factory-connector ${edge.backward ? "loop" : ""}`}>
             <path d={path} markerEnd={`url(#${edge.backward ? loopMarkerId : markerId})`} />
             <text x={labelX} y={labelY} textAnchor={textAnchor}><title>{humanize(edge.fullOutcome)}</title>{humanize(edge.outcome)}</text>
           </g>;
@@ -1662,7 +1704,7 @@ function WorkflowGraph({ workflow, currentNode, selectedNode, onSelect, ticket, 
         const usage = aggregateTokenUsage(runs);
         const costRuns = runs.filter((run) => run.telemetry?.delta.cost_usd !== null && run.telemetry?.delta.cost_usd !== undefined);
         const totalCost = costRuns.reduce((sum, run) => sum + (run.telemetry?.delta.cost_usd ?? 0), 0);
-        return <button type="button" key={node.id} style={{ left: position.x, top: position.y, width: GRAPH_NODE_WIDTH, height: GRAPH_NODE_HEIGHT }} onClick={() => onSelect?.(node.id)} aria-pressed={selectedNode === node.id} className={`factory-node node-kind-${node.type} ${currentNode === node.id ? "current" : ""} ${selectedNode === node.id ? "selected" : ""}`}>
+        return <button type="button" key={node.id} data-node={node.id} style={{ left: position.x, top: position.y, width: GRAPH_NODE_WIDTH, height: nodeHeight }} onClick={() => onSelect?.(node.id)} aria-pressed={selectedNode === node.id} className={`factory-node node-kind-${node.type} ${currentNode === node.id ? "current" : ""} ${selectedNode === node.id ? "selected" : ""}`}>
           <header><span>{humanize(node.type)}</span>{currentNode === node.id && <em>Current</em>}</header>
           <strong>{node.name}</strong><code>{node.id}</code>
           <small>{humanize(node.stage)}{node.when ? ` · when ${humanize(node.when.input)}` : ""}</small>

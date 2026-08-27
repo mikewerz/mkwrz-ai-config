@@ -72,6 +72,42 @@ describe("HerdrController", () => {
     await expect(controller.readTranscript("w1:p1", 100_001)).rejects.toThrow("between 1 and 100000");
   });
 
+  it("retries transcript capture while Herdr is still finalizing the agent pane", async () => {
+    // Arrange
+    let reads = 0;
+    const runText = vi.fn(async () => {
+      reads += 1;
+      if (reads < 3) throw Object.assign(new Error("agent is still working"), {
+        stderr: '{"error":{"code":"agent_not_idle"}}\n',
+      });
+      return "complete transcript";
+    });
+    const controller = new HerdrController({ run: vi.fn(), runText }, "/srv/projects", {
+      transcriptRetryIntervalMs: 1, transcriptRetryTimeoutMs: 50,
+    });
+
+    // Execute
+    const transcript = await controller.readTranscript("w1:p1", 5_000);
+
+    // Verify
+    expect(transcript).toBe("complete transcript");
+    expect(runText).toHaveBeenCalledTimes(3);
+  });
+
+  it("does not retry transcript failures that are unrelated to agent finalization", async () => {
+    // Arrange
+    const runText = vi.fn(async () => {
+      throw Object.assign(new Error("pane does not exist"), { stderr: '{"error":{"code":"agent_not_found"}}\n' });
+    });
+    const controller = new HerdrController({ run: vi.fn(), runText }, "/srv/projects", {
+      transcriptRetryIntervalMs: 1, transcriptRetryTimeoutMs: 50,
+    });
+
+    // Execute and verify
+    await expect(controller.readTranscript("w1:p1", 5_000)).rejects.toThrow("pane does not exist");
+    expect(runText).toHaveBeenCalledTimes(1);
+  });
+
   it("waits for a new macOS login-shell pane to accept the agent start", async () => {
     vi.useFakeTimers();
     let starts = 0;

@@ -745,7 +745,13 @@ export class Supervisor {
           if (finalTelemetry) await this.tracker.telemetry(lease, finalTelemetry, captureBaseline(finalTelemetry)).catch(() => undefined);
         }
       } catch { /* the completed node may already have closed its pane */ }
-      await this.herdr.interrupt(observation.paneId).catch(() => undefined);
+      await this.herdr.interrupt(observation.paneId).catch((error) => {
+        trace.record("agent.settle_failed", { fence_source: fenceSource, error: errorMessage(error) });
+        log("warn", "work.agent_settle_failed", {
+          provider, supervisor_id: this.options.supervisorId, ticket_id: ticket.frontmatter.id,
+          node_id: ticket.workflow_node.id, lease_id: lease, fence_source: fenceSource,
+        }, error);
+      });
       const settledObservation = typeof this.herdr.observe === "function"
         ? await this.herdr.observe(observation.paneId).catch(() => finalObservation ?? lastObservation)
         : finalObservation ?? lastObservation;

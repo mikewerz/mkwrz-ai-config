@@ -11,7 +11,7 @@ const logPath = process.env.FAKE_HERDR_LOG;
 const statePath = process.env.FAKE_HERDR_STATE;
 
 const credentialNames = new Set([
-  "ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "OPENAI_API_KEY", "CODEX_API_KEY", "PI_API_KEY",
+  "ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "OPENAI_API_KEY", "CODEX_API_KEY",
   "GITHUB_TOKEN", "GH_TOKEN", "JIRA_API_TOKEN", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN",
   "AZURE_CLIENT_SECRET", "GOOGLE_APPLICATION_CREDENTIALS",
 ]);
@@ -133,6 +133,14 @@ if (args[0] === "workspace" && args[1] === "create") {
     },
   });
 } else if (args[0] === "agent" && args[1] === "read") {
+  const configuredNotIdleReads = Number.parseInt(process.env.FAKE_HERDR_TRANSCRIPT_NOT_IDLE_READS ?? "0", 10);
+  const notIdleReads = Number.isSafeInteger(configuredNotIdleReads) && configuredNotIdleReads > 0 ? configuredNotIdleReads : 0;
+  if (state.callback_submitted && (state.transcript_not_idle_reads ?? 0) < notIdleReads) {
+    state.transcript_not_idle_reads = (state.transcript_not_idle_reads ?? 0) + 1;
+    writeState(state);
+    console.error(JSON.stringify({ error: { code: "agent_not_idle", message: "Fake pane is still finalizing" } }));
+    process.exit(1);
+  }
   process.stdout.write(state.pending_prompt && process.env.FAKE_HERDR_COLLAPSE_STAGED_PROMPT === "true"
     ? "Claude Code\n[Pasted text #1 +14 lines]" : state.pending_prompt ?? state.transcript ?? "");
 } else if (args[0] === "agent" && args[1] === "prompt") {

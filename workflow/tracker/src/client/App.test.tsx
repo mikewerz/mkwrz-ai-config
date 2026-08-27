@@ -460,6 +460,7 @@ describe("operator UI", () => {
     render(<App />);
     fireEvent.click(await screen.findByRole("button", { name: /UI ticket/i }));
     const workflow = await screen.findByRole("region", { name: "Ticket workflow" });
+    expect(workflow.querySelector<HTMLElement>(".factory-node")?.style.height).toBe("224px");
     expect(within(workflow).getByRole("heading", { name: "Workflow · Standard delivery · v1" })).toBeInTheDocument();
     expect(within(workflow).queryByText(/standard-delivery@/i)).not.toBeInTheDocument();
     expect(screen.getByText("Running tests")).toBeInTheDocument();
@@ -569,6 +570,7 @@ describe("operator UI", () => {
       { id: "trace-1", kind: "execution_trace", ticket_id: "APT-42", node_run_id: "run-12", filename: "run-12.000001-000002.herdr-trace.jsonl", content_type: "application/x-ndjson", size_bytes: 400, sha256: "1".repeat(64), created_at: "2026-08-14T11:01:30Z", metadata: { trace_id: "trace-id", first_sequence: 1, last_sequence: 2, event_count: 2, completed: true } },
       { id: "transcript-1", kind: "agent_transcript", ticket_id: "APT-42", node_run_id: "run-10", filename: "implementation.herdr.txt", content_type: "text/plain", size_bytes: 2_400, sha256: "2".repeat(64), created_at: "2026-08-14T11:01:40Z", metadata: { source: "herdr", completeness: "bounded", disposition: "callback", presentation: { title: "Agent session transcript", description: "Bounded Herdr capture at callback.", category: "provenance" } } },
       { id: "native-1", kind: "harness_session_log", ticket_id: "APT-42", node_run_id: "run-10", filename: "session-claude.jsonl", content_type: "application/x-ndjson", size_bytes: 6_400, sha256: "3".repeat(64), created_at: "2026-08-14T11:01:41Z", metadata: { source: "harness", completeness: "full", disposition: "callback", provider: "claude", role: "primary", presentation: { title: "Claude native session log", description: "Complete harness capture at callback.", category: "provenance" } } },
+      { id: "native-2", kind: "harness_session_log", ticket_id: "APT-42", node_run_id: "run-11", filename: "session-codex.jsonl", content_type: "application/x-ndjson", size_bytes: 7_200, sha256: "4".repeat(64), created_at: "2026-08-14T11:01:42Z", metadata: { source: "harness", completeness: "full", disposition: "callback", provider: "codex", role: "primary", presentation: { title: "Codex native session log", description: "Native capture without a Herdr transcript.", category: "provenance" } } },
     ];
     current.frontmatter.checkpoints = [{ id: "checkpoint-1", label: "Before release", kind: "workflow", node_id: "implementation", node_run_id: "run-12", created_at: "2026-08-14T11:02:00Z", manifest_artifact_id: "checkpoint-manifest", repositories: [{ repository: "demo", head_sha: "1".repeat(40), snapshot_sha: "2".repeat(40), branch: "main", remote_url: "https://github.com/example/demo.git", dirty: true, bundle_artifact_id: "checkpoint-bundle" }] }];
     current.frontmatter.attachments = [{ id: "attachment-1", filename: "requirements.txt", content_type: "text/plain", size_bytes: 42, sha256: "e".repeat(64), created_at: "2026-08-14T10:00:00Z" }];
@@ -603,7 +605,13 @@ describe("operator UI", () => {
     fireEvent.click(within(evidence).getByRole("tab", { name: /Provenance/ }));
     expect(within(evidence).getByText("Agent session transcript")).toBeInTheDocument();
     expect(within(evidence).getByText("Claude native session log")).toBeInTheDocument();
-    expect(within(evidence).getByText(/1\/12 executed agent runs captured/)).toBeInTheDocument();
+    expect(within(evidence).getAllByText(/2\/12 runs with session provenance/).length).toBeGreaterThan(0);
+    expect(within(evidence).getAllByText(/Native 2\/12 · Herdr 1\/12/).length).toBeGreaterThan(0);
+    const provenanceTable = within(evidence).getByRole("table", { name: "Agent run provenance coverage" });
+    const nativeOnlyRow = within(provenanceTable).getByText("Visit 12 · attempt 1").closest<HTMLElement>("[role='row']")!;
+    expect(within(nativeOnlyRow).getAllByText("Captured")).toHaveLength(1);
+    expect(within(nativeOnlyRow).getAllByText("Missing")).toHaveLength(3);
+    expect(within(provenanceTable).getAllByText("Captured")).toHaveLength(3);
     fireEvent.click(within(evidence).getByRole("tab", { name: /Technical artifacts/ }));
     const manifestRow = within(evidence).getByText("run-12.execution-manifest.json").closest("article")!;
     expect(within(manifestRow).getByRole("link", { name: "Download" })).toHaveAttribute("href", "/api/tickets/APT-42/artifacts/execution-manifest/content?download=true");
@@ -627,7 +635,10 @@ describe("operator UI", () => {
     current.frontmatter.production_result = "succeeded";
     current.frontmatter.production_assessment_note = "Healthy in production.";
     current.frontmatter.questions = [{ id: "q1", question: "Ship it?", options: [], answer: "Yes", asked_at: "2026-08-14T11:00:00Z", answered_at: "2026-08-14T11:01:00Z" }];
-    current.frontmatter.artifacts = [{ id: "evidence-1", kind: "evidence", ticket_id: "APT-42", node_run_id: "run-1", filename: "review.md", content_type: "text/markdown", size_bytes: 72, sha256: "f".repeat(64), created_at: "2026-08-14T11:05:00Z", metadata: { presentation: { title: "Release review", category: "review", featured: true } } }];
+    current.frontmatter.artifacts = [
+      { id: "evidence-1", kind: "evidence", ticket_id: "APT-42", node_run_id: "run-1", filename: "review.md", content_type: "text/markdown", size_bytes: 72, sha256: "f".repeat(64), created_at: "2026-08-14T11:05:00Z", metadata: { presentation: { title: "Release review", category: "review", featured: true } } },
+      { id: "native-1", kind: "harness_session_log", ticket_id: "APT-42", node_run_id: "run-1", filename: "session.jsonl", content_type: "application/x-ndjson", size_bytes: 2_400, sha256: "e".repeat(64), created_at: "2026-08-14T11:05:01Z", metadata: { source: "harness", completeness: "full", role: "primary" } },
+    ];
     current.frontmatter.workflow.current_node = "done";
     current.frontmatter.workflow.completed_at = "2026-08-14T12:05:00Z";
     const usage = { input_tokens: 10_000, cached_input_tokens: 0, cache_write_input_tokens: 0, output_tokens: 2_000, reasoning_output_tokens: 0, total_tokens: 12_000 };
@@ -650,7 +661,8 @@ describe("operator UI", () => {
     expect(within(recap).getByText("Reasoning output").parentElement).toHaveTextContent("0");
     expect(within(recap).getByText("Reported cost").parentElement).toHaveTextContent("$1.25");
     expect(within(recap).getAllByText("1/1 executed agent runs")).toHaveLength(2);
-    expect(within(recap).getByText("0/1").parentElement).toHaveTextContent("executed agent runs captured");
+    expect(within(recap).getByText("Provenance coverage").parentElement).toHaveTextContent("1/1");
+    expect(within(recap).getByText("Provenance coverage").parentElement).toHaveTextContent("Native 1/1 · Herdr 0/1");
     expect(within(recap).getByText("$1.25")).toBeInTheDocument();
     expect(within(recap).getByRole("link", { name: /demo · PR/ })).toHaveAttribute("href", "https://github.com/example/demo/pull/42");
     expect(within(recap).getByRole("link", { name: /Release review/ })).toBeInTheDocument();
@@ -1007,6 +1019,42 @@ describe("operator UI", () => {
     expect(graph.querySelectorAll(".factory-connector.loop").length).toBeGreaterThan(0);
     expect(graph.querySelector('[data-route="row-return"]')).toBeInTheDocument();
     expect(graph.querySelector('.factory-connector.loop[data-route="previous-row"]')).toBeInTheDocument();
+    expect(graph.querySelectorAll('.factory-connector:not(.loop)[data-port="primary-left"]').length).toBeGreaterThan(0);
+    expect(graph.querySelectorAll('.factory-connector.loop[data-port="alternate-right"]').length).toBeGreaterThan(0);
+    const assertConnectorPort = (selector: string, ratio: number) => {
+      const connector = graph.querySelector<SVGGElement>(selector)!;
+      const source = graph.querySelector<HTMLElement>(`[data-node="${connector.dataset.source}"]`)!;
+      const target = graph.querySelector<HTMLElement>(`[data-node="${connector.dataset.target}"]`)!;
+      const expectedSourceX = Number.parseFloat(source.style.left) + Number.parseFloat(source.style.width) * ratio;
+      const expectedTargetX = Number.parseFloat(target.style.left) + Number.parseFloat(target.style.width) * ratio;
+      const path = connector.querySelector("path")!.getAttribute("d")!;
+      expect(path).toMatch(new RegExp(`^M ${expectedSourceX} `));
+      expect(path).toContain(`H ${expectedTargetX} `);
+    };
+    assertConnectorPort('.factory-connector:not(.loop)[data-route="next-row"]', 0.25);
+    assertConnectorPort('.factory-connector.loop[data-route="previous-row"]', 0.75);
+    const canvas = graph.querySelector<HTMLElement>(".factory-graph")!;
+    expect(canvas.style.transform).toBe("scale(1)");
+    const wheel = new WheelEvent("wheel", { bubbles: true, cancelable: true, deltaY: -100, clientX: 180, clientY: 120 });
+    graph.dispatchEvent(wheel);
+    expect(wheel.defaultPrevented).toBe(false);
+    expect(canvas.style.transform).toBe("scale(1)");
+    Object.defineProperties(graph, {
+      scrollLeft: { configurable: true, writable: true, value: 40 },
+      scrollTop: { configurable: true, writable: true, value: 50 },
+    });
+    const pointer = (type: string, clientX: number, clientY: number) => {
+      const event = new Event(type, { bubbles: true, cancelable: true });
+      Object.defineProperties(event, { button: { value: 1 }, pointerId: { value: 7 }, clientX: { value: clientX }, clientY: { value: clientY } });
+      fireEvent(graph, event);
+    };
+    pointer("pointerdown", 200, 150);
+    expect(graph).toHaveClass("is-panning");
+    pointer("pointermove", 150, 120);
+    expect(graph.scrollLeft).toBe(90);
+    expect(graph.scrollTop).toBe(50);
+    pointer("pointerup", 150, 120);
+    expect(graph).not.toHaveClass("is-panning");
     expect(screen.getByRole("heading", { name: "Conditions & parameters" })).toBeInTheDocument();
     expect(screen.getByRole("heading", { name: "Stages" })).toBeInTheDocument();
     expect(screen.getByLabelText("Outcome 1 label")).toHaveValue("Specification completed");

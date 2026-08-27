@@ -9,6 +9,8 @@ const exec = promisify(execFile);
 const PANE_BUSY_RETRY_INTERVAL_MS = 500;
 const PANE_BUSY_RETRY_TIMEOUT_MS = 10_000;
 const AGENT_READY_POLL_INTERVAL_MS = 500;
+const TRANSCRIPT_RETRY_INTERVAL_MS = 500;
+const TRANSCRIPT_RETRY_TIMEOUT_MS = 10_000;
 const sleep = (milliseconds: number) => new Promise((resolve) => setTimeout(resolve, milliseconds));
 
 export interface CommandRunner {
@@ -19,6 +21,8 @@ export interface CommandRunner {
 export interface HerdrControllerOptions {
   agentReadyTimeoutMs?: number;
   agentReadySettleMs?: number;
+  transcriptRetryIntervalMs?: number;
+  transcriptRetryTimeoutMs?: number;
 }
 
 export class HerdrCli implements CommandRunner {
@@ -150,6 +154,8 @@ export function agentName(ticketId: string, provider: Provider, conversation: st
 export class HerdrController {
   private readonly agentReadyTimeoutMs: number;
   private readonly agentReadySettleMs: number;
+  private readonly transcriptRetryIntervalMs: number;
+  private readonly transcriptRetryTimeoutMs: number;
   private readonly trace = new AsyncLocalStorage<ExecutionTraceSink>();
 
   constructor(private readonly runner: CommandRunner, readonly projectRoot: string, options: HerdrControllerOptions = {}) {
@@ -157,6 +163,10 @@ export class HerdrController {
       ? Number(options.agentReadyTimeoutMs) : 30_000;
     this.agentReadySettleMs = Number.isFinite(options.agentReadySettleMs) && Number(options.agentReadySettleMs) >= 0
       ? Number(options.agentReadySettleMs) : 10_000;
+    this.transcriptRetryIntervalMs = Number.isFinite(options.transcriptRetryIntervalMs) && Number(options.transcriptRetryIntervalMs) >= 0
+      ? Number(options.transcriptRetryIntervalMs) : TRANSCRIPT_RETRY_INTERVAL_MS;
+    this.transcriptRetryTimeoutMs = Number.isFinite(options.transcriptRetryTimeoutMs) && Number(options.transcriptRetryTimeoutMs) >= 0
+      ? Number(options.transcriptRetryTimeoutMs) : TRANSCRIPT_RETRY_TIMEOUT_MS;
   }
 
   withTrace<T>(sink: ExecutionTraceSink, work: () => Promise<T>): Promise<T> {
@@ -291,7 +301,22 @@ export class HerdrController {
 
   async readTranscript(paneId: string, lines: number): Promise<string> {
     if (!Number.isSafeInteger(lines) || lines < 1 || lines > 100_000) throw new Error("Herdr transcript lines must be an integer between 1 and 100000");
-    return this.runText(["agent", "read", paneId, "--source", "recent-unwrapped", "--lines", String(lines)]);
+    const args = ["agent", "read", paneId, "--source", "recent-unwrapped", "--lines", String(lines)];
+    const deadline = Date.now() + this.transcriptRetryTimeoutMs;
+    let attempt = 0;
+    while (true) {
+      attempt += 1;
+      try {
+        return await this.runText(args);
+      } catch (error) {
+        if (commandErrorCode(error) !== "agent_not_idle" || Date.now() >= deadline) throw error;
+        const delayMs = Math.min(this.transcriptRetryIntervalMs, Math.max(0, deadline - Date.now()));
+        this.trace.getStore()?.record("provenance.herdr_transcript_retry", {
+          pane_id: paneId, attempt, delay_ms: delayMs, error_code: "agent_not_idle",
+        });
+        await sleep(delayMs);
+      }
+    }
   }
 
   async sendKeys(paneId: string, ...keys: string[]): Promise<void> {

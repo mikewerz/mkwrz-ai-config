@@ -164,6 +164,7 @@ export async function startSupervisor(tracker, options = {}) {
       FAKE_HERDR_READY_AFTER_GETS: String(options.fakeHerdrReadyAfterGets ?? 0),
       FAKE_HERDR_STARTUP_OBSERVATION_NOISE: options.fakeHerdrStartupObservationNoise === true ? "true" : "false",
       FAKE_HERDR_PUBLISH_EVIDENCE: options.fakeHerdrPublishEvidence === true ? "true" : "false",
+      FAKE_HERDR_TRANSCRIPT_NOT_IDLE_READS: String(options.fakeHerdrTranscriptNotIdleReads ?? 0),
       CLAUDE_CONFIG_DIR: join(assignmentRoot, "claude-config"),
       SESSION_EVIDENCE_ENABLED: "true",
       NATIVE_SESSION_EVIDENCE_ENABLED: "true",

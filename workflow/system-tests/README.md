@@ -19,8 +19,9 @@ by the supervisor system tests. It records every invocation and, in the agent
 scenario, submits a declared callback directly to the tracker.
 
 The fake also emits deterministic pane scrollback and a fake Claude-native JSONL
-session record. The Agent-path test verifies that both become tracker-owned
-provenance artifacts after the callback without starting a real provider.
+session record. The Agent-path test makes the first post-callback transcript
+read return `agent_not_idle`, then verifies the supervisor retries and both
+sources become tracker-owned provenance artifacts without starting a real provider.
 
 ## Run
 

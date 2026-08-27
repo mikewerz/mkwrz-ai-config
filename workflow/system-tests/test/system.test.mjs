@@ -574,7 +574,7 @@ test("an Agent node uses only fake Herdr and advances through its declared callb
     await configureTracker(tracker, null);
     const workflow = await publishWorkflow(tracker, agentWorkflow("system-fake-agent"));
     await createReadyTicket(tracker, "SYSTEM-FAKE-AGENT", workflow.definition.id);
-    supervisor = await startSupervisor(tracker, { fakeHerdrPublishEvidence: true });
+    supervisor = await startSupervisor(tracker, { fakeHerdrPublishEvidence: true, fakeHerdrTranscriptNotIdleReads: 1 });
 
     const ticket = await completedTicket(tracker, "SYSTEM-FAKE-AGENT");
     assert.equal(ticket.frontmatter.workflow.current_node, "done");
@@ -598,6 +598,7 @@ test("an Agent node uses only fake Herdr and advances through its declared callb
     assert.deepEqual(traceEvents.map((event) => event.sequence), traceEvents.map((_event, index) => index + 1));
     assert.ok(traceEvents.some((event) => event.event === "herdr.command_started" && event.data.command === "agent.prompt"));
     assert.ok(traceEvents.some((event) => event.event === "delivery.confirmed"));
+    assert.ok(traceEvents.some((event) => event.event === "provenance.herdr_transcript_retry" && event.data.error_code === "agent_not_idle"));
     assert.ok(traceEvents.some((event) => event.event === "execution.trace_finished"));
     assert.ok(traceEvents.every((event) => !JSON.stringify(event).includes("You are assigned ticket SYSTEM-FAKE-AGENT")), "trace records hashes and paths instead of duplicating prompt bodies");
     const evidence = ticket.frontmatter.artifacts.find((artifact) => artifact.kind === "evidence");
