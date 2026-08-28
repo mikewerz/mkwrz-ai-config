@@ -307,6 +307,12 @@ export class PromptLibrary {
     return { ...definition, content, revision: revisionId, version: await artifactVersion(this.directory, definition.name, revisionId), tags: definition.allowed_tags.map((tag) => TAGS[tag]!), valid: errors.length === 0, errors };
   }
 
+  async validate(name: string, content: string): Promise<void> {
+    await this.start();
+    const definition = this.definition(name);
+    renderPrompt(definition.name, content, DUMMY_VALUES);
+  }
+
   async list(): Promise<PromptDocument[]> {
     await this.start();
     const discovered = (await readdir(this.directory, { withFileTypes: true }))

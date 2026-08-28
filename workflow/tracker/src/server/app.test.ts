@@ -184,6 +184,91 @@ describe("tracker API", () => {
     expect(promotedTicket.body.frontmatter.workflow_assignment).toMatchObject({ revision: trial.body.workflow.revision, selection: "default" });
   }, 15_000);
 
+  it("exports and imports an exact workflow revision with every referenced prompt revision", async () => {
+    // Arrange a shareable workflow whose implementation prompt differs from a
+    // fresh install, then export the immutable workflow release.
+    const sourceApp = createApp(store, join(root, "missing-client"));
+    const implementation = (await request(sourceApp).get("/api/prompts").expect(200)).body.prompts.find((prompt: { name: string }) => prompt.name === "implementation");
+    const portablePrompt = "Portable implementation instructions.\n\nAllowed outcomes:\n\n{{allowed_outcomes}}\n";
+    const updatedPrompt = await request(sourceApp).put("/api/prompts/implementation").send({
+      expected_revision: implementation.revision, content: portablePrompt,
+    }).expect(200);
+    const standard = (await request(sourceApp).get("/api/workflows/standard-delivery").expect(200)).body.workflow;
+    const portableDefinition = structuredClone(standard.definition);
+    portableDefinition.id = "portable-delivery";
+    portableDefinition.name = "Portable delivery";
+    const portable = await request(sourceApp).post("/api/workflows").send({ content: stringify(portableDefinition), label: "Team baseline" }).expect(201);
+
+    // Execute the export.
+    const exported = await request(sourceApp)
+      .get(`/api/workflows/portable-delivery/revisions/${portable.body.workflow.revision}/export`)
+      .expect("Content-Type", /json/).expect(200);
+
+    // Verify the bundle is self-describing and carries exact prompt bytes.
+    expect(exported.headers["content-disposition"]).toBe("attachment; filename=\"portable-delivery-v1.workflow.json\"");
+    expect(exported.body).toMatchObject({
+      schema: "agentic-project-tracker/workflow-bundle/v1",
+      workflow: { id: "portable-delivery", revision: portable.body.workflow.revision, version: 1, label: "Team baseline" },
+      requirements: { agent_profiles: expect.arrayContaining(["claude", "codex"]), workflows: [] },
+    });
+    expect(exported.body.prompts.find((prompt: { name: string }) => prompt.name === "implementation")).toMatchObject({
+      revision: updatedPrompt.body.prompt.revision, content: portablePrompt,
+    });
+
+    // Arrange a coworker's independent tracker with an existing workflow of
+    // the same ID so the imported revision must remain an explicit trial.
+    const targetRoot = await mkdtemp(join(tmpdir(), "agentic-bundle-target-"));
+    const targetStore = new TicketStore(targetRoot, { watch: false });
+    await targetStore.start();
+    try {
+      const targetConfigStore = new TrackerConfigStore(targetRoot);
+      const targetConfig = await targetConfigStore.start();
+      await targetConfigStore.update({
+        providers: targetConfig.providers,
+        agent_profiles: {
+          default: "claude",
+          profiles: [
+            { id: "claude", label: "Claude work", provider: "claude", model: "claude-opus", reasoning: "high" },
+            { id: "codex", label: "Codex review", provider: "codex", model: "gpt-5.6-sol", reasoning: "high" },
+          ],
+        },
+        repositories: targetConfig.repositories, jira: targetConfig.jira, github: targetConfig.github,
+      }, targetConfig.revision);
+      const targetApp = createApp(targetStore, join(targetRoot, "missing-client"));
+      const localDefinition = structuredClone(portableDefinition);
+      localDefinition.description = "Coworker-local default.";
+      const local = await request(targetApp).post("/api/workflows").send({ content: stringify(localDefinition), label: "Coworker default" }).expect(201);
+
+      // Execute the import and verify prompt activation plus release safety.
+      const imported = await request(targetApp).post("/api/workflow-bundles/import").send(exported.body).expect(201);
+      expect(imported.body).toMatchObject({
+        workflow: { definition: { id: "portable-delivery" }, revision: portable.body.workflow.revision },
+        release: { status: "trial", is_default: false },
+        installed_prompt_revisions: expect.arrayContaining([`implementation@${updatedPrompt.body.prompt.revision}`]),
+      });
+      const targetPrompts = (await request(targetApp).get("/api/prompts").expect(200)).body.prompts;
+      expect(targetPrompts.find((prompt: { name: string }) => prompt.name === "implementation")).toMatchObject({ content: portablePrompt, revision: updatedPrompt.body.prompt.revision });
+      const targetReleases = await request(targetApp).get("/api/workflow-releases").expect(200);
+      expect(targetReleases.body.releases.find((release: { revision: string }) => release.revision === local.body.workflow.revision)).toMatchObject({ is_default: true });
+      expect(targetReleases.body.releases.find((release: { revision: string }) => release.revision === portable.body.workflow.revision)).toMatchObject({ status: "trial", is_default: false });
+
+      const tampered = structuredClone(exported.body);
+      tampered.prompts[0].content += "tampered";
+      await request(targetApp).post("/api/workflow-bundles/import").send(tampered).expect(422);
+
+      // A manually corrupted current prompt must not produce a bundle that
+      // looks portable but will inevitably fail on the destination tracker.
+      await writeFile(join(root, "prompts", "implementation.md"), "{{unknown_bundle_tag}}\n");
+      const invalidExport = await request(sourceApp)
+        .get(`/api/workflows/portable-delivery/revisions/${portable.body.workflow.revision}/export`)
+        .expect(422);
+      expect(invalidExport.body.code).toBe("WORKFLOW_BUNDLE_PROMPT_INVALID");
+    } finally {
+      await targetStore.close();
+      await rm(targetRoot, { recursive: true, force: true });
+    }
+  }, 20_000);
+
   it.each([
     { action: "cancel", status: "cancelled", id: "APT-CANCELLED" },
     { action: "fail", status: "failed", id: "APT-FAILED" },

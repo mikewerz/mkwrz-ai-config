@@ -20,6 +20,7 @@ import { log } from "./logger.js";
 import { OperationalMonitor } from "./operations.js";
 import { IntakeStore } from "./intake-store.js";
 import { buildQuotaReport } from "./quota-estimator.js";
+import { exportWorkflowBundle, importWorkflowBundle } from "./workflow-bundle.js";
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
@@ -518,6 +519,19 @@ export function createApp(
   });
   app.get("/api/workflows", async (_request, response) => response.json({ workflows: await workflowLibrary.list() }));
   app.get("/api/workflow-releases", async (_request, response) => response.json(await workflowLibrary.catalog()));
+  app.get("/api/workflows/:id/revisions/:revision/export", async (request, response) => {
+    const bundle = await exportWorkflowBundle(workflowLibrary, promptLibrary, String(request.params.id), String(request.params.revision));
+    response.setHeader("Content-Disposition", `attachment; filename="${bundle.workflow.id}-v${bundle.workflow.version}.workflow.json"`);
+    response.json(bundle);
+  });
+  app.post("/api/workflow-bundles/import", async (request, response) => {
+    const result = await importWorkflowBundle(request.body, workflowLibrary, promptLibrary, await configStore.read());
+    store.emit("changed", {
+      type: "workflow.bundle.imported", id: result.workflow.definition.id, revision: result.workflow.revision,
+      prompts: result.installed_prompt_revisions.length,
+    });
+    response.status(201).json(result);
+  });
   app.get("/api/workflows/:id/revisions/:revision", async (request, response) => response.json({ workflow: await workflowLibrary.get(String(request.params.id), String(request.params.revision)) }));
   app.get("/api/workflows/:id", async (request, response) => response.json({ workflow: await workflowLibrary.get(String(request.params.id)) }));
   app.post("/api/workflows", async (request, response) => {

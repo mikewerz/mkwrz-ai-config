@@ -1080,6 +1080,12 @@ export class WorkflowLibrary {
     };
   }
 
+  inspect(content: string, promptIds?: Set<string>, workflowIds?: Set<string>, agentProfileIds?: Set<string>): WorkflowDocument {
+    const document = this.document(content, promptIds, workflowIds, agentProfileIds);
+    if (!document.valid) return document;
+    return this.document(normalizedContent(document.definition), promptIds, workflowIds, agentProfileIds);
+  }
+
   private async withVersion(document: WorkflowDocument): Promise<WorkflowDocument> {
     await this.archive(document.definition.id, document.revision, document.content);
     return { ...document, version: await artifactVersion(this.directory, document.definition.id, document.revision) };
@@ -1151,6 +1157,21 @@ export class WorkflowLibrary {
       catalog.revision += 1; catalog.updated_at = new Date().toISOString(); await this.writeCatalog(catalog);
       const document = await this.getWithoutStart(id, revision);
       return { catalog, release: { workflow_id: id, revision, ...release, is_default: true, definition: document.definition } };
+    });
+  }
+
+  async activateTrial(id: string, revision: string): Promise<void> {
+    await this.start();
+    await this.serial(async () => {
+      const catalog = await this.readCatalog();
+      const workflow = catalog.workflows[id];
+      const release = workflow?.releases[revision];
+      if (!workflow || !release) throw new HttpError(404, `Workflow ${id}@${revision} is not published`);
+      if (workflow.default_revision === revision || release.status === "trial") return;
+      release.status = "trial";
+      catalog.revision += 1;
+      catalog.updated_at = new Date().toISOString();
+      await this.writeCatalog(catalog);
     });
   }
 

@@ -244,6 +244,16 @@ describe("operator UI", () => {
       }
       if (path === "/api/workflows" && !init?.method) return Response.json({ workflows });
       if (path === "/api/workflow-releases" && !init?.method) return Response.json(workflowReleases);
+      if (path === "/api/workflow-bundles/import" && init?.method === "POST") {
+        const bundle = JSON.parse(String(init.body));
+        const definition = (await import("yaml")).parse(bundle.workflow.content);
+        const workflow = { definition, content: bundle.workflow.content, revision: bundle.workflow.revision, version: bundle.workflow.version, valid: true, errors: [], referenced_prompts: bundle.prompts.map((prompt: any) => prompt.name) };
+        workflows = [...workflows.filter((item) => item.definition.id !== definition.id), workflow];
+        prompts = [...prompts.filter((item) => !bundle.prompts.some((prompt: any) => prompt.name === item.name)), ...bundle.prompts.map((prompt: any) => ({ ...prompt, title: prompt.name, purpose: "Imported", trigger: "Workflow", stages: [], allowed_tags: [], required_tags: [], tags: [], valid: true, errors: [] }))];
+        const release = { workflow_id: definition.id, revision: workflow.revision, version: workflow.version, label: bundle.workflow.label, status: "active", published_at: new Date().toISOString(), parent_revision: null, is_default: true, definition };
+        workflowReleases.releases.push(release);
+        return Response.json({ workflow, prompts, release, installed_prompt_revisions: bundle.prompts.map((prompt: any) => `${prompt.name}@${prompt.revision}`), unchanged_prompt_revisions: [], warnings: [] }, { status: 201 });
+      }
       if (path === "/api/workflows" && init?.method === "POST") {
         const payload = JSON.parse(String(init.body));
         const definition = (await import("yaml")).parse(payload.content);
@@ -877,6 +887,31 @@ describe("operator UI", () => {
     expect(await screen.findByText("r3")).toBeInTheDocument();
   });
 
+  it("keeps focus while editing model configuration identifiers", async () => {
+    // Arrange
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: "Configuration" }));
+    fireEvent.click(screen.getByRole("tab", { name: /Agents & models/ }));
+    const alias = screen.getByLabelText("Agent profile alias 1");
+
+    // Execute and verify the controlled row is not remounted per keystroke.
+    alias.focus();
+    fireEvent.change(alias, { target: { value: "c" } });
+    expect(alias).toHaveFocus();
+    fireEvent.change(alias, { target: { value: "cod" } });
+    expect(alias).toHaveFocus();
+    expect(alias).toHaveValue("cod");
+
+    fireEvent.click(screen.getByRole("tab", { name: /Cost & metrics/ }));
+    const pricingId = screen.getByLabelText("Pricing ID 1");
+    pricingId.focus();
+    fireEvent.change(pricingId, { target: { value: "g" } });
+    expect(pricingId).toHaveFocus();
+    fireEvent.change(pricingId, { target: { value: "gpt-model" } });
+    expect(pricingId).toHaveFocus();
+    expect(pricingId).toHaveValue("gpt-model");
+  });
+
   it("tracks unsaved configuration changes across tabs and can revert them", async () => {
     render(<App />);
     fireEvent.click(await screen.findByRole("button", { name: "Configuration" }));
@@ -1121,6 +1156,31 @@ describe("operator UI", () => {
     const retiredRelease = within(releasesSection).getByText("Revision v3 · Retired experiment").closest("article")!;
     expect(within(retiredRelease).getByRole("button", { name: "Restore as default" })).toBeInTheDocument();
     expect(within(releasesSection).getByRole("button", { name: "Hide retired revisions" })).toBeInTheDocument();
+  });
+
+  it("exports a numbered workflow revision and imports its prompt bundle", async () => {
+    // Arrange
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: "Workflows" }));
+    const exportLink = await screen.findByRole("link", { name: "Export bundle" });
+    expect(exportLink).toHaveAttribute("href", "/api/workflows/standard-delivery/revisions/workflow-r1/export");
+    expect(exportLink).toHaveAttribute("download", "standard-delivery-v1.workflow.json");
+    const importedDefinition = { ...structuredClone(workflowDefinition), id: "shared-delivery", name: "Shared delivery" };
+    const bundle = {
+      schema: "agentic-project-tracker/workflow-bundle/v1", exported_at: new Date().toISOString(),
+      workflow: { id: "shared-delivery", revision: "shared-r1", version: 1, label: "Shared v1", content: stringify(importedDefinition) },
+      prompts: [{ name: "shared-prompt", revision: "prompt-r1", version: 1, content: "Shared instructions\n" }],
+      requirements: { agent_profiles: ["default"], workflows: [] },
+    };
+
+    // Execute
+    fireEvent.change(screen.getByLabelText("Import workflow bundle file"), { target: { files: [new File([JSON.stringify(bundle)], "shared.workflow.json", { type: "application/json" })] } });
+
+    // Verify
+    await waitFor(() => expect(fetch).toHaveBeenCalledWith("/api/workflow-bundles/import", expect.objectContaining({ method: "POST" })));
+    expect(await screen.findByRole("status")).toHaveTextContent("Imported Shared delivery v1");
+    expect(screen.getByRole("button", { name: /Shared delivery/ })).toBeInTheDocument();
   });
 
   it("starts a genuinely new minimal workflow and adds typed nodes", async () => {

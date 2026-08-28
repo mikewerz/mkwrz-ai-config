@@ -120,6 +120,47 @@ test("tracker exposes readiness, its Markdown index, and background operation st
   }
 });
 
+test("a workflow bundle round-trips through two tracker processes with its exact prompt revisions", { timeout: 30_000 }, async () => {
+  let source;
+  let target;
+  try {
+    source = await startTracker();
+    target = await startTracker();
+    await configureTracker(source, null);
+    await configureTracker(target, null);
+    const sourcePrompts = (await jsonRequest(source.baseUrl, "/api/prompts")).body.prompts;
+    const implementation = sourcePrompts.find((prompt) => prompt.name === "implementation");
+    const promptContent = "Use the portable team implementation policy.\n\nAllowed outcomes:\n\n{{allowed_outcomes}}\n";
+    const updatedPrompt = (await jsonRequest(source.baseUrl, "/api/prompts/implementation", {
+      method: "PUT", body: { expected_revision: implementation.revision, content: promptContent },
+    })).body.prompt;
+    const published = await publishWorkflow(source, agentWorkflow("portable-system-workflow"));
+
+    const exportedResponse = await fetch(new URL(`/api/workflows/${published.definition.id}/revisions/${published.revision}/export`, source.baseUrl));
+    assert.equal(exportedResponse.status, 200);
+    assert.match(exportedResponse.headers.get("content-disposition"), /portable-system-workflow-v1\.workflow\.json/);
+    const bundle = await exportedResponse.json();
+    assert.equal(bundle.schema, "agentic-project-tracker/workflow-bundle/v1");
+    assert.deepEqual(bundle.requirements.agent_profiles, ["fake-claude"]);
+    assert.equal(bundle.prompts.find((prompt) => prompt.name === "implementation").revision, updatedPrompt.revision);
+
+    const imported = (await jsonRequest(target.baseUrl, "/api/workflow-bundles/import", {
+      method: "POST", expected: 201, body: bundle,
+    })).body;
+    assert.equal(imported.workflow.revision, published.revision);
+    assert.equal(imported.release.is_default, true);
+    assert.equal(imported.release.status, "active");
+    assert.ok(imported.installed_prompt_revisions.includes(`implementation@${updatedPrompt.revision}`));
+    const targetPrompt = (await jsonRequest(target.baseUrl, "/api/prompts")).body.prompts.find((prompt) => prompt.name === "implementation");
+    assert.equal(targetPrompt.revision, updatedPrompt.revision);
+    assert.equal(targetPrompt.content, promptContent);
+  } finally {
+    await stopProcess(source?.process);
+    await stopProcess(target?.process);
+    await cleanup([source?.ticketRoot, target?.ticketRoot]);
+  }
+});
+
 test("a supervisor Script source previews safely, admits one ordinary ticket, and deduplicates the next observation without Herdr", { timeout: 30_000 }, async () => {
   let tracker;
   let supervisor;

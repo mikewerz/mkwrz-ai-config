@@ -407,6 +407,23 @@ export interface WorkflowReleaseCatalog {
   releases: WorkflowRelease[];
 }
 
+export interface WorkflowBundle {
+  schema: "agentic-project-tracker/workflow-bundle/v1";
+  exported_at: string;
+  workflow: { id: string; revision: string; version: number; label: string; content: string };
+  prompts: Array<{ name: string; revision: string; version: number; content: string }>;
+  requirements: { agent_profiles: string[]; workflows: string[] };
+}
+
+export interface WorkflowBundleImportResult {
+  workflow: WorkflowDocument;
+  prompts: PromptDocument[];
+  release: WorkflowRelease;
+  installed_prompt_revisions: string[];
+  unchanged_prompt_revisions: string[];
+  warnings: string[];
+}
+
 export interface TicketDetail {
   id: string;
   path: string;
@@ -542,6 +559,8 @@ export const api = {
   workflows: () => request<{ workflows: WorkflowDocument[] }>("/api/workflows"),
   workflowReleases: () => request<WorkflowReleaseCatalog>("/api/workflow-releases"),
   workflowRevision: (id: string, revision: string) => request<{ workflow: WorkflowDocument }>(`/api/workflows/${encodeURIComponent(id)}/revisions/${encodeURIComponent(revision)}`),
+  workflowBundleUrl: (id: string, revision: string) => `/api/workflows/${encodeURIComponent(id)}/revisions/${encodeURIComponent(revision)}/export`,
+  importWorkflowBundle: (bundle: WorkflowBundle) => request<WorkflowBundleImportResult>("/api/workflow-bundles/import", { method: "POST", body: JSON.stringify(bundle) }),
   createWorkflow: (content: string, label?: string) => request<{ workflow: WorkflowDocument }>("/api/workflows", { method: "POST", body: JSON.stringify({ content, label }) }),
   updateWorkflow: (workflow: WorkflowDocument, content: string, makeDefault = false, label?: string) => request<{ workflow: WorkflowDocument }>(`/api/workflows/${encodeURIComponent(workflow.definition.id)}`, {
     method: "PUT", body: JSON.stringify({ expected_revision: workflow.revision, content, make_default: makeDefault, label }),

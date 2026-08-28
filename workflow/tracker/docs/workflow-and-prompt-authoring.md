@@ -303,6 +303,27 @@ Use an external system as the source of truth for long-running canary sampling, 
 
 A published workflow is an immutable, revisioned graph. A workflow family has one active default revision and may retain multiple named trial revisions. Use **Publish as trial** while evaluating a change, then **Make default** only after its metrics justify promotion. Promotion retires the previous active default; retired history remains available behind **Show history** but is not offered for new tickets. New tickets use the default unless an operator explicitly chooses a trial; the ticket records that selection and pins the workflow revision, prompt revisions, and resolved agent profiles. Later library edits and promotions affect only future tickets, not work already in flight. The displayed `v1`, `v2`, and later numbers identify unique content rather than activation chronology, so restoring unchanged shipped content can make an earlier version the default without creating another duplicate revision.
 
+### Share a workflow with another tracker
+
+Use **Export bundle** beside a workflow revision when the graph and its reusable prompts need to move together. The versioned JSON bundle contains:
+
+- The exact normalized workflow YAML, content digest, numbered version, and release label.
+- The exact content, digest, and numbered version of every prompt name referenced by that graph at export time.
+- A dependency manifest naming agent-profile aliases and child workflows that the bundle expects but deliberately does not copy.
+
+Workflow definitions reference prompts by name rather than pinning prompt revisions at publication. Therefore an export captures the current revision of each referenced prompt at the moment of export. Tickets still pin their own prompt revisions when they are created, and importing a bundle never rewrites an existing ticket.
+
+Use **Import bundle** on the destination tracker. The tracker verifies every content digest, validates all prompts and the complete workflow before writing anything, and rejects missing agent-profile or child-workflow dependencies with a concrete list. If the workflow ID is new, the imported revision becomes that family's default. If the ID already exists, the imported revision is a trial and cannot silently replace the coworker's default. Bundled prompt revisions become current so the imported graph has the intended instructions; prior local prompt revisions remain in immutable history and can be restored. The bundle does not automatically include configured credentials, repository configuration, provider pricing, agent-profile definitions, tickets, or artifacts. Because prompt text is included verbatim, review the JSON before sharing it if an operator may have embedded environment-specific or sensitive instructions in a prompt.
+
+The HTTP equivalents are:
+
+```text
+GET  /api/workflows/{id}/revisions/{sha256}/export
+POST /api/workflow-bundles/import
+```
+
+Treat the bundle as a reviewed configuration artifact. It is JSON for portability, but its embedded workflow remains the same validated YAML shown by the advanced editor.
+
 At runtime:
 
 1. The ticket's current node is authoritative.
