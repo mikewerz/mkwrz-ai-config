@@ -4,7 +4,7 @@ This consolidated workflow was synchronized on 2026-09-01 from these standalone 
 
 | Component | Source revision |
 | --- | --- |
-| Tracker | `be477a091aba` |
+| Tracker | `df941e49f6e1` |
 | Supervisor | `49331310032d` |
 | Herdr configuration | `e4d5df55efab` |
 | Cross-process system tests | `63daf9198357` |

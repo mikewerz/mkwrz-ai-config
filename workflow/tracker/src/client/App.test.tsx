@@ -1109,18 +1109,28 @@ describe("operator UI", () => {
     expect(graph.querySelector('.factory-connector.loop[data-route="previous-row"]')).toBeInTheDocument();
     expect(graph.querySelectorAll('.factory-connector:not(.loop)[data-port="primary-left"]').length).toBeGreaterThan(0);
     expect(graph.querySelectorAll('.factory-connector.loop[data-port="alternate-right"]').length).toBeGreaterThan(0);
-    const assertConnectorPort = (selector: string, ratio: number) => {
+    const assertConnectorPorts = (selector: string, sourceBand: [number, number], targetBand: [number, number]) => {
       const connector = graph.querySelector<SVGGElement>(selector)!;
       const source = graph.querySelector<HTMLElement>(`[data-node="${connector.dataset.source}"]`)!;
       const target = graph.querySelector<HTMLElement>(`[data-node="${connector.dataset.target}"]`)!;
-      const expectedSourceX = Number.parseFloat(source.style.left) + Number.parseFloat(source.style.width) * ratio;
-      const expectedTargetX = Number.parseFloat(target.style.left) + Number.parseFloat(target.style.width) * ratio;
+      const sourceRatio = Number.parseFloat(connector.dataset.sourcePortRatio!);
+      const targetRatio = Number.parseFloat(connector.dataset.targetPortRatio!);
+      expect(sourceRatio).toBeGreaterThanOrEqual(sourceBand[0]);
+      expect(sourceRatio).toBeLessThanOrEqual(sourceBand[1]);
+      expect(targetRatio).toBeGreaterThanOrEqual(targetBand[0]);
+      expect(targetRatio).toBeLessThanOrEqual(targetBand[1]);
+      expect(sourceRatio).not.toBe(targetRatio);
+      const expectedSourceX = Number.parseFloat(source.style.left) + Number.parseFloat(source.style.width) * sourceRatio;
+      const expectedTargetX = Number.parseFloat(target.style.left) + Number.parseFloat(target.style.width) * targetRatio;
       const path = connector.querySelector("path")!.getAttribute("d")!;
       expect(path).toMatch(new RegExp(`^M ${expectedSourceX} `));
       expect(path).toContain(`H ${expectedTargetX} `);
     };
-    assertConnectorPort('.factory-connector:not(.loop)[data-route="next-row"]', 0.25);
-    assertConnectorPort('.factory-connector.loop[data-route="previous-row"]', 0.75);
+    assertConnectorPorts('.factory-connector:not(.loop)[data-route="next-row"]', [0.30, 0.38], [0.14, 0.22]);
+    assertConnectorPorts('.factory-connector.loop[data-route="previous-row"]', [0.62, 0.70], [0.78, 0.86]);
+    const primaryEntry = graph.querySelector<SVGGElement>('.factory-connector:not(.loop):not([data-route="direct"])[data-target="implementation"]')!;
+    const primaryExit = graph.querySelector<SVGGElement>('.factory-connector:not(.loop):not([data-route="direct"])[data-source="implementation"]')!;
+    expect(primaryEntry.dataset.targetPortRatio).not.toBe(primaryExit.dataset.sourcePortRatio);
     const canvas = graph.querySelector<HTMLElement>(".factory-graph")!;
     expect(canvas.style.transform).toBe("scale(1)");
     const wheel = new WheelEvent("wheel", { bubbles: true, cancelable: true, deltaY: -100, clientX: 180, clientY: 120 });
@@ -1177,10 +1187,7 @@ describe("operator UI", () => {
     expect(takenRepair()?.querySelector(".route-glow")).toBeInTheDocument();
     expect(takenRepair()?.querySelector(".route-line")).toBeInTheDocument();
     expect(graph.querySelector('[data-node="implementation"]')).toHaveClass("current");
-    expect(graph.querySelector('.factory-connector[data-source="specification-approval"][data-target="specification"]')).toBeInTheDocument();
-
-    fireEvent.click(within(workflow).getByRole("button", { name: "Taken + next" }));
-
+    expect(within(workflow).getByRole("button", { name: "Taken + next" })).toHaveAttribute("aria-pressed", "true");
     expect(takenRepair()).toHaveClass("taken");
     expect(graph.querySelector('.factory-connector[data-source="implementation"][data-target="review"]')).toHaveClass("expected");
     expect(graph.querySelector('.factory-connector[data-source="specification"][data-target="specification-approval"]')).not.toBeInTheDocument();
@@ -1188,6 +1195,21 @@ describe("operator UI", () => {
 
     fireEvent.click(within(workflow).getByRole("button", { name: "All routes" }));
     expect(graph.querySelector('.factory-connector[data-source="specification-approval"][data-target="specification"]')).toBeInTheDocument();
+  });
+
+  it("allocates distinct node ports when several routes share one direction", async () => {
+    const sharedPortWorkflow = structuredClone(workflowDefinition);
+    const implementation: any = sharedPortWorkflow.nodes.find((node) => node.id === "implementation")!;
+    implementation.outcomes.push({ id: "skip_review", label: "Skip review", description: "Finish directly.", target: "done" });
+    workflows = [{ definition: sharedPortWorkflow, content: stringify(sharedPortWorkflow), revision: "shared-ports-r1", version: 1, valid: true, errors: [], referenced_prompts: ["implementation"] }];
+
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: "Workflows" }));
+    const graph = await screen.findByLabelText("Workflow graph");
+    const sharedPrimarySources = [...graph.querySelectorAll<SVGGElement>('.factory-connector:not(.loop):not([data-route="direct"])[data-source="implementation"]')];
+
+    expect(sharedPrimarySources).toHaveLength(2);
+    expect(new Set(sharedPrimarySources.map((connector) => connector.dataset.sourcePortRatio)).size).toBe(2);
   });
 
   it("routes dense workflow feedback through local and reusable side lanes without extending the canvas per loop", async () => {

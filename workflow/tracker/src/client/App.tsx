@@ -322,7 +322,7 @@ function NextActionSummary({ ticket, workflow }: { ticket: TicketFrontmatter; wo
 
 function WorkflowMap({ ticket, workflow }: { ticket: TicketFrontmatter; workflow: WorkflowDocument["definition"] | undefined }) {
   const [storedZoom, setStoredZoom] = useStoredState("agentic-project-tracker.graph.zoom", 1);
-  const [storedRouteView, setStoredRouteView] = useStoredState<"all" | "focused">("agentic-project-tracker.graph.routes", "all");
+  const [storedRouteView, setStoredRouteView] = useStoredState<"all" | "focused">("agentic-project-tracker.graph.routes", "focused");
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
   const zoom = Number.isFinite(storedZoom) ? clampGraphZoom(storedZoom) : 1;
   const routeView = storedRouteView === "focused" ? "focused" : "all";
@@ -1551,12 +1551,18 @@ const GRAPH_TICKET_NODE_HEIGHT = 224;
 const GRAPH_COLUMN_GAP = 126;
 const GRAPH_BASE_ROW_GAP = 104;
 const GRAPH_LANE_GAP = 18;
-const GRAPH_PRIMARY_PORT_RATIO = 0.25;
-const GRAPH_ALTERNATE_PORT_RATIO = 0.75;
+const GRAPH_PORT_BANDS = {
+  primary: { incoming: [0.14, 0.22], outgoing: [0.30, 0.38] },
+  alternate: { incoming: [0.78, 0.86], outgoing: [0.62, 0.70] },
+} as const;
 const GRAPH_ZOOM_MIN = 0.5;
 const GRAPH_ZOOM_MAX = 2;
 const GRAPH_ZOOM_STEP = 0.1;
 const clampGraphZoom = (zoom: number) => Math.min(GRAPH_ZOOM_MAX, Math.max(GRAPH_ZOOM_MIN, Math.round(zoom * 100) / 100));
+const graphPortRatio = (band: readonly [number, number], index: number, count: number) => {
+  const ratio = count === 1 ? (band[0] + band[1]) / 2 : band[0] + (band[1] - band[0]) * index / (count - 1);
+  return Math.round(ratio * 1_000) / 1_000;
+};
 
 type WorkflowRoute = WorkflowNode["outcomes"][number];
 
@@ -1774,6 +1780,34 @@ function WorkflowGraph({ workflow, currentNode, selectedNode, onSelect, ticket, 
       y: topPadding + position.row * (nodeHeight + rowGap),
     }];
   }));
+  const sourcePortRatios = new Map<string, number>();
+  const targetPortRatios = new Map<string, number>();
+  const assignPortRatios = (role: "source" | "target") => {
+    const groups = new Map<string, typeof positionedEdges>();
+    for (const edge of positionedEdges) {
+      if (edge.route === "direct" || edge.route === "missing") continue;
+      const family = edge.backward ? "alternate" : "primary";
+      const nodeId = role === "source" ? edge.source : edge.target;
+      const key = `${family}:${nodeId}`;
+      const group = groups.get(key) ?? [];
+      group.push(edge);
+      groups.set(key, group);
+    }
+    for (const [key, group] of groups) {
+      const [family] = key.split(":") as ["primary" | "alternate"];
+      const ordered = [...group].sort((left, right) => {
+        const leftOther = grid.get(role === "source" ? left.target : left.source)?.index ?? 0;
+        const rightOther = grid.get(role === "source" ? right.target : right.source)?.index ?? 0;
+        return leftOther - rightOther || left.id.localeCompare(right.id);
+      });
+      const direction = role === "source" ? "outgoing" : "incoming";
+      ordered.forEach((edge, index) => (role === "source" ? sourcePortRatios : targetPortRatios)
+        .set(edge.id, graphPortRatio(GRAPH_PORT_BANDS[family][direction], index, ordered.length)));
+    }
+  };
+  assignPortRatios("source");
+  assignPortRatios("target");
+  const drawableEdges = [...positionedEdges].sort((left, right) => Number(left.taken) - Number(right.taken));
   const width = Math.max(760, leftPadding + gridWidth + rightPadding);
   const height = topPadding + rows * nodeHeight + Math.max(0, rows - 1) * rowGap + 52;
   return <div ref={viewportRef} className={`factory-graph-scroll ${panning ? "is-panning" : ""}`} aria-label="Workflow graph" title="Middle-click and drag left or right to pan." onPointerDown={onPointerDown} onPointerMove={onPointerMove} onPointerUp={stopPanning} onPointerCancel={stopPanning} onAuxClick={(event) => { if (event.button === 1) event.preventDefault(); }}>
@@ -1786,12 +1820,14 @@ function WorkflowGraph({ workflow, currentNode, selectedNode, onSelect, ticket, 
           <marker className="taken-marker" id={takenMarkerId} markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" /></marker>
           <marker className="loop-marker taken-marker" id={takenLoopMarkerId} markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" /></marker>
         </defs>
-        {positionedEdges.map((edge) => {
+        {drawableEdges.map((edge) => {
           const source = positions.get(edge.source); const target = positions.get(edge.target);
           if (!source || !target || edge.route === "missing") return null;
-          const portRatio = edge.backward ? GRAPH_ALTERNATE_PORT_RATIO : GRAPH_PRIMARY_PORT_RATIO;
-          const sourcePortX = source.x + GRAPH_NODE_WIDTH * portRatio;
-          const targetPortX = target.x + GRAPH_NODE_WIDTH * portRatio;
+          const family = edge.backward ? "alternate" : "primary";
+          const sourcePortRatio = sourcePortRatios.get(edge.id) ?? graphPortRatio(GRAPH_PORT_BANDS[family].outgoing, 0, 1);
+          const targetPortRatio = targetPortRatios.get(edge.id) ?? graphPortRatio(GRAPH_PORT_BANDS[family].incoming, 0, 1);
+          const sourcePortX = source.x + GRAPH_NODE_WIDTH * sourcePortRatio;
+          const targetPortX = target.x + GRAPH_NODE_WIDTH * targetPortRatio;
           let path: string; let labelX: number; let labelY: number; let textAnchor: "start" | "middle" | "end" = "middle";
           if (edge.route === "direct") {
             const y = source.y + nodeHeight / 2;
@@ -1829,7 +1865,7 @@ function WorkflowGraph({ workflow, currentNode, selectedNode, onSelect, ticket, 
             labelY = (sourceTrackY + targetTrackY) / 2 + (edge.lane % 2 === 0 ? -7 : 11);
             textAnchor = side === "left" ? "end" : "start";
           }
-          return <g key={edge.id} data-route={edge.route} data-source={edge.source} data-target={edge.target} data-port={edge.backward ? "alternate-right" : "primary-left"} className={`factory-connector ${edge.backward ? "loop" : ""} ${edge.expected ? "expected" : ""} ${edge.taken ? "taken" : ""}`}>
+          return <g key={edge.id} data-route={edge.route} data-source={edge.source} data-target={edge.target} data-port={edge.backward ? "alternate-right" : "primary-left"} data-source-port-ratio={sourcePortRatio} data-target-port-ratio={targetPortRatio} className={`factory-connector ${edge.backward ? "loop" : ""} ${edge.expected ? "expected" : ""} ${edge.taken ? "taken" : ""}`}>
             {edge.taken && <path className="route-glow" d={path} />}
             <path className="route-line" d={path} markerEnd={`url(#${edge.taken ? (edge.backward ? takenLoopMarkerId : takenMarkerId) : (edge.backward ? loopMarkerId : markerId)})`} />
             <text x={labelX} y={labelY} textAnchor={textAnchor}><title>{humanize(edge.fullOutcome)}</title>{humanize(edge.outcome)}</text>
