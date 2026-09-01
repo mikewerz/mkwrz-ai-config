@@ -1,4 +1,5 @@
 import React, { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
+import { BrowserRouter, useLocation, useNavigate } from "react-router-dom";
 import { parse, stringify } from "yaml";
 import { api, type Execution, type HarnessTelemetryRecord, type IntakeCampaign, type IntakeLimits, type IntakeOverview, type IntakeSource, type MetricsReport, type NumberSummary, type OperationalStatus, type PromptDocument, type QuotaReport, type RepositoryClaimBlocker, type RepositoryConfig, type RuntimeAgent, type SupervisorHealth, type TicketDetail, type TicketFrontmatter, type TicketSummary, type TokenUsage, type TrackerConfig, type WorkflowBundle, type WorkflowComparisonReport, type WorkflowDocument, type WorkflowNode, type WorkflowReleaseCatalog } from "./api.js";
 
@@ -8,6 +9,8 @@ const THEMES = ["light", "dark", "retro"] as const;
 type Theme = (typeof THEMES)[number];
 const APP_VIEWS = ["attention", "tickets", "intake", "metrics", "supervisors", "configuration", "prompts", "workflows"] as const;
 type AppView = (typeof APP_VIEWS)[number];
+type ConfigurationTab = "general" | "agents" | "cost" | "quality" | "integrations" | "maintenance";
+type MetricsTab = "overview" | "runtime" | "reliability" | "cost" | "compare";
 type WorkProvider = "claude" | "codex";
 const ALL_WORK_PROVIDERS: WorkProvider[] = ["claude", "codex"];
 const MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024;
@@ -131,6 +134,61 @@ function useStoredState<T>(key: string, fallback: T): [T, React.Dispatch<React.S
 function storedAppView(): AppView {
   const value = storedValue<string>("agentic-project-tracker.view", "tickets");
   return APP_VIEWS.includes(value as AppView) ? value as AppView : "tickets";
+}
+
+interface AppRoute {
+  view: AppView;
+  ticketId?: string;
+  newTicket?: boolean;
+  configurationTab?: ConfigurationTab;
+  metricsTab?: MetricsTab;
+  workflowId?: string;
+  promptName?: string;
+  legacyRoot?: boolean;
+  redirectTo?: string;
+}
+
+const CONFIGURATION_TABS: ConfigurationTab[] = ["general", "agents", "cost", "quality", "integrations", "maintenance"];
+const METRICS_TABS: MetricsTab[] = ["overview", "runtime", "reliability", "cost", "compare"];
+const decodePathSegment = (value: string | undefined) => {
+  if (!value) return undefined;
+  try { return decodeURIComponent(value); } catch { return undefined; }
+};
+const ticketPath = (id: string) => `/tickets/${encodeURIComponent(id)}`;
+const viewPath = (view: AppView) => ({
+  attention: "/inbox", tickets: "/queue", intake: "/intake", metrics: "/metrics/overview",
+  supervisors: "/operations", configuration: "/configuration/general", prompts: "/prompts", workflows: "/workflows",
+})[view];
+
+function parseAppRoute(pathname: string): AppRoute {
+  const segments = pathname.replace(/\/+$/, "").split("/").filter(Boolean);
+  if (!segments.length) return { view: "tickets", legacyRoot: true };
+  if (segments[0] === "inbox" && segments.length === 1) return { view: "attention" };
+  if ((segments[0] === "queue" || segments[0] === "tickets") && segments.length === 1) return { view: "tickets" };
+  if (segments[0] === "tickets" && segments.length === 2) {
+    if (segments[1] === "new") return { view: "tickets", newTicket: true };
+    const ticketId = decodePathSegment(segments[1]);
+    return ticketId ? { view: "tickets", ticketId } : { view: "tickets", redirectTo: "/queue" };
+  }
+  if (segments[0] === "intake" && segments.length === 1) return { view: "intake" };
+  if (segments[0] === "operations" && segments.length === 1) return { view: "supervisors" };
+  if (segments[0] === "configuration" && segments.length <= 2) {
+    const tab = segments[1] as ConfigurationTab | undefined;
+    return { view: "configuration", configurationTab: tab && CONFIGURATION_TABS.includes(tab) ? tab : "general", ...(!tab || !CONFIGURATION_TABS.includes(tab) ? { redirectTo: "/configuration/general" } : {}) };
+  }
+  if (segments[0] === "metrics" && segments.length <= 2) {
+    const tab = segments[1] as MetricsTab | undefined;
+    return { view: "metrics", metricsTab: tab && METRICS_TABS.includes(tab) ? tab : "overview", ...(!tab || !METRICS_TABS.includes(tab) ? { redirectTo: "/metrics/overview" } : {}) };
+  }
+  if (segments[0] === "workflows" && segments.length <= 2) {
+    const workflowId = decodePathSegment(segments[1]);
+    return { view: "workflows", ...(workflowId ? { workflowId } : {}) };
+  }
+  if (segments[0] === "prompts" && segments.length <= 2) {
+    const promptName = decodePathSegment(segments[1]);
+    return { view: "prompts", ...(promptName ? { promptName } : {}) };
+  }
+  return { view: "tickets", redirectTo: "/queue" };
 }
 
 function isInitialDraft(ticket: TicketFrontmatter): boolean {
@@ -703,10 +761,7 @@ function SupervisorHealthPage({ supervisors, operations, githubObservationEnable
   </main>;
 }
 
-type ConfigurationTab = "general" | "agents" | "cost" | "quality" | "integrations" | "maintenance";
-
-function ConfigurationPage({ config, quota, busy, onSave, onRestoreDefaults }: { config: TrackerConfig | null; quota: QuotaReport | null; busy: boolean; onSave: (update: Pick<TrackerConfig, "providers" | "agent_profiles" | "pricing" | "metrics" | "quality" | "artifacts" | "repositories" | "jira" | "github">) => void; onRestoreDefaults: () => void }) {
-  const [tab, setTab] = useStoredState<ConfigurationTab>("agentic-project-tracker.configuration.tab", "general");
+function ConfigurationPage({ config, quota, busy, tab, onTab, onSave, onRestoreDefaults }: { config: TrackerConfig | null; quota: QuotaReport | null; busy: boolean; tab: ConfigurationTab; onTab: (tab: ConfigurationTab) => void; onSave: (update: Pick<TrackerConfig, "providers" | "agent_profiles" | "pricing" | "metrics" | "quality" | "artifacts" | "repositories" | "jira" | "github">) => void; onRestoreDefaults: () => void }) {
   const [enabledProviders, setEnabledProviders] = useState<WorkProvider[]>(config?.providers?.enabled ?? ALL_WORK_PROVIDERS);
   const [repositories, setRepositories] = useState<RepositoryConfig[]>(config?.repositories ?? []);
   const [jira, setJira] = useState(config?.jira ?? { enabled: false, site_url: "", project_key: "", issue_type: "Task" });
@@ -796,7 +851,7 @@ function ConfigurationPage({ config, quota, busy, onSave, onRestoreDefaults }: {
   ];
   return <main className="configuration-page">
     <div className="health-heading"><div><span>Local configuration</span><h1>Tracker configuration</h1><p>Configure repository sources, agent profiles, accounting, evidence, and optional integrations.</p></div>{config && <div className="health-summary"><strong>r{config.revision}</strong><span>tracker-config.yaml</span></div>}</div>
-    <nav className="configuration-tabs" role="tablist" aria-label="Configuration sections">{tabs.map((item) => <button role="tab" aria-selected={tab === item.id} className={tab === item.id ? "active" : ""} key={item.id} onClick={() => setTab(item.id)}><strong>{item.label}</strong><small>{item.description}</small></button>)}</nav>
+    <nav className="configuration-tabs" role="tablist" aria-label="Configuration sections">{tabs.map((item) => <button role="tab" aria-selected={tab === item.id} className={tab === item.id ? "active" : ""} key={item.id} onClick={() => onTab(item.id)}><strong>{item.label}</strong><small>{item.description}</small></button>)}</nav>
     <section className="configuration-card">
       {tab === "general" && <>
       <div className="section-heading"><div><span>Repositories</span><h2>Configured clone sources</h2></div><button className="button-secondary" onClick={() => setRepositories((current) => [...current, { id: "", url: "" }])}>Add repository</button></div>
@@ -1485,16 +1540,18 @@ function TopNavigation({ view, attentionCount, onlineSupervisors, jiraEnabled, b
   </header>;
 }
 
-function PromptEditorPage({ prompts, onUpdated, onError }: {
-  prompts: PromptDocument[]; onUpdated: (prompt: PromptDocument) => void; onError: (message: string | null) => void;
+function PromptEditorPage({ prompts, selectedPromptName, onSelectPrompt, onUpdated, onError }: {
+  prompts: PromptDocument[]; selectedPromptName?: string; onSelectPrompt: (name: string) => void; onUpdated: (prompt: PromptDocument) => void; onError: (message: string | null) => void;
 }) {
-  const [selectedName, setSelectedName] = useState<PromptDocument["name"]>("assignment");
+  const [selectedName, setSelectedName] = useState<PromptDocument["name"]>(selectedPromptName ?? "assignment");
   const selected = prompts.find((prompt) => prompt.name === selectedName) ?? prompts[0];
   const [creatingName, setCreatingName] = useState<string | null>(null);
   const [draft, setDraft] = useState("");
   const [preview, setPreview] = useState<string | null>(null);
   const [previewPhase, setPreviewPhase] = useState<"specification" | "implementation" | "review">("implementation");
   const [busy, setBusy] = useState(false);
+  const selectPrompt = (name: string) => { setSelectedName(name); onSelectPrompt(name); };
+  useEffect(() => { if (selectedPromptName) setSelectedName(selectedPromptName); }, [selectedPromptName]);
   useEffect(() => { if (selected && !creatingName) { setDraft(selected.content); setPreview(null); } }, [selected?.name, selected?.revision, creatingName]);
   if (!selected) return <main className="configuration-page"><div className="empty-health"><h2>Prompt library unavailable</h2></div></main>;
   const activeName = creatingName ?? selected.name;
@@ -1509,7 +1566,7 @@ function PromptEditorPage({ prompts, onUpdated, onError }: {
     setBusy(true); onError(null);
     try {
       const result = creatingName ? await api.createPrompt(creatingName, draft) : await api.updatePrompt(selected, draft);
-      onUpdated(result.prompt); setSelectedName(result.prompt.name); setCreatingName(null); setDraft(result.prompt.content);
+      onUpdated(result.prompt); selectPrompt(result.prompt.name); setCreatingName(null); setDraft(result.prompt.content);
     }
     catch (error) { onError((error as Error).message); }
     finally { setBusy(false); }
@@ -1530,7 +1587,7 @@ function PromptEditorPage({ prompts, onUpdated, onError }: {
   return <main className="prompt-page">
     <div className="health-heading"><div><span>Agent messages</span><h1>Prompt editor</h1><p>Create, reuse, and publish versioned Markdown instructions for workflow nodes.</p></div><div className="artifact-actions"><button className="button-secondary" disabled={busy || !cloneable} title={cloneable ? "Copy the selected prompt into a new artifact" : "System envelope and live-guidance prompts cannot be used as workflow-node prompts"} onClick={beginClone}>Clone prompt</button><button className="button-primary" disabled={busy} onClick={beginNew}>New prompt</button></div></div>
     <div className="prompt-layout">
-      <aside className="prompt-list" aria-label="Prompt templates">{creatingName && <button className="active artifact-draft"><strong>{activeTitle}</strong><small>{creatingName}.md · unsaved</small></button>}{prompts.map((prompt) => <button className={!creatingName && prompt.name === selected.name ? "active" : ""} key={prompt.name} onClick={() => { setCreatingName(null); setSelectedName(prompt.name); }}><strong>{prompt.title}</strong><small>{prompt.name}.md · v{prompt.version}</small>{!prompt.valid && <em>Invalid</em>}</button>)}</aside>
+      <aside className="prompt-list" aria-label="Prompt templates">{creatingName && <button className="active artifact-draft"><strong>{activeTitle}</strong><small>{creatingName}.md · unsaved</small></button>}{prompts.map((prompt) => <button className={!creatingName && prompt.name === selected.name ? "active" : ""} key={prompt.name} onClick={() => { setCreatingName(null); selectPrompt(prompt.name); }}><strong>{prompt.title}</strong><small>{prompt.name}.md · v{prompt.version}</small>{!prompt.valid && <em>Invalid</em>}</button>)}</aside>
       <section className="prompt-editor-card">
         <div className="prompt-heading"><div><span>{activeName}.md{!creatingName ? ` · v${selected.version}` : ""}</span><h2>{activeTitle}</h2><p>{creatingName ? "New reusable workflow-node instructions." : selected.purpose}</p></div>{creatingName ? <span className="prompt-validity draft">Draft</span> : <span className={`prompt-validity ${selected.valid ? "valid" : "invalid"}`}>{selected.valid ? "Valid" : "Needs repair"}</span>}</div>
         {creatingName && <label className="artifact-id-field"><span>Prompt ID</span><input aria-label="Prompt ID" value={creatingName} onChange={(event) => setCreatingName(event.target.value.toLowerCase().replace(/[^a-z0-9-]/g, "-"))} /><small>Lowercase letters, numbers, and hyphens. This becomes the Markdown filename.</small></label>}
@@ -2216,10 +2273,10 @@ function WorkflowContractEditor({ workflow, onChange }: { workflow: WorkflowDocu
   </section>;
 }
 
-function WorkflowEditorPage({ workflows, releases, prompts, agentProfiles, onChanged, onPromptsChanged, onReleasesChanged, onError }: {
-  workflows: WorkflowDocument[]; releases: WorkflowReleaseCatalog | null; prompts: PromptDocument[]; agentProfiles: TrackerConfig["agent_profiles"] | undefined; onChanged: (workflows: WorkflowDocument[]) => void; onPromptsChanged: (prompts: PromptDocument[]) => void; onReleasesChanged: (catalog: WorkflowReleaseCatalog) => void; onError: (message: string | null) => void;
+function WorkflowEditorPage({ workflows, releases, prompts, agentProfiles, selectedWorkflowId, onSelectWorkflow, onChanged, onPromptsChanged, onReleasesChanged, onError }: {
+  workflows: WorkflowDocument[]; releases: WorkflowReleaseCatalog | null; prompts: PromptDocument[]; agentProfiles: TrackerConfig["agent_profiles"] | undefined; selectedWorkflowId?: string; onSelectWorkflow: (id: string) => void; onChanged: (workflows: WorkflowDocument[]) => void; onPromptsChanged: (prompts: PromptDocument[]) => void; onReleasesChanged: (catalog: WorkflowReleaseCatalog) => void; onError: (message: string | null) => void;
 }) {
-  const [selectedId, setSelectedId] = useState("standard-delivery");
+  const [selectedId, setSelectedId] = useState(selectedWorkflowId ?? "standard-delivery");
   const [draft, setDraft] = useState("");
   const [creating, setCreating] = useState<"new" | "clone" | null>(null);
   const [returnId, setReturnId] = useState<string | null>(null);
@@ -2230,6 +2287,8 @@ function WorkflowEditorPage({ workflows, releases, prompts, agentProfiles, onCha
   const [bundleNotice, setBundleNotice] = useState<string | null>(null);
   const bundleInput = useRef<HTMLInputElement>(null);
   const selected = workflows.find((workflow) => workflow.definition.id === selectedId) ?? workflows[0];
+  const selectWorkflow = (id: string) => { setSelectedId(id); onSelectWorkflow(id); };
+  useEffect(() => { if (selectedWorkflowId && !creating) setSelectedId(selectedWorkflowId); }, [selectedWorkflowId, creating]);
   useEffect(() => { if (selected && !creating) { setDraft(editableWorkflowContent(selected)); setSelectedNodeId(selected.definition.start); } }, [selected?.revision, creating]);
   useEffect(() => { setShowRetiredReleases(false); }, [selected?.definition.id]);
   let preview: WorkflowDocument["definition"] | null = null;
@@ -2248,7 +2307,7 @@ function WorkflowEditorPage({ workflows, releases, prompts, agentProfiles, onCha
     definition.id = `copy-of-${selected.definition.id}`; definition.name = `${selected.definition.name} copy`;
     setReturnId(selected.definition.id); setSelectedId(definition.id); setCreating("clone"); setDefinition(definition, definition.start); onError(null);
   };
-  const cancelCreate = () => { const target = workflows.find((workflow) => workflow.definition.id === returnId) ?? workflows[0]; setCreating(null); setReturnId(null); if (target) { setSelectedId(target.definition.id); setDraft(editableWorkflowContent(target)); setSelectedNodeId(target.definition.start); } };
+  const cancelCreate = () => { const target = workflows.find((workflow) => workflow.definition.id === returnId) ?? workflows[0]; setCreating(null); setReturnId(null); if (target) { selectWorkflow(target.definition.id); setDraft(editableWorkflowContent(target)); setSelectedNodeId(target.definition.start); } };
   const addNode = (type: WorkflowNode["type"]) => {
     if (!preview) return;
     const base = type.replace("human_gate", "approval"); let suffix = 1; let id = base;
@@ -2294,7 +2353,7 @@ function WorkflowEditorPage({ workflows, releases, prompts, agentProfiles, onCha
       const result = creating ? await api.createWorkflow(draft, releaseLabel.trim() || undefined) : await api.updateWorkflow(selected!, draft, makeDefault, releaseLabel.trim() || undefined);
       const next = [...workflows.filter((workflow) => workflow.definition.id !== result.workflow.definition.id), result.workflow]
         .sort((a, b) => a.definition.name.localeCompare(b.definition.name));
-      onChanged(next); onReleasesChanged(await api.workflowReleases()); setSelectedId(result.workflow.definition.id); setCreating(null); setReturnId(null); setDraft(result.workflow.content); setSelectedNodeId(result.workflow.definition.start); setReleaseLabel("");
+      onChanged(next); onReleasesChanged(await api.workflowReleases()); selectWorkflow(result.workflow.definition.id); setCreating(null); setReturnId(null); setDraft(result.workflow.content); setSelectedNodeId(result.workflow.definition.start); setReleaseLabel("");
     } catch (error) { onError((error as Error).message); }
     finally { setBusy(false); }
   };
@@ -2321,7 +2380,7 @@ function WorkflowEditorPage({ workflows, releases, prompts, agentProfiles, onCha
       const result = await api.importWorkflowBundle(bundle);
       const [nextWorkflows, nextReleases] = await Promise.all([api.workflows(), api.workflowReleases()]);
       onChanged(nextWorkflows.workflows); onPromptsChanged(result.prompts); onReleasesChanged(nextReleases);
-      setSelectedId(result.workflow.definition.id); setCreating(null); setDraft(result.workflow.content); setSelectedNodeId(result.workflow.definition.start);
+      selectWorkflow(result.workflow.definition.id); setCreating(null); setDraft(result.workflow.content); setSelectedNodeId(result.workflow.definition.start);
       setBundleNotice(`Imported ${result.workflow.definition.name} v${result.workflow.version}. ${result.installed_prompt_revisions.length} prompt revision(s) installed, ${result.unchanged_prompt_revisions.length} already present.`);
     } catch (error) { onError((error as Error).message); }
     finally { setBusy(false); if (bundleInput.current) bundleInput.current.value = ""; }
@@ -2337,7 +2396,7 @@ function WorkflowEditorPage({ workflows, releases, prompts, agentProfiles, onCha
     <div className="health-heading"><div><span>Software factory</span><h1>Workflow editor</h1><p>Build a directed graph of durable boundaries while agents remain autonomous inside agent nodes.</p></div><div className="artifact-actions"><input ref={bundleInput} className="visually-hidden" aria-label="Import workflow bundle file" type="file" accept="application/json,.json" onChange={(event) => void importBundle(event.target.files?.[0])} /><button className="button-secondary" disabled={busy} onClick={() => bundleInput.current?.click()}>Import bundle</button><button className="button-secondary" disabled={busy || !selected} onClick={clone}>Clone workflow</button><button className="button-primary" disabled={busy} onClick={beginNew}>New workflow</button></div></div>
     {bundleNotice && <div className="success-banner" role="status">{bundleNotice}</div>}
     <div className="workflow-editor-layout">
-      <aside className="prompt-list">{creating && preview && <button className="active artifact-draft"><strong>{preview.name}</strong><small>{preview.id}.yaml · unsaved</small></button>}{workflows.map((workflow) => <button className={!creating && workflow.definition.id === selected?.definition.id ? "active" : ""} key={workflow.definition.id} onClick={() => { setCreating(null); setSelectedId(workflow.definition.id); }}><strong>{workflow.definition.name}</strong><small>{workflow.definition.id}.yaml · v{workflow.version}</small>{!workflow.valid && <em>Invalid</em>}</button>)}</aside>
+      <aside className="prompt-list">{creating && preview && <button className="active artifact-draft"><strong>{preview.name}</strong><small>{preview.id}.yaml · unsaved</small></button>}{workflows.map((workflow) => <button className={!creating && workflow.definition.id === selected?.definition.id ? "active" : ""} key={workflow.definition.id} onClick={() => { setCreating(null); selectWorkflow(workflow.definition.id); }}><strong>{workflow.definition.name}</strong><small>{workflow.definition.id}.yaml · v{workflow.version}</small>{!workflow.valid && <em>Invalid</em>}</button>)}</aside>
       <section className="workflow-editor-main">
         <div className="prompt-heading"><div><span>{creating ? `${creating === "clone" ? "Cloned" : "New"} artifact` : `${selected?.definition.id}.yaml · v${selected?.version}`}</span><h2>{preview?.name ?? "Workflow draft"}</h2><p>{preview?.description}</p></div>{selected && !creating && <code>{selected.revision.slice(0, 12)}</code>}</div>
         {selected && !creating && <section className="workflow-releases"><div className="section-heading"><div><span>Revision history</span><h3>Default and trial revisions</h3><p>Each publication creates an immutable numbered revision. Export packages the selected revision with the current exact revisions of every prompt it references.</p></div>{retiredReleaseCount > 0 && <button className="button-secondary button-compact" type="button" onClick={() => setShowRetiredReleases((value) => !value)}>{showRetiredReleases ? "Hide retired revisions" : `Show retired revisions (${retiredReleaseCount})`}</button>}</div><div>{visibleReleases.map((release) => <article key={release.revision} className={release.is_default ? "default-release" : ""}><span><strong>{releaseDisplayLabel(release)}</strong><small>{release.revision.slice(0, 12)} · {humanize(release.status)} · published {timeAgo(release.published_at, Date.now())}</small></span><span className="release-actions"><a className="button-secondary button-compact" href={api.workflowBundleUrl(release.workflow_id, release.revision)} download={`${release.workflow_id}-v${release.version}.workflow.json`}>Export bundle</a>{!release.is_default && <button className="button-secondary button-compact" disabled={busy} onClick={() => void promote(release.revision)}>{release.status === "retired" ? "Restore as default" : "Make default"}</button>}</span></article>)}</div></section>}
@@ -2369,20 +2428,17 @@ function FiveNumberCard({ title, summary, kind }: { title: string; summary: Numb
   </dl></section>;
 }
 
-type MetricsTab = "overview" | "runtime" | "reliability" | "cost" | "compare";
-
 type MetricTone = "positive" | "negative" | "neutral";
 
 function ExecutiveMetric({ label, value, detail, coverage, tone = "neutral" }: { label: string; value: string; detail: string; coverage: string; tone?: MetricTone }) {
   return <article className={`executive-metric metric-tone-${tone}`}><span>{label}</span><strong>{value}</strong><p>{detail}</p><small>{coverage}</small></article>;
 }
 
-function MetricsPage({ releases, onError }: { releases: WorkflowReleaseCatalog | null; onError: (message: string | null) => void }) {
+function MetricsPage({ releases, tab, onTab, onError }: { releases: WorkflowReleaseCatalog | null; tab: MetricsTab; onTab: (tab: MetricsTab) => void; onError: (message: string | null) => void }) {
   const [report, setReport] = useState<MetricsReport | null>(null);
   const [comparison, setComparison] = useState<WorkflowComparisonReport | null>(null);
   const [compareLeft, setCompareLeft] = useState("");
   const [compareRight, setCompareRight] = useState("");
-  const [tab, setTab] = useState<MetricsTab>("overview");
   const [filters, setFilters] = useState({ from: "", to: "", labels: [] as string[], labelMode: "any" as "any" | "all", workflowId: "", workflowRevision: "", productionResult: "" });
   const [loading, setLoading] = useState(false);
   const filterKey = JSON.stringify(filters);
@@ -2488,7 +2544,7 @@ function MetricsPage({ releases, onError }: { releases: WorkflowReleaseCatalog |
     </section>
     <nav className="metrics-tabs" role="tablist" aria-label="Metrics views">{([
       ["overview", "Overview"], ["runtime", "Runtime"], ["reliability", "Reliability"], ["cost", "Cost & usage"], ["compare", "Compare"],
-    ] as Array<[MetricsTab, string]>).map(([id, label]) => <button key={id} role="tab" aria-selected={tab === id} className={tab === id ? "active" : ""} onClick={() => setTab(id)}>{label}</button>)}</nav>
+    ] as Array<[MetricsTab, string]>).map(([id, label]) => <button key={id} role="tab" aria-selected={tab === id} className={tab === id ? "active" : ""} onClick={() => onTab(id)}>{label}</button>)}</nav>
     {tab === "compare" && releaseOptions.length > 0 && <section className="workflow-comparison content-card"><div className="section-heading"><div><span>Experiment analysis</span><h2>Compare workflow revisions</h2></div><small>Efficiency uses completed, non-crossover tickets</small></div><div className="comparison-selectors"><label>Baseline<select aria-label="Comparison baseline" value={compareLeft} onChange={(event) => setCompareLeft(event.target.value)}>{releaseOptions.map((release) => { const value = `${release.workflow_id}@${release.revision}`; return <option key={value} value={value}>{releaseName(value)}</option>; })}</select></label><span>versus</span><label>Candidate<select aria-label="Comparison candidate" value={compareRight} onChange={(event) => setCompareRight(event.target.value)}><option value="">Choose a revision</option>{releaseOptions.map((release) => { const value = `${release.workflow_id}@${release.revision}`; return <option key={value} value={value}>{releaseName(value)}</option>; })}</select></label></div>{comparison && <>
       <div className="comparison-deltas"><ExecutiveMetric label="Completion difference" value={delta("completion_rate", "rate")} tone={deltaTone("completion_rate")} detail="Candidate compared with baseline" coverage={`${comparison.left.cohort.assigned} vs ${comparison.right.cohort.assigned} assigned`} /><ExecutiveMetric label="Active-time difference" value={delta("median_active_ms", "duration")} tone={deltaTone("median_active_ms")} detail="Median execution time" coverage={`${comparison.left.summaries.active_time_ms.count} vs ${comparison.right.summaries.active_time_ms.count} measured`} /><ExecutiveMetric label="Cost difference" value={delta("median_cost_usd", "cost")} tone={deltaTone("median_cost_usd")} detail="Median cost per eligible ticket" coverage={`${comparison.left.coverage.cost_tickets} vs ${comparison.right.coverage.cost_tickets} covered`} /></div>
       <div className="comparison-cohorts"><article><small>Baseline</small><strong>{releaseName(compareLeft)}</strong><span>{comparison.left.cohort.completed}/{comparison.left.cohort.completed + comparison.left.cohort.failed + comparison.left.cohort.cancelled} settled tickets completed</span><small>{comparison.left.cohort.assigned} assigned · {comparison.left.cohort.failed} failed · {comparison.left.cohort.cancelled} cancelled · {comparison.left.cohort.in_progress} in progress ({comparison.left.cohort.blocked} blocked) · {comparison.left.cohort.crossover} crossover</small></article><article><small>Candidate</small><strong>{releaseName(compareRight)}</strong><span>{comparison.right.cohort.completed}/{comparison.right.cohort.completed + comparison.right.cohort.failed + comparison.right.cohort.cancelled} settled tickets completed</span><small>{comparison.right.cohort.assigned} assigned · {comparison.right.cohort.failed} failed · {comparison.right.cohort.cancelled} cancelled · {comparison.right.cohort.in_progress} in progress ({comparison.right.cohort.blocked} blocked) · {comparison.right.cohort.crossover} crossover</small></article></div>
@@ -2787,6 +2843,14 @@ function QueuePage({ tickets, includeArchived, setIncludeArchived, now, onOpen, 
 }
 
 export function App() {
+  return <BrowserRouter future={{ v7_startTransition: true, v7_relativeSplatPath: true }}><AppContent /></BrowserRouter>;
+}
+
+function AppContent() {
+  const location = useLocation();
+  const navigate = useNavigate();
+  const route = useMemo(() => parseAppRoute(location.pathname), [location.pathname]);
+  const view = route.view;
   const [theme, setTheme] = useState<Theme>(storedTheme);
   const [tickets, setTickets] = useState<TicketSummary[]>([]);
   const [runtime, setRuntime] = useState<RuntimeAgent[]>([]);
@@ -2797,7 +2861,6 @@ export function App() {
   const [prompts, setPrompts] = useState<PromptDocument[]>([]);
   const [workflows, setWorkflows] = useState<WorkflowDocument[]>([]);
   const [workflowReleases, setWorkflowReleases] = useState<WorkflowReleaseCatalog | null>(null);
-  const [view, setView] = useState<AppView>(storedAppView);
   const [selected, setSelected] = useState<TicketDetail | null>(null);
   const [creating, setCreating] = useState(false);
   const [draft, setDraft] = useState<TicketDraft>(emptyDraft);
@@ -2810,15 +2873,28 @@ export function App() {
   const [descriptionEdit, setDescriptionEdit] = useState<null | { text: string; targetNode: string }>(null);
   const [now, setNow] = useState(Date.now());
   const [includeArchived, setIncludeArchived] = useStoredState("agentic-project-tracker.queue.archived", false);
-  const [restoredTicketId] = useState(() => storedValue<string | null>("agentic-project-tracker.selected-ticket", null));
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
     try { window.localStorage.setItem("agentic-project-tracker.theme", theme); } catch { /* storage may be disabled */ }
   }, [theme]);
   useEffect(() => {
-    try { window.localStorage.setItem("agentic-project-tracker.view", JSON.stringify(view)); } catch { /* storage may be disabled */ }
-  }, [view]);
+    if (route.legacyRoot) {
+      const legacyView = storedAppView();
+      const legacyTicketId = storedValue<string | null>("agentic-project-tracker.selected-ticket", null);
+      try { window.localStorage.removeItem("agentic-project-tracker.view"); window.localStorage.removeItem("agentic-project-tracker.selected-ticket"); } catch { /* storage may be disabled */ }
+      navigate(legacyView === "tickets" && legacyTicketId ? ticketPath(legacyTicketId) : viewPath(legacyView), { replace: true });
+    } else if (route.redirectTo) navigate(route.redirectTo, { replace: true });
+  }, [route.legacyRoot, route.redirectTo]);
+
+  useEffect(() => {
+    if (view === "workflows" && workflows.length > 0 && (!route.workflowId || !workflows.some((workflow) => workflow.definition.id === route.workflowId))) {
+      navigate(`/workflows/${encodeURIComponent(workflows[0]!.definition.id)}`, { replace: true });
+    }
+    if (view === "prompts" && prompts.length > 0 && (!route.promptName || !prompts.some((prompt) => prompt.name === route.promptName))) {
+      navigate(`/prompts/${encodeURIComponent(prompts[0]!.name)}`, { replace: true });
+    }
+  }, [view, route.workflowId, route.promptName, workflows, prompts]);
 
   const refresh = useCallback(async () => {
     const [list, live, health, operational, configured, promptLibrary, workflowLibrary, releases] = await Promise.all([api.list(includeArchived), api.runtime(), api.supervisors(), api.operations().catch(() => null), api.config(), api.prompts(), api.workflows().catch(() => ({ workflows: [] })), api.workflowReleases().catch(() => null)]);
@@ -2854,21 +2930,12 @@ export function App() {
     return () => stream.close();
   }, [refresh]);
 
-  const open = async (id: string) => {
-    setView("tickets");
+  const loadTicket = async (id: string) => {
     setError(null); const ticket = await api.get(id); setSelected(ticket); setDraft(draftFromTicket(ticket));
     if (ticket.integration_warnings?.length) setError(ticket.integration_warnings.join(" · "));
     setRawDraft(ticket.markdown); setDirty(false); setCreating(false); setComposer(null); setDescriptionEdit(null); setQuestionAnswers({});
-    try { window.localStorage.setItem("agentic-project-tracker.selected-ticket", JSON.stringify(id)); } catch { /* storage may be disabled */ }
   };
-
-  useEffect(() => {
-    if (view !== "tickets" || !restoredTicketId) return;
-    void open(restoredTicketId).catch((caught: Error) => {
-      try { window.localStorage.removeItem("agentic-project-tracker.selected-ticket"); } catch { /* storage may be disabled */ }
-      setError(caught.message);
-    });
-  }, []);
+  const open = (id: string) => navigate(ticketPath(id));
 
   const run = async (work: () => Promise<TicketDetail>): Promise<boolean> => {
     setBusy(true); setError(null);
@@ -2890,7 +2957,7 @@ export function App() {
         : await api.edit(selected!, selected!.valid ? ticketMarkdown(draft, selected!) : rawDraft);
       for (const file of draft.attachmentFiles) { next = await api.uploadAttachment(next, file); uploadedFiles += 1; }
       setSelected(next); setDraft(draftFromTicket(next)); setRawDraft(next.markdown); setDirty(false); setComposer(null); setCreating(false);
-      try { window.localStorage.setItem("agentic-project-tracker.selected-ticket", JSON.stringify(next.id)); } catch { /* storage may be disabled */ }
+      navigate(ticketPath(next.id), { replace: creating });
       await refresh();
     } catch (caught) {
       if (next) { setSelected(next); setDraft({ ...draftFromTicket(next), attachmentFiles: draft.attachmentFiles.slice(uploadedFiles) }); setRawDraft(next.markdown); setCreating(false); await refresh(); }
@@ -2977,7 +3044,7 @@ export function App() {
     setBusy(true); setError(null);
     try {
       const result = await api.checkPullRequests(selected.id);
-      await open(selected.id);
+      await loadTicket(selected.id);
       if (!result.reopened) window.alert(`Checked ${result.checked} pull request(s); no new follow-up was found.`);
     } catch (caught) { setError((caught as Error).message); }
     finally { setBusy(false); }
@@ -3008,18 +3075,18 @@ export function App() {
     finally { setBusy(false); }
   };
 
-  const beginLocalTicket = async () => {
+  const beginLocalTicket = async (updateLocation = true) => {
     setError(null);
+    if (updateLocation) navigate("/tickets/new");
     try {
       const next = await api.nextId();
       const initial = emptyDraft(next.id, true);
       const workflowId = workflowReleases?.catalog.default_workflow_id ?? initial.workflowId;
       const release = workflowReleases?.releases.find((item) => item.workflow_id === workflowId && item.is_default);
-      setView("tickets"); setCreating(true); setSelected(null); setDraft({ ...initial, workflowId, workflowRevision: release?.revision ?? "",
+      setCreating(true); setSelected(null); setDraft({ ...initial, workflowId, workflowRevision: release?.revision ?? "",
         workflowInputs: Object.fromEntries(release?.definition.inputs.map((input) => [input.id, input.default]) ?? []),
         stageEnabled: Object.fromEntries(release?.definition.stages.map((stage) => [stage.id, stage.skippable ? stage.default_enabled : true]) ?? []),
       }); setDirty(false);
-      try { window.localStorage.removeItem("agentic-project-tracker.selected-ticket"); } catch { /* storage may be disabled */ }
     } catch (caught) { setError((caught as Error).message); }
   };
 
@@ -3029,8 +3096,7 @@ export function App() {
     setBusy(true); setError(null);
     try {
       const imported = (await api.jiraImport(key.trim())).draft;
-      setView("tickets"); setCreating(true); setSelected(null);
-      try { window.localStorage.removeItem("agentic-project-tracker.selected-ticket"); } catch { /* storage may be disabled */ }
+      navigate("/tickets/new"); setCreating(true); setSelected(null);
       const initial = emptyDraft(imported.id, false);
       const workflowId = workflowReleases?.catalog.default_workflow_id ?? initial.workflowId;
       const release = workflowReleases?.releases.find((item) => item.workflow_id === workflowId && item.is_default);
@@ -3042,6 +3108,18 @@ export function App() {
     } catch (caught) { setError((caught as Error).message); }
     finally { setBusy(false); }
   };
+
+  useEffect(() => {
+    if (route.ticketId) {
+      void loadTicket(route.ticketId).catch((caught: Error) => { setSelected(null); setError(caught.message); });
+      return;
+    }
+    if (route.newTicket) {
+      if (!creating) void beginLocalTicket(false);
+      return;
+    }
+    if (view === "tickets") { setSelected(null); setCreating(false); }
+  }, [route.ticketId, route.newTicket, view]);
 
   const frontmatter = selected?.frontmatter;
   const selectedWorkflow = selected?.workflow_definition ?? (frontmatter?.workflow ? workflows.find((workflow) => workflow.definition.id === frontmatter.workflow?.id)?.definition : undefined);
@@ -3063,16 +3141,15 @@ export function App() {
     : 0;
   const attentionCount = tickets.filter((ticket) => visibleAttentionKinds(ticket, now).length > 0).length;
   const showQueue = () => {
-    setView("tickets"); setSelected(null); setCreating(false);
-    try { window.localStorage.removeItem("agentic-project-tracker.selected-ticket"); } catch { /* storage may be disabled */ }
+    navigate("/queue"); setSelected(null); setCreating(false);
   };
   return <div className="app-shell">
-    <TopNavigation view={view} attentionCount={attentionCount} onlineSupervisors={supervisors.filter((item) => item.status === "online").length} jiraEnabled={Boolean(config?.jira?.enabled)} busy={busy} theme={theme} onView={setView} onQueue={showQueue} onNewTicket={() => void beginLocalTicket()} onImportJira={() => void beginJiraTicket()} onTheme={setTheme} />
+    <TopNavigation view={view} attentionCount={attentionCount} onlineSupervisors={supervisors.filter((item) => item.status === "online").length} jiraEnabled={Boolean(config?.jira?.enabled)} busy={busy} theme={theme} onView={(target) => navigate(viewPath(target))} onQueue={showQueue} onNewTicket={() => void beginLocalTicket()} onImportJira={() => void beginJiraTicket()} onTheme={setTheme} />
     {view === "tickets" && <AgentFleet agents={runtime} now={now} onOpen={(id) => void open(id)} />}
     {error && <div className="error" role="alert"><strong>Something needs attention</strong><span>{error}</span><button onClick={() => setError(null)}>×</button></div>}
-    {view === "attention" ? <AttentionPage tickets={tickets} now={now} onOpen={(id) => void open(id)} onChanged={refresh} onError={setError} /> : view === "intake" ? <IntakePage repositories={config?.repositories ?? []} workflows={workflows} onOpenTicket={(id) => void open(id)} onError={setError} /> : view === "metrics" ? <MetricsPage releases={workflowReleases} onError={setError} /> : view === "workflows" ? <WorkflowEditorPage workflows={workflows} releases={workflowReleases} prompts={prompts} agentProfiles={config?.agent_profiles} onChanged={setWorkflows} onPromptsChanged={setPrompts} onReleasesChanged={setWorkflowReleases} onError={setError} /> : view === "prompts" ? <PromptEditorPage prompts={prompts} onUpdated={(prompt) => setPrompts((current) => [...current.filter((item) => item.name !== prompt.name), prompt])} onError={setError} /> : view === "configuration" ? <ConfigurationPage config={config} quota={quotaReport} busy={busy} onSave={(update) => void saveConfig(update)} onRestoreDefaults={() => void restoreDefaults()} /> : view === "supervisors" ? <SupervisorHealthPage supervisors={supervisors} operations={operations} githubObservationEnabled={Boolean(config?.github?.observation_enabled)} now={now} onOpenTicket={(id) => void open(id)} /> : !selected && !creating ? <QueuePage tickets={tickets} includeArchived={includeArchived} setIncludeArchived={setIncludeArchived} now={now} onOpen={(id) => void open(id)} onCreate={() => void beginLocalTicket()} /> : <main className="dashboard-layout detail-only">
+    {view === "attention" ? <AttentionPage tickets={tickets} now={now} onOpen={(id) => void open(id)} onChanged={refresh} onError={setError} /> : view === "intake" ? <IntakePage repositories={config?.repositories ?? []} workflows={workflows} onOpenTicket={(id) => void open(id)} onError={setError} /> : view === "metrics" ? <MetricsPage releases={workflowReleases} tab={route.metricsTab ?? "overview"} onTab={(tab) => navigate(`/metrics/${tab}`)} onError={setError} /> : view === "workflows" ? <WorkflowEditorPage workflows={workflows} releases={workflowReleases} prompts={prompts} agentProfiles={config?.agent_profiles} {...(route.workflowId ? { selectedWorkflowId: route.workflowId } : {})} onSelectWorkflow={(id) => navigate(`/workflows/${encodeURIComponent(id)}`)} onChanged={setWorkflows} onPromptsChanged={setPrompts} onReleasesChanged={setWorkflowReleases} onError={setError} /> : view === "prompts" ? <PromptEditorPage prompts={prompts} {...(route.promptName ? { selectedPromptName: route.promptName } : {})} onSelectPrompt={(name) => navigate(`/prompts/${encodeURIComponent(name)}`)} onUpdated={(prompt) => setPrompts((current) => [...current.filter((item) => item.name !== prompt.name), prompt])} onError={setError} /> : view === "configuration" ? <ConfigurationPage config={config} quota={quotaReport} busy={busy} tab={route.configurationTab ?? "general"} onTab={(tab) => navigate(`/configuration/${tab}`)} onSave={(update) => void saveConfig(update)} onRestoreDefaults={() => void restoreDefaults()} /> : view === "supervisors" ? <SupervisorHealthPage supervisors={supervisors} operations={operations} githubObservationEnabled={Boolean(config?.github?.observation_enabled)} now={now} onOpenTicket={(id) => void open(id)} /> : !selected && !creating ? <QueuePage tickets={tickets} includeArchived={includeArchived} setIncludeArchived={setIncludeArchived} now={now} onOpen={(id) => void open(id)} onCreate={() => void beginLocalTicket()} /> : <main className="dashboard-layout detail-only">
       <section className="ticket-workspace">
-        {creating ? <TicketEditor draft={draft} setDraft={(value) => { setDirty(true); setDraft(value); }} existing={false} busy={busy} repositories={config?.repositories ?? []} workflows={workflows} {...(workflowReleases ? { workflowReleases } : {})} onSave={() => void save()} onCancel={() => setCreating(false)} /> : selected ? !selected.valid ? <div className="invalid-editor">
+        {creating ? <TicketEditor draft={draft} setDraft={(value) => { setDirty(true); setDraft(value); }} existing={false} busy={busy} repositories={config?.repositories ?? []} workflows={workflows} {...(workflowReleases ? { workflowReleases } : {})} onSave={() => void save()} onCancel={showQueue} /> : selected ? !selected.valid ? <div className="invalid-editor">
           <div className="issue-heading"><div><span className="issue-key">Recovery editor</span><h1>{selected.relative_path}</h1><p>Repair the invalid Markdown before this ticket can be scheduled.</p></div></div>
           <ul className="validation">{selected.errors.map((item) => <li key={item}>{item}</li>)}</ul>
           <textarea aria-label="Raw ticket Markdown" value={rawDraft} onChange={(event) => { setRawDraft(event.target.value); setDirty(true); }} />

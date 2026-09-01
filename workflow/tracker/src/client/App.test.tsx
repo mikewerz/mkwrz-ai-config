@@ -154,6 +154,7 @@ describe("operator UI", () => {
   let intakeOverview: any;
   let extraTicketSummaries: any[];
   beforeEach(() => {
+    window.history.replaceState({}, "", "/");
     installLocalStorage();
     document.documentElement.removeAttribute("data-theme");
     summary.attention = { kinds: [], pending_questions: 0, wait_wake_at: null, wait_deadline_at: null, delivery_failure_summary: null, github_feedback_summary: null };
@@ -438,11 +439,33 @@ describe("operator UI", () => {
     first.unmount();
 
     window.localStorage.removeItem("agentic-project-tracker.selected-ticket");
+    window.history.replaceState({}, "", "/queue");
     window.localStorage.setItem("agentic-project-tracker.queue.query", JSON.stringify("dashboard"));
     window.localStorage.setItem("agentic-project-tracker.queue.status", JSON.stringify("running"));
     render(<App />);
     expect(await screen.findByLabelText("Search tickets")).toHaveValue("dashboard");
     expect(screen.getByLabelText("Queue status")).toHaveValue("running");
+  });
+
+  it("loads durable ticket and nested page URLs and follows browser history", async () => {
+    window.history.replaceState({}, "", "/tickets/APT-42");
+    const first = render(<App />);
+    expect(await screen.findByRole("heading", { name: "UI ticket" })).toBeInTheDocument();
+    expect(window.location.pathname).toBe("/tickets/APT-42");
+
+    first.unmount();
+    render(<App />);
+    expect(await screen.findByRole("heading", { name: "UI ticket" })).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Configuration" }));
+    expect(await screen.findByRole("heading", { name: "Tracker configuration" })).toBeInTheDocument();
+    expect(window.location.pathname).toBe("/configuration/general");
+    fireEvent.click(screen.getByRole("tab", { name: /Cost & metrics/ }));
+    expect(window.location.pathname).toBe("/configuration/cost");
+
+    window.history.back();
+    await waitFor(() => expect(window.location.pathname).toBe("/configuration/general"));
+    expect(screen.getByRole("tab", { name: /General & repositories/ })).toHaveAttribute("aria-selected", "true");
   });
 
   it("authors campaigns and sources through structured intake forms while retaining advanced YAML", async () => {
@@ -1080,6 +1103,7 @@ describe("operator UI", () => {
     expect(await screen.findByRole("button", { name: "New prompt" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Clone prompt" })).toBeDisabled();
     fireEvent.click(within(screen.getByLabelText("Prompt templates")).getByRole("button", { name: /Specification instructions/ }));
+    expect(window.location.pathname).toBe("/prompts/specification");
     expect(screen.getByRole("button", { name: "Clone prompt" })).toBeEnabled();
     fireEvent.click(screen.getByRole("button", { name: "Clone prompt" }));
     expect(screen.getByLabelText("Prompt ID")).toHaveValue("copy-of-specification");
@@ -1099,6 +1123,7 @@ describe("operator UI", () => {
     render(<App />);
     fireEvent.click(await screen.findByRole("button", { name: "Workflows" }));
     expect(await screen.findByRole("heading", { name: "Workflow editor" })).toBeInTheDocument();
+    await waitFor(() => expect(window.location.pathname).toBe("/workflows/standard-delivery"));
     expect(screen.getByRole("button", { name: "New workflow" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Clone workflow" })).toBeInTheDocument();
     const graph = screen.getByLabelText("Workflow graph");

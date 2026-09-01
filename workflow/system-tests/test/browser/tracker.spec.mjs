@@ -26,18 +26,20 @@ test("loads the production queue and opens ticket creation", async ({ page }) =>
 });
 
 test("navigates to the production configuration and workflow screens", async ({ page }) => {
-  await page.goto(tracker.baseUrl);
-  await page.getByRole("button", { name: "Configuration" }).click();
-  await expect(page.getByRole("heading", { name: "Configured clone sources" })).toBeVisible();
-  await page.getByRole("tab", { name: /Cost & metrics/ }).click();
+  await page.goto(`${tracker.baseUrl}/configuration/cost`);
   await expect(page.getByRole("heading", { name: "Weekly allowances" })).toBeVisible();
   await expect(page.getByText("No subscription quota observations")).toBeVisible();
+  await expect(page).toHaveURL(/\/configuration\/cost$/);
+  await page.reload();
+  await expect(page.getByRole("heading", { name: "Weekly allowances" })).toBeVisible();
 
   await page.getByRole("tab", { name: /Quality & artifacts/ }).click();
+  await expect(page).toHaveURL(/\/configuration\/quality$/);
   await expect(page.getByRole("heading", { name: "Artifact retention & quotas" })).toBeVisible();
 
-  await page.getByRole("button", { name: "Workflows", exact: true }).click();
+  await page.goto(`${tracker.baseUrl}/workflows/standard-delivery`);
   await expect(page.getByRole("heading", { name: "Workflow editor" })).toBeVisible();
+  await expect(page).toHaveURL(/\/workflows\/standard-delivery$/);
 });
 
 test("shows tracker readiness and the Markdown index on the operations page", async ({ page }) => {
