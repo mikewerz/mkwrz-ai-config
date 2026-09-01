@@ -307,6 +307,10 @@ export async function buildMetrics(store: TicketStore, workflows: WorkflowLibrar
   const comparableHumanCost = comparable.reduce((sum, item) => sum + (item.ticket.estimated_human_days ?? 0) * metricsConfig.human_day_rate_usd, 0);
   const comparableFactoryCost = comparable.reduce((sum, item) => sum + item.value.cost, 0);
   const comparableSavings = comparableHumanCost - comparableFactoryCost;
+  const completedCount = tickets.filter((ticket) => ticket.status === "completed").length;
+  const failedCount = tickets.filter((ticket) => ticket.status === "failed").length;
+  const cancelledCount = tickets.filter((ticket) => ticket.status === "cancelled").length;
+  const settledCount = completedCount + failedCount + cancelledCount;
   return {
     generated_at: new Date().toISOString(), filters,
     available: {
@@ -319,7 +323,12 @@ export async function buildMetrics(store: TicketStore, workflows: WorkflowLibrar
     },
     totals: {
       tickets: tickets.length,
-      completed: tickets.filter((ticket) => ticket.status === "completed").length,
+      completed: completedCount,
+      failed: failedCount,
+      cancelled: cancelledCount,
+      in_progress: tickets.length - settledCount,
+      settled: settledCount,
+      completion_rate: settledCount ? completedCount / settledCount : null,
       archived: tickets.filter((ticket) => ticket.archived_at).length,
       total_tokens: accounts.reduce((sum, item) => sum + item.value.tokens, 0),
       known_cost_usd: accounts.reduce((sum, item) => sum + item.value.cost, 0),

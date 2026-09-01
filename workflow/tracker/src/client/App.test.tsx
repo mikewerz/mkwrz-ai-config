@@ -100,7 +100,8 @@ const metricsFixture = {
   generated_at: "2026-08-18T13:00:00.000Z", filters: { labels: [], label_mode: "any", repositories: [] },
   available: { labels: ["dashboard"], workflows: [{ id: "standard-delivery", revision: "workflow-r1" }], repositories: ["demo"] },
   totals: {
-    tickets: 1, completed: 1, archived: 0, total_tokens: 1_100, known_cost_usd: 0.02,
+    tickets: 3, completed: 1, failed: 0, cancelled: 0, in_progress: 2, settled: 1, completion_rate: 1,
+    archived: 0, total_tokens: 1_100, known_cost_usd: 0.02,
     active_ms: 90_000, quota_paused_ms: 30_000, human_wait_ms: 60_000, external_wait_ms: 0,
     estimated_human_days: 2, estimated_human_cost_usd: 2_000, human_day_rate_usd: 1_000,
     comparison_tickets: 1, comparison_human_cost_usd: 2_000, comparison_factory_cost_usd: 0.02,
@@ -231,7 +232,11 @@ describe("operator UI", () => {
       if (path.startsWith("/api/metrics/compare") && !init?.method) {
         const summary = { count: 1, min: 1, q1: 1, median: 1, q3: 1, max: 1, mean: 1, p90: 1, p95: 1 };
         const arm = (revision: string) => ({ workflow_id: "standard-delivery", workflow_revision: revision, cohort: { assigned: 1, completed: 1, failed: 0, cancelled: 0, blocked: 0, in_progress: 0, crossover: 0, efficiency_eligible: 1 }, completion_rate: 1, production_success_rate: 1, coverage: { cost_tickets: 1, token_tickets: 1, eligible_tickets: 1 }, totals: { known_cost_usd: 1, known_tokens: 100, active_ms: 1, human_wait_ms: 0, quota_paused_ms: 0 }, summaries: { ticket_duration_ms: summary, active_time_ms: summary, human_wait_ms: summary, quota_pause_ms: summary, cost_per_ticket_usd: summary, tokens_per_ticket: summary, node_visits: summary }, nodes: metricsFixture.workflows[0]!.nodes });
-        return Response.json({ generated_at: "2026-08-18T13:00:00Z", left: arm("workflow-r1"), right: arm("workflow-r2"), deltas: Object.fromEntries(["completion_rate", "production_success_rate", "median_cost_usd", "median_tokens", "median_duration_ms", "median_active_ms"].map((key) => [key, { absolute: 0, percent: 0 }])) });
+        return Response.json({ generated_at: "2026-08-18T13:00:00Z", left: arm("workflow-r1"), right: arm("workflow-r2"), deltas: {
+          completion_rate: { absolute: 0.1, percent: 0.1 }, production_success_rate: { absolute: 0, percent: 0 },
+          median_cost_usd: { absolute: 1, percent: 1 }, median_tokens: { absolute: 0, percent: 0 },
+          median_duration_ms: { absolute: 0, percent: 0 }, median_active_ms: { absolute: -1_000, percent: -0.5 },
+        } });
       }
       if (path.startsWith("/api/metrics") && !init?.method) return Response.json(metricsFixture);
       if (path === "/api/intake" && !init?.method) return Response.json(intakeOverview);
@@ -563,6 +568,32 @@ describe("operator UI", () => {
     expect(screen.getByText("Pending")).toBeInTheDocument();
   });
 
+  it("opens node-scoped run details and provenance from the ticket workflow graph", async () => {
+    current.frontmatter.workflow.node_runs = [{
+      id: "implementation-run", workflow_revision: "workflow-r1", node_id: "implementation", node_type: "agent",
+      visit: 1, attempt: 1, status: "completed", outcome: "completed", summary: "Implemented the requested change.", handoff: "Review the pull request.",
+      started_at: "2026-08-14T11:00:00Z", completed_at: "2026-08-14T11:05:00Z", lease_id: "lease-implementation", provider: "claude", supervisor_id: "worker-a", telemetry: null,
+      timing: { active_ms: 300_000, quota_paused_ms: 0, human_wait_ms: 0, external_wait_ms: 0, state: "active", last_accounted_at: null, pause_limit_id: null, pause_until: null },
+    }];
+    current.frontmatter.artifacts = [{
+      id: "evidence-1", kind: "agent_transcript", ticket_id: "APT-42", node_run_id: "implementation-run", filename: "implementation.herdr.txt", content_type: "text/plain",
+      size_bytes: 72, sha256: "f".repeat(64), created_at: "2026-08-14T11:05:00Z", metadata: { presentation: { title: "Implementation transcript", category: "provenance" } },
+    }];
+
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: /UI ticket/i }));
+    const graph = await screen.findByLabelText("Workflow graph");
+    fireEvent.click(within(graph).getByRole("button", { name: /Implementation/i }));
+
+    const dialog = await screen.findByRole("dialog", { name: "Workflow node details: Implementation" });
+    expect(within(dialog).getByText("Implemented the requested change.")).toBeInTheDocument();
+    expect(within(dialog).getByText("Review the pull request.")).toBeInTheDocument();
+    expect(within(dialog).getByText("Implementation transcript")).toBeInTheDocument();
+    expect(within(dialog).getByText(/Provenance ·/)).toBeInTheDocument();
+    fireEvent.click(within(dialog).getByRole("button", { name: "Close" }));
+    expect(screen.queryByRole("dialog", { name: "Workflow node details: Implementation" })).not.toBeInTheDocument();
+  });
+
   it("browses complete ticket evidence, provenance, and run history from one view", async () => {
     const timing = { active_ms: 1_000, quota_paused_ms: 0, human_wait_ms: 0, external_wait_ms: 0, state: "active", last_accounted_at: null, pause_limit_id: null, pause_until: null };
     current.frontmatter.workflow.node_runs = Array.from({ length: 13 }, (_, index) => ({
@@ -765,6 +796,7 @@ describe("operator UI", () => {
 
     render(<App />);
     const table = await screen.findByRole("table");
+    await waitFor(() => expect(within(table).getAllByRole("row")).toHaveLength(4));
     const rows = within(table).getAllByRole("row").slice(1);
     expect(rows.map((row) => within(row).getByRole("button").textContent)).toEqual([
       expect.stringContaining("APT-NEW"),
@@ -837,8 +869,9 @@ describe("operator UI", () => {
     fireEvent.click(await screen.findByRole("button", { name: "Metrics" }));
     expect(await screen.findByRole("heading", { name: "Factory metrics" })).toBeInTheDocument();
     expect(screen.getByRole("tab", { name: "Overview" })).toHaveAttribute("aria-selected", "true");
-    expect(screen.getByText("Median delivery time")).toBeInTheDocument();
+    expect(screen.getByText("Median active time")).toBeInTheDocument();
     expect(screen.getByText("Completion rate")).toBeInTheDocument();
+    expect(screen.getByText("1/1 settled completed · 2 still in progress")).toBeInTheDocument();
     expect(screen.getByText("Median factory cost")).toBeInTheDocument();
     expect(screen.getByRole("heading", { name: "Operational signals" })).toBeInTheDocument();
     fireEvent.change(screen.getByLabelText("Metrics workflow"), { target: { value: "standard-delivery" } });
@@ -860,6 +893,9 @@ describe("operator UI", () => {
     fireEvent.click(screen.getByRole("tab", { name: "Compare" }));
     expect(screen.getByRole("heading", { name: "Compare workflow revisions" })).toBeInTheDocument();
     expect(await screen.findByText("Manual trial assignment may introduce selection bias.", { exact: false })).toBeInTheDocument();
+    expect(screen.getByText("Active-time difference").closest("article")).toHaveClass("metric-tone-positive");
+    expect(screen.getByText("Cost difference").closest("article")).toHaveClass("metric-tone-negative");
+    expect(screen.getByText("Baseline nodes").closest("article")?.querySelector(".comparison-node-row > span > strong")).toHaveTextContent("Implementation");
   });
 
   it("edits and saves the YAML-backed repository catalog through structured fields", async () => {

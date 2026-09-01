@@ -84,6 +84,12 @@ describe("factory metrics", () => {
     const excluded = await buildMetrics(store, workflows, { labels: ["frontend"], label_mode: "any", repositories: [] });
     expect(excluded.totals.tickets).toBe(0);
 
+    await store.create(ticketMarkdown({ id: "APT-PENDING", labels: ["backend"] }));
+    const withPending = await buildMetrics(store, workflows, { labels: ["backend"], label_mode: "all", repositories: [] });
+    expect(withPending.totals).toMatchObject({
+      tickets: 2, completed: 1, failed: 0, cancelled: 0, settled: 1, in_progress: 1, completion_rate: 1,
+    });
+
     const changed = structuredClone(workflow.definition); changed.description = "Comparison candidate.";
     const trial = await workflows.save(stringify(changed), workflow.revision, undefined, undefined, undefined, { label: "Candidate" });
     await store.create(ticketMarkdown({ id: "APT-0002", labels: ["backend"] }));

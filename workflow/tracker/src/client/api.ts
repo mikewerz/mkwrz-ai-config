@@ -470,7 +470,8 @@ export interface MetricsReport {
   filters: { from?: string; to?: string; labels: string[]; label_mode: "any" | "all"; workflow_id?: string; workflow_revision?: string; repositories: string[]; production_result?: string };
   available: { labels: string[]; workflows: Array<{ id: string; revision: string }>; repositories: string[] };
   totals: {
-    tickets: number; completed: number; archived: number; total_tokens: number; known_cost_usd: number;
+    tickets: number; completed: number; failed: number; cancelled: number; in_progress: number; settled: number; completion_rate: number | null;
+    archived: number; total_tokens: number; known_cost_usd: number;
     active_ms: number; quota_paused_ms: number; human_wait_ms: number; external_wait_ms: number;
     production: Record<"unassessed" | "succeeded" | "failed" | "rolled_back" | "not_deployed", number>;
     production_assessed: number; production_success_rate: number | null;

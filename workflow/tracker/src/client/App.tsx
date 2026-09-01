@@ -322,12 +322,16 @@ function NextActionSummary({ ticket, workflow }: { ticket: TicketFrontmatter; wo
 
 function WorkflowMap({ ticket, workflow }: { ticket: TicketFrontmatter; workflow: WorkflowDocument["definition"] | undefined }) {
   const [storedZoom, setStoredZoom] = useStoredState("agentic-project-tracker.graph.zoom", 1);
+  const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
   const zoom = Number.isFinite(storedZoom) ? clampGraphZoom(storedZoom) : 1;
+  const selectedNode = workflow?.nodes.find((node) => node.id === selectedNodeId) ?? null;
+  useEffect(() => { setSelectedNodeId(null); }, [ticket.id, ticket.workflow?.revision]);
   if (ticket.workflow && workflow) return <section className="workflow-panel" aria-label="Ticket workflow">
     <div className="section-heading"><div><h2>Workflow · {workflow.name} · v{ticket.workflow_assignment?.version ?? 1}</h2></div><div className="workflow-heading-actions"><div className="graph-zoom" role="group" aria-label="Workflow zoom"><button aria-label="Zoom out" disabled={zoom <= GRAPH_ZOOM_MIN} onClick={() => setStoredZoom(clampGraphZoom(zoom - GRAPH_ZOOM_STEP))}>−</button><button aria-label="Reset zoom" onClick={() => setStoredZoom(1)}>{Math.round(zoom * 100)}%</button><button aria-label="Zoom in" disabled={zoom >= GRAPH_ZOOM_MAX} onClick={() => setStoredZoom(clampGraphZoom(zoom + GRAPH_ZOOM_STEP))}>＋</button></div></div></div>
     <NextActionSummary ticket={ticket} workflow={workflow} />
-    <WorkflowGraph workflow={workflow} currentNode={ticket.workflow.current_node} ticket={ticket} zoom={zoom} />
+    <WorkflowGraph workflow={workflow} currentNode={ticket.workflow.current_node} {...(selectedNodeId ? { selectedNode: selectedNodeId } : {})} onSelect={setSelectedNodeId} ticket={ticket} zoom={zoom} />
     <div className="workflow-loops"><span>{ticket.workflow.transition_count} / {workflow.max_transitions} transitions</span><span>{ticket.workflow.node_runs.length} durable node runs</span></div>
+    {selectedNode && <WorkflowNodeDialog ticket={ticket} workflow={workflow} node={selectedNode} onClose={() => setSelectedNodeId(null)} />}
   </section>;
   return <section className="workflow-panel" aria-label="Ticket workflow"><p className="muted">This ticket has no loadable pinned workflow.</p></section>;
 }
@@ -485,6 +489,65 @@ function ArtifactPreview({ ticketId, artifact }: { ticketId: string; artifact: T
     return <pre className="artifact-text-preview"><code>{displayed}</code></pre>;
   }
   return <div className="artifact-preview-fallback"><p>No inline preview is available for {artifact.content_type}.</p><a href={url} target="_blank" rel="noreferrer">Open artifact ↗</a></div>;
+}
+
+const PROVENANCE_ARTIFACT_KINDS = new Set(["agent_transcript", "harness_session_log", "execution_trace", "execution_manifest"]);
+
+function WorkflowNodeDialog({ ticket, workflow, node, onClose }: {
+  ticket: TicketFrontmatter;
+  workflow: WorkflowDocument["definition"];
+  node: WorkflowNode;
+  onClose: () => void;
+}) {
+  const [selectedArtifactId, setSelectedArtifactId] = useState<string | null>(null);
+  const now = Date.now();
+  const runs = [...(ticket.workflow?.node_runs ?? [])].filter((run) => run.node_id === node.id
+    && run.workflow_revision === ticket.workflow?.revision
+    && (run.workflow_id ?? ticket.workflow?.id) === workflow.id).reverse();
+  const runIds = new Set(runs.map((run) => run.id));
+  const artifacts = (ticket.artifacts ?? []).filter((artifact) => artifact.node_run_id !== null && runIds.has(artifact.node_run_id))
+    .sort((left, right) => Number(PROVENANCE_ARTIFACT_KINDS.has(right.kind)) - Number(PROVENANCE_ARTIFACT_KINDS.has(left.kind)) || right.created_at.localeCompare(left.created_at));
+  const selectedArtifact = artifacts.find((artifact) => artifact.id === selectedArtifactId) ?? null;
+  const provider = resolvedWorkflowProvider(ticket, node);
+  const routes = nodeRoutes(node);
+  useEffect(() => {
+    const closeOnEscape = (event: KeyboardEvent) => { if (event.key === "Escape") onClose(); };
+    window.addEventListener("keydown", closeOnEscape);
+    return () => window.removeEventListener("keydown", closeOnEscape);
+  }, [onClose]);
+  return <div className="node-detail-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
+    <section className="node-detail-modal" role="dialog" aria-modal="true" aria-label={`Workflow node details: ${node.name}`}>
+      <header className="node-detail-header"><div><span>{humanize(node.type)} node</span><h2>{node.name}</h2><code>{node.id}</code></div><button className="button-secondary" type="button" onClick={onClose}>Close</button></header>
+      <div className="node-detail-contract">
+        <div><span>Stage</span><strong>{humanize(node.stage)}</strong></div>
+        <div><span>Executor</span><strong>{provider ? humanize(provider) : node.type === "agent" ? "Unresolved" : "Deterministic"}</strong></div>
+        <div><span>Prompt</span><strong>{node.prompt ? `${node.prompt}.md` : "Not applicable"}</strong></div>
+        <div><span>Runs</span><strong>{runs.length}</strong></div>
+        {node.type === "agent" && <div><span>Cost limit</span><strong>{usd(node.max_cost_usd ?? 50)}</strong></div>}
+      </div>
+      {routes.length > 0 && <div className="node-detail-routes"><span>Configured outcomes</span><div>{routes.map((route) => <code key={route.id}>{route.label} → {humanize(route.target)}</code>)}</div></div>}
+      <div className="node-detail-columns">
+        <section className="node-detail-runs"><header><div><span>Execution history</span><h3>Node runs</h3></div><strong>{runs.length}</strong></header>
+          {runs.length ? runs.map((run) => <details className="node-detail-run" key={run.id} open={runs.length === 1 || run.status === "running"}>
+            <summary><span><strong>{humanize(run.status)}{run.outcome ? ` · ${humanize(run.outcome)}` : ""}</strong><small>Visit {run.visit} · attempt {run.attempt}</small></span><NodeTimingDetails run={run} now={now} /></summary>
+            <div>
+              {run.telemetry && <TelemetryDetails telemetry={run.telemetry} compact />}
+              {run.summary && <p><strong>Summary</strong><span>{run.summary}</span></p>}
+              {run.handoff && <p><strong>Handoff</strong><span>{run.handoff}</span></p>}
+              {run.output && <p><strong>Output tail</strong><code>{run.output}</code></p>}
+              <p><strong>Run ID</strong><code>{run.id}</code></p>
+              {run.provider && <p><strong>Provider</strong><span>{humanize(run.provider)}</span></p>}
+              {run.supervisor_id && <p><strong>Supervisor</strong><span>{run.supervisor_id}</span></p>}
+            </div>
+          </details>) : <div className="node-detail-empty"><strong>This node has not run yet.</strong><p>Its configuration is shown above; run history will appear after execution begins.</p></div>}
+        </section>
+        <section className="node-detail-artifacts"><header><div><span>Evidence and governance</span><h3>Artifacts & provenance</h3></div><strong>{artifacts.length}</strong></header>
+          {artifacts.length ? <div className="node-artifact-list">{artifacts.map((artifact) => <button type="button" className={artifact.id === selectedArtifactId ? "active" : ""} key={artifact.id} onClick={() => setSelectedArtifactId(artifact.id === selectedArtifactId ? null : artifact.id)}><span><strong>{artifactTitle(artifact)}</strong><small>{PROVENANCE_ARTIFACT_KINDS.has(artifact.kind) ? "Provenance" : artifactPresentation(artifact).category ?? humanize(artifact.kind)} · {fileSize(artifact.size_bytes)}</small></span><span>{artifact.id === selectedArtifactId ? "Hide" : "Preview"}</span></button>)}</div> : <div className="node-detail-empty"><strong>No node-scoped artifacts.</strong><p>Artifacts become available here when this node publishes evidence, traces, manifests, or a harness transcript.</p></div>}
+          {selectedArtifact && <div className="node-artifact-preview"><div><a href={api.artifactUrl(ticket.id, selectedArtifact.id)} target="_blank" rel="noreferrer">Open ↗</a><a href={api.artifactUrl(ticket.id, selectedArtifact.id, true)}>Download</a></div><ArtifactPreview ticketId={ticket.id} artifact={selectedArtifact} /></div>}
+        </section>
+      </div>
+    </section>
+  </div>;
 }
 
 function ReviewMaterials({ ticket, workflow, busy, now, onDecide }: {
@@ -2195,8 +2258,10 @@ function FiveNumberCard({ title, summary, kind }: { title: string; summary: Numb
 
 type MetricsTab = "overview" | "runtime" | "reliability" | "cost" | "compare";
 
-function ExecutiveMetric({ label, value, detail, coverage }: { label: string; value: string; detail: string; coverage: string }) {
-  return <article className="executive-metric"><span>{label}</span><strong>{value}</strong><p>{detail}</p><small>{coverage}</small></article>;
+type MetricTone = "positive" | "negative" | "neutral";
+
+function ExecutiveMetric({ label, value, detail, coverage, tone = "neutral" }: { label: string; value: string; detail: string; coverage: string; tone?: MetricTone }) {
+  return <article className={`executive-metric metric-tone-${tone}`}><span>{label}</span><strong>{value}</strong><p>{detail}</p><small>{coverage}</small></article>;
 }
 
 function MetricsPage({ releases, onError }: { releases: WorkflowReleaseCatalog | null; onError: (message: string | null) => void }) {
@@ -2255,13 +2320,22 @@ function MetricsPage({ releases, onError }: { releases: WorkflowReleaseCatalog |
     const absolute = kind === "rate" ? `${value.absolute >= 0 ? "+" : ""}${(value.absolute * 100).toFixed(1)} pp` : kind === "duration" ? `${value.absolute >= 0 ? "+" : "−"}${duration(Math.abs(value.absolute))}` : kind === "cost" ? `${value.absolute >= 0 ? "+" : "−"}${usd(Math.abs(value.absolute))}` : `${value.absolute >= 0 ? "+" : "−"}${tokenCount(Math.abs(value.absolute))}`;
     return `${absolute}${value.percent === null ? "" : ` · ${value.percent >= 0 ? "+" : ""}${(value.percent * 100).toFixed(1)}%`}`;
   };
+  const deltaTone = (metric: keyof WorkflowComparisonReport["deltas"]): MetricTone => {
+    const absolute = comparison?.deltas[metric].absolute;
+    if (absolute === null || absolute === undefined || absolute === 0) return "neutral";
+    const lowerIsBetter = ["median_cost_usd", "median_tokens", "median_duration_ms", "median_active_ms"].includes(metric);
+    return (lowerIsBetter ? absolute < 0 : absolute > 0) ? "positive" : "negative";
+  };
+  const deltaValue = (metric: keyof WorkflowComparisonReport["deltas"], kind: "rate" | "duration" | "cost" | "tokens") =>
+    <span className={`comparison-delta metric-tone-${deltaTone(metric)}`}>{delta(metric, kind)}</span>;
+  const nodeRateTone = (rate: number | null): MetricTone => rate === null ? "neutral" : rate >= .8 ? "positive" : rate < .5 ? "negative" : "neutral";
   const clearFilters = () => setFilters({ from: "", to: "", labels: [], labelMode: "any", workflowId: "", workflowRevision: "", productionResult: "" });
   const activeFilterCount = Number(Boolean(filters.from)) + Number(Boolean(filters.to)) + filters.labels.length + Number(Boolean(filters.workflowId)) + Number(Boolean(filters.workflowRevision)) + Number(Boolean(filters.productionResult));
   const allNodes = report?.workflows.flatMap((workflow) => workflow.nodes) ?? [];
   const slowestNode = [...allNodes].filter((node) => node.wall_ms.median !== null).sort((left, right) => (right.wall_ms.median ?? 0) - (left.wall_ms.median ?? 0))[0];
   const leastReliableNode = [...allNodes].filter((node) => node.success_rate !== null && node.runs > 0).sort((left, right) => (left.success_rate ?? 1) - (right.success_rate ?? 1))[0];
   const mostExpensiveNode = [...allNodes].filter((node) => node.telemetry_coverage.cost_runs > 0 && node.runs > 0).sort((left, right) => (right.known_cost_usd / right.runs) - (left.known_cost_usd / left.runs))[0];
-  const completionRate = report?.totals.tickets ? report.totals.completed / report.totals.tickets : null;
+  const completionRate = report?.totals.completion_rate ?? null;
   const observedRuntime = report ? report.totals.active_ms + report.totals.human_wait_ms + report.totals.external_wait_ms + report.totals.quota_paused_ms : 0;
   const runtimeSegments = report ? [
     { label: "Active", value: report.totals.active_ms, className: "active" },
@@ -2269,6 +2343,7 @@ function MetricsPage({ releases, onError }: { releases: WorkflowReleaseCatalog |
     { label: "External wait", value: report.totals.external_wait_ms, className: "external" },
     { label: "Quota paused", value: report.totals.quota_paused_ms, className: "quota" },
   ] : [];
+  const comparisonNodeList = (title: string, nodes: WorkflowComparisonReport["left"]["nodes"]) => <article><h3>{title}</h3>{nodes.length ? nodes.map((node) => <div className="comparison-node-row" key={node.node_id}><span><strong>{node.node_name}</strong><small>{humanize(node.node_type)} · {node.runs} run{node.runs === 1 ? "" : "s"}</small>{(node.quality ?? []).map((quality) => <small key={`${quality.key}/${quality.type}/${quality.unit}/${quality.direction}`}>{quality.label}: {quality.numeric?.median ?? quality.values[0]?.value ?? "—"}{quality.unit ? ` ${quality.unit}` : ""} · {quality.pass_rate === null ? "unclassified" : `${(quality.pass_rate * 100).toFixed(0)}% pass`}</small>)}</span><span className={`comparison-node-rate metric-tone-${nodeRateTone(node.success_rate)}`}><strong>{node.success_rate === null ? "—" : `${(node.success_rate * 100).toFixed(0)}%`}</strong><small>success</small></span></div>) : <p className="comparison-empty">No completed node runs in this cohort.</p>}</article>;
   const workflowReliability = report && <section className="workflow-metrics"><div className="section-heading"><div><span>Workflow reliability</span><h2>Nodes and branches</h2></div><small>Grouped by immutable workflow revision</small></div>
     {report.workflows.map((workflow) => <details key={`${workflow.workflow_id}@${workflow.workflow_revision}`} open={report.workflows.length === 1}><summary><strong>{humanize(workflow.workflow_id)}</strong><code>{workflow.workflow_revision.slice(0, 12)}</code><span>{workflow.ticket_count} tickets · {workflow.nodes.reduce((sum, node) => sum + node.runs, 0)} runs</span></summary><div className="node-metrics-grid">{workflow.nodes.map((node) => <article key={node.node_id} className="node-metric-card">
       <header><div><span>{humanize(node.node_type)}</span><h3>{node.node_name}</h3></div><strong>{node.success_rate === null ? "—" : `${(node.success_rate * 100).toFixed(0)}%`}</strong></header>
@@ -2302,24 +2377,24 @@ function MetricsPage({ releases, onError }: { releases: WorkflowReleaseCatalog |
       ["overview", "Overview"], ["runtime", "Runtime"], ["reliability", "Reliability"], ["cost", "Cost & usage"], ["compare", "Compare"],
     ] as Array<[MetricsTab, string]>).map(([id, label]) => <button key={id} role="tab" aria-selected={tab === id} className={tab === id ? "active" : ""} onClick={() => setTab(id)}>{label}</button>)}</nav>
     {tab === "compare" && releaseOptions.length > 0 && <section className="workflow-comparison content-card"><div className="section-heading"><div><span>Experiment analysis</span><h2>Compare workflow revisions</h2></div><small>Efficiency uses completed, non-crossover tickets</small></div><div className="comparison-selectors"><label>Baseline<select aria-label="Comparison baseline" value={compareLeft} onChange={(event) => setCompareLeft(event.target.value)}>{releaseOptions.map((release) => { const value = `${release.workflow_id}@${release.revision}`; return <option key={value} value={value}>{releaseName(value)}</option>; })}</select></label><span>versus</span><label>Candidate<select aria-label="Comparison candidate" value={compareRight} onChange={(event) => setCompareRight(event.target.value)}><option value="">Choose a revision</option>{releaseOptions.map((release) => { const value = `${release.workflow_id}@${release.revision}`; return <option key={value} value={value}>{releaseName(value)}</option>; })}</select></label></div>{comparison && <>
-      <div className="comparison-deltas"><ExecutiveMetric label="Completion difference" value={delta("completion_rate", "rate")} detail="Candidate compared with baseline" coverage={`${comparison.left.cohort.assigned} vs ${comparison.right.cohort.assigned} assigned`} /><ExecutiveMetric label="Delivery-time difference" value={delta("median_duration_ms", "duration")} detail="Median elapsed time" coverage={`${comparison.left.summaries.ticket_duration_ms.count} vs ${comparison.right.summaries.ticket_duration_ms.count} measured`} /><ExecutiveMetric label="Cost difference" value={delta("median_cost_usd", "cost")} detail="Median cost per eligible ticket" coverage={`${comparison.left.coverage.cost_tickets} vs ${comparison.right.coverage.cost_tickets} covered`} /></div>
-      <div className="comparison-cohorts"><article><strong>{releaseName(compareLeft)}</strong><span>{comparison.left.cohort.completed}/{comparison.left.cohort.assigned} completed</span><small>{comparison.left.cohort.failed} failed · {comparison.left.cohort.cancelled} cancelled · {comparison.left.cohort.in_progress} in progress ({comparison.left.cohort.blocked} blocked) · {comparison.left.cohort.crossover} crossover</small></article><article><strong>{releaseName(compareRight)}</strong><span>{comparison.right.cohort.completed}/{comparison.right.cohort.assigned} completed</span><small>{comparison.right.cohort.failed} failed · {comparison.right.cohort.cancelled} cancelled · {comparison.right.cohort.in_progress} in progress ({comparison.right.cohort.blocked} blocked) · {comparison.right.cohort.crossover} crossover</small></article></div>
+      <div className="comparison-deltas"><ExecutiveMetric label="Completion difference" value={delta("completion_rate", "rate")} tone={deltaTone("completion_rate")} detail="Candidate compared with baseline" coverage={`${comparison.left.cohort.assigned} vs ${comparison.right.cohort.assigned} assigned`} /><ExecutiveMetric label="Active-time difference" value={delta("median_active_ms", "duration")} tone={deltaTone("median_active_ms")} detail="Median execution time" coverage={`${comparison.left.summaries.active_time_ms.count} vs ${comparison.right.summaries.active_time_ms.count} measured`} /><ExecutiveMetric label="Cost difference" value={delta("median_cost_usd", "cost")} tone={deltaTone("median_cost_usd")} detail="Median cost per eligible ticket" coverage={`${comparison.left.coverage.cost_tickets} vs ${comparison.right.coverage.cost_tickets} covered`} /></div>
+      <div className="comparison-cohorts"><article><small>Baseline</small><strong>{releaseName(compareLeft)}</strong><span>{comparison.left.cohort.completed}/{comparison.left.cohort.completed + comparison.left.cohort.failed + comparison.left.cohort.cancelled} settled tickets completed</span><small>{comparison.left.cohort.assigned} assigned · {comparison.left.cohort.failed} failed · {comparison.left.cohort.cancelled} cancelled · {comparison.left.cohort.in_progress} in progress ({comparison.left.cohort.blocked} blocked) · {comparison.left.cohort.crossover} crossover</small></article><article><small>Candidate</small><strong>{releaseName(compareRight)}</strong><span>{comparison.right.cohort.completed}/{comparison.right.cohort.completed + comparison.right.cohort.failed + comparison.right.cohort.cancelled} settled tickets completed</span><small>{comparison.right.cohort.assigned} assigned · {comparison.right.cohort.failed} failed · {comparison.right.cohort.cancelled} cancelled · {comparison.right.cohort.in_progress} in progress ({comparison.right.cohort.blocked} blocked) · {comparison.right.cohort.crossover} crossover</small></article></div>
       <table className="comparison-table"><thead><tr><th>Metric</th><th>Baseline</th><th>Candidate</th><th>Difference</th></tr></thead><tbody>
-        <tr><td>Completion rate</td><td>{comparison.left.completion_rate === null ? "—" : `${(comparison.left.completion_rate * 100).toFixed(1)}%`}</td><td>{comparison.right.completion_rate === null ? "—" : `${(comparison.right.completion_rate * 100).toFixed(1)}%`}</td><td>{delta("completion_rate", "rate")}</td></tr>
-        <tr><td>Production success</td><td>{comparison.left.production_success_rate === null ? "—" : `${(comparison.left.production_success_rate * 100).toFixed(1)}%`}</td><td>{comparison.right.production_success_rate === null ? "—" : `${(comparison.right.production_success_rate * 100).toFixed(1)}%`}</td><td>{delta("production_success_rate", "rate")}</td></tr>
-        <tr><td>Median cost</td><td>{formatMetric(comparison.left.summaries.cost_per_ticket_usd.median, "cost")}</td><td>{formatMetric(comparison.right.summaries.cost_per_ticket_usd.median, "cost")}</td><td>{delta("median_cost_usd", "cost")}</td></tr>
-        <tr><td>Median tokens</td><td>{formatMetric(comparison.left.summaries.tokens_per_ticket.median, "tokens")}</td><td>{formatMetric(comparison.right.summaries.tokens_per_ticket.median, "tokens")}</td><td>{delta("median_tokens", "tokens")}</td></tr>
-        <tr><td>Median duration</td><td>{formatMetric(comparison.left.summaries.ticket_duration_ms.median, "duration")}</td><td>{formatMetric(comparison.right.summaries.ticket_duration_ms.median, "duration")}</td><td>{delta("median_duration_ms", "duration")}</td></tr>
-        <tr><td>Median active time</td><td>{formatMetric(comparison.left.summaries.active_time_ms.median, "duration")}</td><td>{formatMetric(comparison.right.summaries.active_time_ms.median, "duration")}</td><td>{delta("median_active_ms", "duration")}</td></tr>
+        <tr><td>Completion rate</td><td>{comparison.left.completion_rate === null ? "—" : `${(comparison.left.completion_rate * 100).toFixed(1)}%`}</td><td>{comparison.right.completion_rate === null ? "—" : `${(comparison.right.completion_rate * 100).toFixed(1)}%`}</td><td>{deltaValue("completion_rate", "rate")}</td></tr>
+        <tr><td>Production success</td><td>{comparison.left.production_success_rate === null ? "—" : `${(comparison.left.production_success_rate * 100).toFixed(1)}%`}</td><td>{comparison.right.production_success_rate === null ? "—" : `${(comparison.right.production_success_rate * 100).toFixed(1)}%`}</td><td>{deltaValue("production_success_rate", "rate")}</td></tr>
+        <tr><td>Median cost</td><td>{formatMetric(comparison.left.summaries.cost_per_ticket_usd.median, "cost")}</td><td>{formatMetric(comparison.right.summaries.cost_per_ticket_usd.median, "cost")}</td><td>{deltaValue("median_cost_usd", "cost")}</td></tr>
+        <tr><td>Median tokens</td><td>{formatMetric(comparison.left.summaries.tokens_per_ticket.median, "tokens")}</td><td>{formatMetric(comparison.right.summaries.tokens_per_ticket.median, "tokens")}</td><td>{deltaValue("median_tokens", "tokens")}</td></tr>
+        <tr><td>Median duration</td><td>{formatMetric(comparison.left.summaries.ticket_duration_ms.median, "duration")}</td><td>{formatMetric(comparison.right.summaries.ticket_duration_ms.median, "duration")}</td><td>{deltaValue("median_duration_ms", "duration")}</td></tr>
+        <tr><td>Median active time</td><td>{formatMetric(comparison.left.summaries.active_time_ms.median, "duration")}</td><td>{formatMetric(comparison.right.summaries.active_time_ms.median, "duration")}</td><td>{deltaValue("median_active_ms", "duration")}</td></tr>
       </tbody></table><p className="metrics-coverage">Cost coverage: {comparison.left.coverage.cost_tickets}/{comparison.left.coverage.eligible_tickets} baseline and {comparison.right.coverage.cost_tickets}/{comparison.right.coverage.eligible_tickets} candidate tickets. Token coverage: {comparison.left.coverage.token_tickets}/{comparison.left.coverage.eligible_tickets} and {comparison.right.coverage.token_tickets}/{comparison.right.coverage.eligible_tickets}. Manual trial assignment may introduce selection bias.</p>
-      <div className="comparison-nodes"><article><h3>Baseline nodes</h3>{comparison.left.nodes.map((node) => <div key={node.node_id}><span>{node.node_name}{(node.quality ?? []).map((quality) => <small key={`${quality.key}/${quality.type}/${quality.unit}/${quality.direction}`}>{quality.label}: {quality.numeric?.median ?? quality.values[0]?.value ?? "—"}{quality.unit ? ` ${quality.unit}` : ""} · {quality.pass_rate === null ? "unclassified" : `${(quality.pass_rate * 100).toFixed(0)}% pass`}</small>)}</span><strong>{node.success_rate === null ? "—" : `${(node.success_rate * 100).toFixed(0)}%`} · n={node.runs}</strong></div>)}</article><article><h3>Candidate nodes</h3>{comparison.right.nodes.map((node) => <div key={node.node_id}><span>{node.node_name}{(node.quality ?? []).map((quality) => <small key={`${quality.key}/${quality.type}/${quality.unit}/${quality.direction}`}>{quality.label}: {quality.numeric?.median ?? quality.values[0]?.value ?? "—"}{quality.unit ? ` ${quality.unit}` : ""} · {quality.pass_rate === null ? "unclassified" : `${(quality.pass_rate * 100).toFixed(0)}% pass`}</small>)}</span><strong>{node.success_rate === null ? "—" : `${(node.success_rate * 100).toFixed(0)}%`} · n={node.runs}</strong></div>)}</article></div>
+      <div className="comparison-nodes">{comparisonNodeList("Baseline nodes", comparison.left.nodes)}{comparisonNodeList("Candidate nodes", comparison.right.nodes)}</div>
     </>}</section>}
     {tab === "compare" && releaseOptions.length === 0 && <div className="empty-health"><h2>No workflow revisions are available to compare</h2></div>}
     {report && <>
       {tab === "overview" && <>
         <section className="executive-metrics" aria-label="Executive summary">
-          <ExecutiveMetric label="Median delivery time" value={formatMetric(report.summaries.ticket_duration_ms.median, "duration")} detail={`P90 ${formatMetric(report.summaries.ticket_duration_ms.p90, "duration")} · ${duration(report.totals.active_ms)} total active`} coverage={`${report.summaries.ticket_duration_ms.count} completed tickets measured`} />
-          <ExecutiveMetric label="Completion rate" value={completionRate === null ? "—" : `${(completionRate * 100).toFixed(1)}%`} detail={`Production success ${report.totals.production_success_rate === null ? "—" : `${(report.totals.production_success_rate * 100).toFixed(1)}%`}`} coverage={`${report.totals.completed}/${report.totals.tickets} completed · ${report.totals.production_assessed} production assessed`} />
+          <ExecutiveMetric label="Median active time" value={formatMetric(report.summaries.active_time_ms.median, "duration")} detail={`P90 ${formatMetric(report.summaries.active_time_ms.p90, "duration")} · ${duration(report.totals.active_ms)} total active`} coverage={`${report.summaries.active_time_ms.count} tickets measured`} />
+          <ExecutiveMetric label="Completion rate" value={completionRate === null ? "—" : `${(completionRate * 100).toFixed(1)}%`} detail={`Production success ${report.totals.production_success_rate === null ? "—" : `${(report.totals.production_success_rate * 100).toFixed(1)}%`}`} coverage={`${report.totals.completed}/${report.totals.settled} settled completed · ${report.totals.in_progress} still in progress`} />
           <ExecutiveMetric label="Median factory cost" value={formatMetric(report.summaries.cost_per_ticket_usd.median, "cost")} detail={`${report.coverage.cost_runs ? usd(report.totals.known_cost_usd) : "No observed cost"} total known cost`} coverage={`${report.coverage.complete_cost_tickets}/${report.totals.completed} completed tickets fully covered`} />
         </section>
         {(report.coverage.complete_cost_tickets < report.totals.completed || report.coverage.complete_token_tickets < report.totals.completed) && <p className="metrics-coverage metrics-coverage-warning">Some completed tickets have incomplete telemetry. Unknown subscription cost is not treated as zero.</p>}
@@ -2342,7 +2417,7 @@ function MetricsPage({ releases, onError }: { releases: WorkflowReleaseCatalog |
       </>}
       {tab === "reliability" && <>
         <div className="metrics-tab-heading"><span>Delivery confidence</span><h2>Reliability and outcomes</h2><p>Ticket completion, production assessment, node outcomes, loops, and quality evidence.</p></div>
-        <section className="reliability-kpis"><ExecutiveMetric label="Ticket completion" value={completionRate === null ? "—" : `${(completionRate * 100).toFixed(1)}%`} detail={`${report.totals.completed} completed of ${report.totals.tickets} filtered`} coverage="Includes unsettled tickets in the denominator" /><ExecutiveMetric label="Production success" value={report.totals.production_success_rate === null ? "—" : `${(report.totals.production_success_rate * 100).toFixed(1)}%`} detail={`${report.totals.production.succeeded} succeeded · ${report.totals.production.failed + report.totals.production.rolled_back} failed or rolled back`} coverage={`${report.totals.production_assessed} tickets assessed`} /></section>
+        <section className="reliability-kpis"><ExecutiveMetric label="Ticket completion" value={completionRate === null ? "—" : `${(completionRate * 100).toFixed(1)}%`} detail={`${report.totals.completed} completed of ${report.totals.settled} settled`} coverage={`${report.totals.in_progress} unsettled tickets excluded`} /><ExecutiveMetric label="Production success" value={report.totals.production_success_rate === null ? "—" : `${(report.totals.production_success_rate * 100).toFixed(1)}%`} detail={`${report.totals.production.succeeded} succeeded · ${report.totals.production.failed + report.totals.production.rolled_back} failed or rolled back`} coverage={`${report.totals.production_assessed} tickets assessed`} /></section>
         <section className="production-metrics content-card"><div className="section-heading"><div><span>Deployment evidence</span><h2>Production outcomes</h2></div><small>{report.totals.production_assessed}/{report.totals.tickets} assessed</small></div><div>{Object.entries(report.totals.production).map(([result, count]) => <div key={result}><span>{humanize(result)}</span><strong>{count}</strong><progress max={Math.max(1, report.totals.tickets)} value={count} /></div>)}</div></section>
         {workflowReliability}
       </>}
