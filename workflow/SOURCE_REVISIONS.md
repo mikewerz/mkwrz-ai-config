@@ -1,10 +1,10 @@
 # Source Revisions
 
-This consolidated workflow was synchronized on 2026-08-31 from these standalone repository revisions:
+This consolidated workflow was synchronized on 2026-09-01 from these standalone repository revisions:
 
 | Component | Source revision |
 | --- | --- |
-| Tracker | `44ec07b2a8cb` |
+| Tracker | `be477a091aba` |
 | Supervisor | `49331310032d` |
 | Herdr configuration | `e4d5df55efab` |
 | Cross-process system tests | `63daf9198357` |

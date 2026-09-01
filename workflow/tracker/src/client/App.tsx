@@ -322,14 +322,16 @@ function NextActionSummary({ ticket, workflow }: { ticket: TicketFrontmatter; wo
 
 function WorkflowMap({ ticket, workflow }: { ticket: TicketFrontmatter; workflow: WorkflowDocument["definition"] | undefined }) {
   const [storedZoom, setStoredZoom] = useStoredState("agentic-project-tracker.graph.zoom", 1);
+  const [storedRouteView, setStoredRouteView] = useStoredState<"all" | "focused">("agentic-project-tracker.graph.routes", "all");
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
   const zoom = Number.isFinite(storedZoom) ? clampGraphZoom(storedZoom) : 1;
+  const routeView = storedRouteView === "focused" ? "focused" : "all";
   const selectedNode = workflow?.nodes.find((node) => node.id === selectedNodeId) ?? null;
   useEffect(() => { setSelectedNodeId(null); }, [ticket.id, ticket.workflow?.revision]);
   if (ticket.workflow && workflow) return <section className="workflow-panel" aria-label="Ticket workflow">
-    <div className="section-heading"><div><h2>Workflow · {workflow.name} · v{ticket.workflow_assignment?.version ?? 1}</h2></div><div className="workflow-heading-actions"><div className="graph-zoom" role="group" aria-label="Workflow zoom"><button aria-label="Zoom out" disabled={zoom <= GRAPH_ZOOM_MIN} onClick={() => setStoredZoom(clampGraphZoom(zoom - GRAPH_ZOOM_STEP))}>−</button><button aria-label="Reset zoom" onClick={() => setStoredZoom(1)}>{Math.round(zoom * 100)}%</button><button aria-label="Zoom in" disabled={zoom >= GRAPH_ZOOM_MAX} onClick={() => setStoredZoom(clampGraphZoom(zoom + GRAPH_ZOOM_STEP))}>＋</button></div></div></div>
+    <div className="section-heading"><div><h2>Workflow · {workflow.name} · v{ticket.workflow_assignment?.version ?? 1}</h2></div><div className="workflow-heading-actions"><div className="graph-route-view" role="group" aria-label="Workflow routes"><button aria-pressed={routeView === "focused"} onClick={() => setStoredRouteView("focused")}>Taken + next</button><button aria-pressed={routeView === "all"} onClick={() => setStoredRouteView("all")}>All routes</button></div><div className="graph-zoom" role="group" aria-label="Workflow zoom"><button aria-label="Zoom out" disabled={zoom <= GRAPH_ZOOM_MIN} onClick={() => setStoredZoom(clampGraphZoom(zoom - GRAPH_ZOOM_STEP))}>−</button><button aria-label="Reset zoom" onClick={() => setStoredZoom(1)}>{Math.round(zoom * 100)}%</button><button aria-label="Zoom in" disabled={zoom >= GRAPH_ZOOM_MAX} onClick={() => setStoredZoom(clampGraphZoom(zoom + GRAPH_ZOOM_STEP))}>＋</button></div></div></div>
     <NextActionSummary ticket={ticket} workflow={workflow} />
-    <WorkflowGraph workflow={workflow} currentNode={ticket.workflow.current_node} {...(selectedNodeId ? { selectedNode: selectedNodeId } : {})} onSelect={setSelectedNodeId} ticket={ticket} zoom={zoom} />
+    <WorkflowGraph workflow={workflow} currentNode={ticket.workflow.current_node} {...(selectedNodeId ? { selectedNode: selectedNodeId } : {})} onSelect={setSelectedNodeId} ticket={ticket} zoom={zoom} routeView={routeView} />
     <div className="workflow-loops"><span>{ticket.workflow.transition_count} / {workflow.max_transitions} transitions</span><span>{ticket.workflow.node_runs.length} durable node runs</span></div>
     {selectedNode && <WorkflowNodeDialog ticket={ticket} workflow={workflow} node={selectedNode} onClose={() => setSelectedNodeId(null)} />}
   </section>;
@@ -507,7 +509,32 @@ function WorkflowNodeDialog({ ticket, workflow, node, onClose }: {
   const runIds = new Set(runs.map((run) => run.id));
   const artifacts = (ticket.artifacts ?? []).filter((artifact) => artifact.node_run_id !== null && runIds.has(artifact.node_run_id))
     .sort((left, right) => Number(PROVENANCE_ARTIFACT_KINDS.has(right.kind)) - Number(PROVENANCE_ARTIFACT_KINDS.has(left.kind)) || right.created_at.localeCompare(left.created_at));
-  const selectedArtifact = artifacts.find((artifact) => artifact.id === selectedArtifactId) ?? null;
+  const traceGroups = [...artifacts.filter((artifact) => artifact.kind === "execution_trace").reduce((groups, artifact) => {
+    const key = String(artifact.metadata.trace_id ?? artifact.id);
+    groups.set(key, [...(groups.get(key) ?? []), artifact]);
+    return groups;
+  }, new Map<string, TicketArtifact[]>()).values()]
+    .sort((left, right) => (right[0]?.created_at ?? "").localeCompare(left[0]?.created_at ?? ""));
+  const artifactRecords = artifacts.filter((artifact) => artifact.kind !== "execution_trace");
+  const logicalArtifactCount = artifactRecords.length + traceGroups.length;
+  const selectedArtifact = artifactRecords.find((artifact) => artifact.id === selectedArtifactId) ?? null;
+  const runById = new Map(runs.map((run) => [run.id, run]));
+  const executionRuns = agentExecutionRuns(runs);
+  const measuredRuns = executionRuns.filter((run) => run.telemetry);
+  const tokenRuns = measuredRuns.filter((run) => run.telemetry?.delta.usage);
+  const costRuns = measuredRuns.filter((run) => run.telemetry?.delta.cost_usd !== null && run.telemetry?.delta.cost_usd !== undefined);
+  const usage = aggregateTokenUsage(tokenRuns);
+  const totalCost = costRuns.reduce((sum, run) => sum + (run.telemetry?.delta.cost_usd ?? 0), 0);
+  const timings = runs.map((run) => nodeTiming(run, now));
+  const totalActiveMs = timings.reduce((sum, timing) => sum + timing.activeMs, 0);
+  const totalWallMs = timings.reduce((sum, timing) => sum + timing.wallMs, 0);
+  const latestRun = runs[0];
+  const workflowId = ticket.workflow?.active_workflow_id ?? ticket.workflow?.id;
+  const configuredProfile = workflowId ? ticket.workflow?.resolved_agent_profiles?.[`${workflowId}/${node.id}`] : undefined;
+  const observedModels = [...new Set(measuredRuns.flatMap((run) => run.telemetry?.latest.model.observed_ids ?? []))];
+  const latestTelemetry = measuredRuns[0]?.telemetry?.latest;
+  const model = observedModels[0] ?? latestTelemetry?.model.id ?? configuredProfile?.model ?? null;
+  const reasoning = latestTelemetry?.reasoning.effort ?? configuredProfile?.reasoning ?? null;
   const provider = resolvedWorkflowProvider(ticket, node);
   const routes = nodeRoutes(node);
   useEffect(() => {
@@ -518,13 +545,14 @@ function WorkflowNodeDialog({ ticket, workflow, node, onClose }: {
   return <div className="node-detail-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
     <section className="node-detail-modal" role="dialog" aria-modal="true" aria-label={`Workflow node details: ${node.name}`}>
       <header className="node-detail-header"><div><span>{humanize(node.type)} node</span><h2>{node.name}</h2><code>{node.id}</code></div><button className="button-secondary" type="button" onClick={onClose}>Close</button></header>
-      <div className="node-detail-contract">
-        <div><span>Stage</span><strong>{humanize(node.stage)}</strong></div>
-        <div><span>Executor</span><strong>{provider ? humanize(provider) : node.type === "agent" ? "Unresolved" : "Deterministic"}</strong></div>
-        <div><span>Prompt</span><strong>{node.prompt ? `${node.prompt}.md` : "Not applicable"}</strong></div>
-        <div><span>Runs</span><strong>{runs.length}</strong></div>
-        {node.type === "agent" && <div><span>Cost limit</span><strong>{usd(node.max_cost_usd ?? 50)}</strong></div>}
+      <div className="node-detail-metrics">
+        <div><span>Latest result</span><strong>{latestRun ? humanize(latestRun.outcome ?? latestRun.status) : "Not run"}</strong><small>{runs.length} run{runs.length === 1 ? "" : "s"}{latestRun ? ` · visit ${latestRun.visit}` : ""}</small></div>
+        <div><span>Active runtime</span><strong>{runs.length ? duration(totalActiveMs) : "—"}</strong><small>{runs.length ? `${duration(totalWallMs)} cumulative wall time` : "No execution timing"}</small></div>
+        <div className="node-metric-tokens"><span>Total tokens</span><strong>{tokenCount(usage?.total_tokens)}</strong><small>{runs.length ? `${compactTokenBreakdown(usage)} · ${tokenRuns.length}/${executionRuns.length || runs.length} measured runs` : "No execution telemetry"}</small></div>
+        <div><span>{costLabel(costRuns.map((run) => run.telemetry!.latest.cost.kind))}</span><strong>{costRuns.length ? usd(totalCost) : "Unavailable"}</strong><small>{runs.length ? `${costRuns.length}/${executionRuns.length || runs.length} measured runs${node.type === "agent" ? ` · ${usd(node.max_cost_usd ?? 50)} limit` : ""}` : "No execution telemetry"}</small></div>
+        <div><span>Model</span><strong>{model ?? (node.type === "agent" ? "Unavailable" : "Deterministic")}</strong><small>{[latestTelemetry?.model.provider ?? configuredProfile?.provider ?? provider, reasoning ? `${humanize(reasoning)} reasoning` : null, observedModels.length > 1 ? `${observedModels.length} models observed` : null].filter(Boolean).map(String).map(humanize).join(" · ") || "No agent model"}</small></div>
       </div>
+      <div className="node-detail-routes"><span>Node configuration</span><div><code>Stage: {humanize(node.stage)}</code><code>Executor: {provider ? humanize(provider) : node.type === "agent" ? "Unresolved" : "Deterministic"}</code><code>Prompt: {node.prompt ? `${node.prompt}.md` : "Not applicable"}</code>{node.type === "agent" && <code>Cost limit: {usd(node.max_cost_usd ?? 50)}</code>}</div></div>
       {routes.length > 0 && <div className="node-detail-routes"><span>Configured outcomes</span><div>{routes.map((route) => <code key={route.id}>{route.label} → {humanize(route.target)}</code>)}</div></div>}
       <div className="node-detail-columns">
         <section className="node-detail-runs"><header><div><span>Execution history</span><h3>Node runs</h3></div><strong>{runs.length}</strong></header>
@@ -541,8 +569,13 @@ function WorkflowNodeDialog({ ticket, workflow, node, onClose }: {
             </div>
           </details>) : <div className="node-detail-empty"><strong>This node has not run yet.</strong><p>Its configuration is shown above; run history will appear after execution begins.</p></div>}
         </section>
-        <section className="node-detail-artifacts"><header><div><span>Evidence and governance</span><h3>Artifacts & provenance</h3></div><strong>{artifacts.length}</strong></header>
-          {artifacts.length ? <div className="node-artifact-list">{artifacts.map((artifact) => <button type="button" className={artifact.id === selectedArtifactId ? "active" : ""} key={artifact.id} onClick={() => setSelectedArtifactId(artifact.id === selectedArtifactId ? null : artifact.id)}><span><strong>{artifactTitle(artifact)}</strong><small>{PROVENANCE_ARTIFACT_KINDS.has(artifact.kind) ? "Provenance" : artifactPresentation(artifact).category ?? humanize(artifact.kind)} · {fileSize(artifact.size_bytes)}</small></span><span>{artifact.id === selectedArtifactId ? "Hide" : "Preview"}</span></button>)}</div> : <div className="node-detail-empty"><strong>No node-scoped artifacts.</strong><p>Artifacts become available here when this node publishes evidence, traces, manifests, or a harness transcript.</p></div>}
+        <section className="node-detail-artifacts"><header><div><span>Evidence and provenance</span><h3>Artifacts & provenance</h3></div><strong>{logicalArtifactCount} item{logicalArtifactCount === 1 ? "" : "s"}</strong></header>
+          {traceGroups.length > 0 && <div className="node-trace-list">{traceGroups.map((group) => {
+            const traceRun = group[0]?.node_run_id ? runById.get(group[0].node_run_id) : undefined;
+            return <OperationalTrace key={String(group[0]?.metadata.trace_id ?? group[0]?.id)} ticketId={ticket.id} artifacts={group} {...(traceRun ? { run: traceRun } : {})} now={now} nodeName={() => node.name} />;
+          })}</div>}
+          {artifactRecords.length > 0 && <div className="node-artifact-list">{artifactRecords.map((artifact) => <button type="button" className={artifact.id === selectedArtifactId ? "active" : ""} key={artifact.id} onClick={() => setSelectedArtifactId(artifact.id === selectedArtifactId ? null : artifact.id)}><span><strong>{artifactTitle(artifact)}</strong><small>{PROVENANCE_ARTIFACT_KINDS.has(artifact.kind) ? "Provenance" : artifactPresentation(artifact).category ?? humanize(artifact.kind)} · {fileSize(artifact.size_bytes)}</small></span><span>{artifact.id === selectedArtifactId ? "Hide" : "Preview"}</span></button>)}</div>}
+          {!logicalArtifactCount && <div className="node-detail-empty"><strong>No node-scoped artifacts.</strong><p>Artifacts become available here when this node publishes evidence, traces, manifests, or a harness transcript.</p></div>}
           {selectedArtifact && <div className="node-artifact-preview"><div><a href={api.artifactUrl(ticket.id, selectedArtifact.id)} target="_blank" rel="noreferrer">Open ↗</a><a href={api.artifactUrl(ticket.id, selectedArtifact.id, true)}>Download</a></div><ArtifactPreview ticketId={ticket.id} artifact={selectedArtifact} /></div>}
         </section>
       </div>
@@ -1558,8 +1591,8 @@ function replaceNodeTargets(node: WorkflowNode, from: string, to: string): Workf
   };
 }
 
-function WorkflowGraph({ workflow, currentNode, selectedNode, onSelect, ticket, zoom = 1 }: {
-  workflow: WorkflowDocument["definition"]; currentNode?: string; selectedNode?: string; onSelect?: (nodeId: string) => void; ticket?: TicketFrontmatter; zoom?: number;
+function WorkflowGraph({ workflow, currentNode, selectedNode, onSelect, ticket, zoom = 1, routeView = "all" }: {
+  workflow: WorkflowDocument["definition"]; currentNode?: string; selectedNode?: string; onSelect?: (nodeId: string) => void; ticket?: TicketFrontmatter; zoom?: number; routeView?: "all" | "focused";
 }) {
   const viewportRef = useRef<HTMLDivElement>(null);
   const panRef = useRef<{ pointerId: number; clientX: number; scrollLeft: number } | null>(null);
@@ -1586,6 +1619,8 @@ function WorkflowGraph({ workflow, currentNode, selectedNode, onSelect, ticket, 
   };
   const markerId = useId().replaceAll(":", "");
   const loopMarkerId = `${markerId}-loop`;
+  const takenMarkerId = `${markerId}-taken`;
+  const takenLoopMarkerId = `${markerId}-taken-loop`;
   const nodeHeight = ticket ? GRAPH_TICKET_NODE_HEIGHT : GRAPH_NODE_HEIGHT;
   const columns = Math.min(workflow.nodes.length > 9 ? 4 : 3, Math.max(1, workflow.nodes.length));
   const rows = Math.ceil(workflow.nodes.length / columns);
@@ -1595,28 +1630,67 @@ function WorkflowGraph({ workflow, currentNode, selectedNode, onSelect, ticket, 
   const stageEntries = new Map<string, string>();
   for (const node of workflow.nodes) if (!stageEntries.has(node.stage)) stageEntries.set(node.stage, node.id);
   const stages = new Map(workflow.stages.map((stage) => [stage.id, stage]));
+  const takenEdgeKeys = new Set<string>();
+  const markTaken = (source: string, target: string | undefined) => {
+    if (target) takenEdgeKeys.add(`${source}\u0000${target}`);
+  };
+  const activeWorkflowId = ticket?.workflow?.active_workflow_id ?? ticket?.workflow?.id;
+  const activeWorkflowRevision = ticket?.workflow?.active_workflow_revision ?? ticket?.workflow?.revision;
+  for (const run of ticket?.workflow?.node_runs ?? []) {
+    if (!run.outcome || run.workflow_revision !== activeWorkflowRevision || (run.workflow_id ?? ticket?.workflow?.id) !== activeWorkflowId) continue;
+    const node = workflow.nodes.find((candidate) => candidate.id === run.node_id);
+    if (!node) continue;
+    let target = nodeRoutes(node).find((route) => route.id === run.outcome)?.target;
+    if (run.outcome === "bypassed") {
+      const stage = stages.get(node.stage);
+      target = run.summary?.startsWith("Stage ") ? stage?.bypass_to : node.otherwise;
+    } else if (run.outcome === "github_feedback") target = node.github_watch?.feedback_target;
+    markTaken(node.id, target);
+  }
+  if (ticket?.workflow?.incoming && activeWorkflowId === workflow.id
+    && workflow.nodes.some((node) => node.id === ticket.workflow!.incoming!.source_node)
+    && workflow.nodes.some((node) => node.id === ticket.workflow!.incoming!.target_node)) {
+    markTaken(ticket.workflow.incoming.source_node, ticket.workflow.incoming.target_node);
+  }
   const rawEdges = workflow.nodes.flatMap((node) => {
     const stage = stages.get(node.stage);
     return [
-      ...nodeRoutes(node).map((route) => ({ source: node.id, outcome: route.label, target: route.target })),
-      ...(node.otherwise ? [{ source: node.id, outcome: "Otherwise", target: node.otherwise }] : []),
+      ...nodeRoutes(node).map((route) => ({ source: node.id, outcome: route.label, target: route.target, expectedCandidate: route.metric_class !== "failure" })),
+      ...(node.otherwise ? [{ source: node.id, outcome: "Otherwise", target: node.otherwise, expectedCandidate: false }] : []),
       ...(stageEntries.get(node.stage) === node.id && stage?.skippable && stage.bypass_to
-        ? [{ source: node.id, outcome: "Stage disabled", target: stage.bypass_to }] : []),
-      ...(node.github_watch?.feedback_target ? [{ source: node.id, outcome: "GitHub feedback", target: node.github_watch.feedback_target }] : []),
+        ? [{ source: node.id, outcome: "Stage disabled", target: stage.bypass_to, expectedCandidate: false }] : []),
+      ...(node.github_watch?.feedback_target ? [{ source: node.id, outcome: "GitHub feedback", target: node.github_watch.feedback_target, expectedCandidate: false }] : []),
     ];
   });
-  const groupedEdges = new Map<string, { source: string; target: string; outcomes: string[] }>();
+  const expectedEdgeKeys = new Set<string>();
+  const expectedQueue = currentNode ? [currentNode] : [];
+  const expectedNodes = new Set<string>();
+  while (expectedQueue.length) {
+    const sourceId = expectedQueue.shift()!;
+    if (expectedNodes.has(sourceId)) continue;
+    expectedNodes.add(sourceId);
+    const source = grid.get(sourceId);
+    for (const edge of rawEdges.filter((candidate) => candidate.source === sourceId && candidate.expectedCandidate)) {
+      const target = grid.get(edge.target);
+      if (!source || !target || target.index <= source.index) continue;
+      expectedEdgeKeys.add(`${edge.source}\u0000${edge.target}`);
+      expectedQueue.push(edge.target);
+    }
+  }
+  const groupedEdges = new Map<string, { source: string; target: string; outcomes: string[]; expectedCandidate: boolean }>();
   for (const edge of rawEdges) {
     const key = `${edge.source}\u0000${edge.target}`;
-    const grouped = groupedEdges.get(key) ?? { source: edge.source, target: edge.target, outcomes: [] };
+    const grouped = groupedEdges.get(key) ?? { source: edge.source, target: edge.target, outcomes: [], expectedCandidate: false };
     if (!grouped.outcomes.includes(edge.outcome)) grouped.outcomes.push(edge.outcome);
+    grouped.expectedCandidate ||= edge.expectedCandidate;
     groupedEdges.set(key, grouped);
   }
   const edges = [...groupedEdges.values()].map((edge, index) => {
     const primary = edge.outcomes.find((outcome) => outcome !== "Stage disabled") ?? edge.outcomes[0]!;
     const outcome = edge.outcomes.length === 1 ? primary : edge.outcomes.includes("Stage disabled") ? `${primary} / bypass` : `${primary} / +${edge.outcomes.length - 1}`;
-    return { ...edge, outcome, fullOutcome: edge.outcomes.join(" / "), id: `${index}:${edge.source}:${edge.target}` };
-  });
+    const expected = expectedEdgeKeys.has(`${edge.source}\u0000${edge.target}`);
+    return { ...edge, outcome, fullOutcome: edge.outcomes.join(" / "), id: `${index}:${edge.source}:${edge.target}`, expected, taken: takenEdgeKeys.has(`${edge.source}\u0000${edge.target}`) };
+  }).filter((edge) => routeView === "all" || edge.taken || edge.expected);
 
   type LaneInterval = { start: number; end: number };
   const rowArcLanes = new Map<number, LaneInterval[][]>();
@@ -1709,6 +1783,8 @@ function WorkflowGraph({ workflow, currentNode, selectedNode, onSelect, ticket, 
         <defs>
           <marker id={markerId} markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" /></marker>
           <marker className="loop-marker" id={loopMarkerId} markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" /></marker>
+          <marker className="taken-marker" id={takenMarkerId} markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" /></marker>
+          <marker className="loop-marker taken-marker" id={takenLoopMarkerId} markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" /></marker>
         </defs>
         {positionedEdges.map((edge) => {
           const source = positions.get(edge.source); const target = positions.get(edge.target);
@@ -1753,8 +1829,9 @@ function WorkflowGraph({ workflow, currentNode, selectedNode, onSelect, ticket, 
             labelY = (sourceTrackY + targetTrackY) / 2 + (edge.lane % 2 === 0 ? -7 : 11);
             textAnchor = side === "left" ? "end" : "start";
           }
-          return <g key={edge.id} data-route={edge.route} data-source={edge.source} data-target={edge.target} data-port={edge.backward ? "alternate-right" : "primary-left"} className={`factory-connector ${edge.backward ? "loop" : ""}`}>
-            <path d={path} markerEnd={`url(#${edge.backward ? loopMarkerId : markerId})`} />
+          return <g key={edge.id} data-route={edge.route} data-source={edge.source} data-target={edge.target} data-port={edge.backward ? "alternate-right" : "primary-left"} className={`factory-connector ${edge.backward ? "loop" : ""} ${edge.expected ? "expected" : ""} ${edge.taken ? "taken" : ""}`}>
+            {edge.taken && <path className="route-glow" d={path} />}
+            <path className="route-line" d={path} markerEnd={`url(#${edge.taken ? (edge.backward ? takenLoopMarkerId : takenMarkerId) : (edge.backward ? loopMarkerId : markerId)})`} />
             <text x={labelX} y={labelY} textAnchor={textAnchor}><title>{humanize(edge.fullOutcome)}</title>{humanize(edge.outcome)}</text>
           </g>;
         })}

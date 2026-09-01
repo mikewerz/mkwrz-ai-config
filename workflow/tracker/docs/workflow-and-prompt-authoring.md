@@ -361,7 +361,7 @@ Workflow metadata keys may contain dots, but they are literal keys, not nested-p
 
 ## Workflow document anatomy
 
-A workflow is stored as YAML beneath the configured `workflows/` library. The editor can create a new workflow, clone an existing workflow, validate it, display the graph, and publish a content-addressed revision.
+A workflow is stored as YAML beneath the configured `workflows/` library. The editor can create a new workflow, clone an existing workflow, validate it, display the graph, and publish a content-addressed revision. On a ticket, completed transitions and the current node glow. The **Taken + next** route view retains the actual path and projects non-failure routes forward only from the current node; expected routes from earlier nodes disappear when those nodes were skipped or bypassed. This is a display filter only and does not change workflow execution.
 
 The V3 product currently uses workflow schema `version: 2`; these are different version axes. Use `version: 2` until the implemented workflow schema changes.
 
@@ -714,7 +714,7 @@ Declared `artifacts` are exact regular-file paths relative to the resolved worki
 
 ### Human-readable review evidence
 
-Use an ordinary artifact when an operator should inspect a result during execution or before choosing a Human Gate outcome. Contents are intentionally permissive: Markdown, standalone HTML, images, PDF, JSON, YAML, text, and arbitrary downloadable files are all valid. There is no required report schema and artifact content never selects a workflow edge. Every artifact remains expandable from the ticket's **Evidence & artifacts** card regardless of ticket state; its review packet can show only featured evidence, keep the newest artifact from each node, filter by node/category/media type, and move through fullscreen previews. Selecting a node on a ticket's workflow graph opens that node's configuration, durable runs, telemetry, summaries/handoffs, and node-scoped artifacts, with provenance shown first. Low-level manifests and checkpoint bundles are grouped under **Technical artifacts**. An active Human Gate additionally presents the preceding node's evidence in the focused **Review materials** card.
+Use an ordinary artifact when an operator should inspect a result during execution or before choosing a Human Gate outcome. Contents are intentionally permissive: Markdown, standalone HTML, images, PDF, JSON, YAML, text, and arbitrary downloadable files are all valid. There is no required report schema and artifact content never selects a workflow edge. Every artifact remains expandable from the ticket's **Evidence & artifacts** card regardless of ticket state; its review packet can show only featured evidence, keep the newest artifact from each node, filter by node/category/media type, and move through fullscreen previews. Selecting a node on a ticket's workflow graph opens a run-analysis view led by result, runtime, token, cost, and exact-model summaries, followed by configuration, durable runs, telemetry, summaries/handoffs, and node-scoped artifacts. Provenance is shown first, and incremental Herdr JSONL chunks sharing one trace ID are presented as one logical operational trace. Low-level manifests and checkpoint bundles are grouped under **Technical artifacts**. An active Human Gate additionally presents the preceding node's evidence in the focused **Review materials** card.
 
 An Agent can publish any file before its terminal callback with the generated helper:
 

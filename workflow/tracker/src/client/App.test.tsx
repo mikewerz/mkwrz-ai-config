@@ -569,16 +569,26 @@ describe("operator UI", () => {
   });
 
   it("opens node-scoped run details and provenance from the ticket workflow graph", async () => {
+    const usage = { input_tokens: 2_000, cached_input_tokens: 20_000, cache_write_input_tokens: 1_000, output_tokens: 4_000, reasoning_output_tokens: 400, total_tokens: 27_400 };
+    const telemetry = {
+      baseline: { schema_version: 1, harness: "claude", session_ref: "session-1", observed_at: "2026-08-14T11:00:00Z", source: { kind: "session_log", detail: "session.jsonl" }, model: { id: "claude-opus-4-8", provider: "anthropic", observed_ids: ["claude-opus-4-8"] }, reasoning: { effort: "high", enabled: true, source: "session" }, usage: { input_tokens: 0, cached_input_tokens: 0, cache_write_input_tokens: 0, output_tokens: 0, reasoning_output_tokens: 0, total_tokens: 0 }, cost: { total_usd: 0, kind: "reported" }, context: { used_tokens: null, window_tokens: null, used_percent: null }, rate_limits: [], attributes: {} },
+      latest: { schema_version: 1, harness: "claude", session_ref: "session-1", observed_at: "2026-08-14T11:05:00Z", source: { kind: "session_log", detail: "session.jsonl" }, model: { id: "claude-opus-4-8", provider: "anthropic", observed_ids: ["claude-opus-4-8"] }, reasoning: { effort: "high", enabled: true, source: "session" }, usage, cost: { total_usd: 1.25, kind: "reported" }, context: { used_tokens: 27_400, window_tokens: 200_000, used_percent: 13.7 }, rate_limits: [], attributes: {} },
+      delta: { usage, cost_usd: 1.25 },
+    };
     current.frontmatter.workflow.node_runs = [{
       id: "implementation-run", workflow_revision: "workflow-r1", node_id: "implementation", node_type: "agent",
       visit: 1, attempt: 1, status: "completed", outcome: "completed", summary: "Implemented the requested change.", handoff: "Review the pull request.",
-      started_at: "2026-08-14T11:00:00Z", completed_at: "2026-08-14T11:05:00Z", lease_id: "lease-implementation", provider: "claude", supervisor_id: "worker-a", telemetry: null,
+      started_at: "2026-08-14T11:00:00Z", completed_at: "2026-08-14T11:05:00Z", lease_id: "lease-implementation", provider: "claude", supervisor_id: "worker-a", telemetry,
       timing: { active_ms: 300_000, quota_paused_ms: 0, human_wait_ms: 0, external_wait_ms: 0, state: "active", last_accounted_at: null, pause_limit_id: null, pause_until: null },
     }];
-    current.frontmatter.artifacts = [{
-      id: "evidence-1", kind: "agent_transcript", ticket_id: "APT-42", node_run_id: "implementation-run", filename: "implementation.herdr.txt", content_type: "text/plain",
-      size_bytes: 72, sha256: "f".repeat(64), created_at: "2026-08-14T11:05:00Z", metadata: { presentation: { title: "Implementation transcript", category: "provenance" } },
-    }];
+    current.frontmatter.artifacts = [
+      {
+        id: "evidence-1", kind: "agent_transcript", ticket_id: "APT-42", node_run_id: "implementation-run", filename: "implementation.herdr.txt", content_type: "text/plain",
+        size_bytes: 72, sha256: "f".repeat(64), created_at: "2026-08-14T11:05:00Z", metadata: { presentation: { title: "Implementation transcript", category: "provenance" } },
+      },
+      { id: "trace-1", kind: "execution_trace", ticket_id: "APT-42", node_run_id: "implementation-run", filename: "implementation-run.000001-000003.herdr-trace.jsonl", content_type: "application/x-ndjson", size_bytes: 400, sha256: "1".repeat(64), created_at: "2026-08-14T11:01:30Z", metadata: { trace_id: "trace-id", first_sequence: 1, last_sequence: 3, event_count: 3, completed: false } },
+      { id: "trace-2", kind: "execution_trace", ticket_id: "APT-42", node_run_id: "implementation-run", filename: "implementation-run.000004-000007.herdr-trace.jsonl", content_type: "application/x-ndjson", size_bytes: 500, sha256: "2".repeat(64), created_at: "2026-08-14T11:05:00Z", metadata: { trace_id: "trace-id", first_sequence: 4, last_sequence: 7, event_count: 4, completed: true } },
+    ];
 
     render(<App />);
     fireEvent.click(await screen.findByRole("button", { name: /UI ticket/i }));
@@ -590,6 +600,13 @@ describe("operator UI", () => {
     expect(within(dialog).getByText("Review the pull request.")).toBeInTheDocument();
     expect(within(dialog).getByText("Implementation transcript")).toBeInTheDocument();
     expect(within(dialog).getByText(/Provenance ·/)).toBeInTheDocument();
+    expect(within(dialog).getByText("27.4K")).toBeInTheDocument();
+    expect(within(dialog).getByText("$1.25")).toBeInTheDocument();
+    expect(within(dialog).getByText("claude-opus-4-8")).toBeInTheDocument();
+    expect(within(dialog).getByText(/Anthropic · High Reasoning/)).toBeInTheDocument();
+    expect(within(dialog).getByText(/7 events · 2 chunks/)).toBeInTheDocument();
+    expect(within(dialog).getAllByText(/Herdr operational trace/)).toHaveLength(1);
+    expect(within(dialog).getByText("2 items")).toBeInTheDocument();
     fireEvent.click(within(dialog).getByRole("button", { name: "Close" }));
     expect(screen.queryByRole("dialog", { name: "Workflow node details: Implementation" })).not.toBeInTheDocument();
   });
@@ -1140,6 +1157,37 @@ describe("operator UI", () => {
     await waitFor(() => expect(fetch).toHaveBeenCalledWith("/api/workflows/standard-delivery", expect.objectContaining({
       method: "PUT", body: expect.stringContaining("Write specification"),
     })));
+  });
+
+  it("highlights taken workflow routes and can hide untaken alternate routes", async () => {
+    current.frontmatter.workflow.node_runs = [{
+      id: "review-repair", workflow_id: "standard-delivery", workflow_revision: "workflow-r1", node_id: "review", node_type: "agent",
+      visit: 1, attempt: 1, status: "completed", outcome: "changes_requested", summary: "Implementation needs repair.", handoff: null,
+      started_at: "2026-08-14T11:55:00Z", completed_at: "2026-08-14T12:00:00Z", lease_id: "review-lease", provider: "codex",
+      telemetry: null, timing: { active_ms: 300_000, quota_paused_ms: 0, human_wait_ms: 0, external_wait_ms: 0, state: "active", last_accounted_at: null, pause_limit_id: null, pause_until: null },
+    }];
+
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: /UI ticket/i }));
+
+    const workflow = await screen.findByRole("region", { name: "Ticket workflow" });
+    const graph = within(workflow).getByLabelText("Workflow graph");
+    const takenRepair = () => graph.querySelector('.factory-connector[data-source="review"][data-target="implementation"]');
+    expect(takenRepair()).toHaveClass("taken", "loop");
+    expect(takenRepair()?.querySelector(".route-glow")).toBeInTheDocument();
+    expect(takenRepair()?.querySelector(".route-line")).toBeInTheDocument();
+    expect(graph.querySelector('[data-node="implementation"]')).toHaveClass("current");
+    expect(graph.querySelector('.factory-connector[data-source="specification-approval"][data-target="specification"]')).toBeInTheDocument();
+
+    fireEvent.click(within(workflow).getByRole("button", { name: "Taken + next" }));
+
+    expect(takenRepair()).toHaveClass("taken");
+    expect(graph.querySelector('.factory-connector[data-source="implementation"][data-target="review"]')).toHaveClass("expected");
+    expect(graph.querySelector('.factory-connector[data-source="specification"][data-target="specification-approval"]')).not.toBeInTheDocument();
+    expect(graph.querySelector('.factory-connector[data-source="specification-approval"][data-target="specification"]')).not.toBeInTheDocument();
+
+    fireEvent.click(within(workflow).getByRole("button", { name: "All routes" }));
+    expect(graph.querySelector('.factory-connector[data-source="specification-approval"][data-target="specification"]')).toBeInTheDocument();
   });
 
   it("routes dense workflow feedback through local and reusable side lanes without extending the canvas per loop", async () => {
