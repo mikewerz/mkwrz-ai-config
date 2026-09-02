@@ -58,6 +58,9 @@ Node 22.12 or newer is required by the applications under test.
   generated review-evidence publication, fake terminal callback, immutable run-start inputs in the execution manifest, completed node-run audit history, and automatic
   same-node recovery when the fake pane rejects the first prompt deliveries.
 - Fail-closed fake-Herdr startup and provider credential scrubbing.
+- Tracker-only demo traversal through a real workflow and Human Gate, including
+  simulated PR sidebar data but no Markdown ticket, Herdr scheduling, provider
+  runtime, GitHub request, or metric contribution.
 - Stable lease/artifact errors, artifact quotas, orphan diagnostics, recovery,
   retention garbage collection, and run-ledger hydration after restart.
 - Chromium smoke coverage for the production attention inbox, queue, ticket form,

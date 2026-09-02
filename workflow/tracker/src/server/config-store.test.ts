@@ -26,8 +26,18 @@ describe("TrackerConfigStore", () => {
       pricing: { estimate_missing_costs: true, models: [{ id: "openai-gpt-5-6-sol-standard-2026-08" }, { id: "anthropic-claude-opus-4-8-global-2026-08" }] },
       metrics: { human_day_rate_usd: 1_000, quota_account_aliases: {} },
       quality: { attributes: [] },
+      demo: { enabled: false, step_duration_seconds: 10 },
     });
     expect(await readFile(join(root, "tracker-config.yaml"), "utf8")).toContain("repositories: []");
+  });
+
+  it("persists bounded demo-mode timing", async () => {
+    const { store } = await createStore();
+    const current = await store.start();
+    const updated = await store.update({ ...current, demo: { enabled: true, step_duration_seconds: 12 } }, current.revision);
+    expect(updated.demo).toEqual({ enabled: true, step_duration_seconds: 12 });
+    await expect(store.update({ ...updated, demo: { enabled: true, step_duration_seconds: 0 } }, updated.revision)).rejects.toMatchObject({ status: 422 });
+    await expect(store.update({ ...updated, demo: { enabled: true, step_duration_seconds: 301 } }, updated.revision)).rejects.toMatchObject({ status: 422 });
   });
 
   it("persists editable pricing and the human day rate", async () => {

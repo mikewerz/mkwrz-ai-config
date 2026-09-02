@@ -198,6 +198,7 @@ function isInitialDraft(ticket: TicketFrontmatter): boolean {
 interface TicketDraft {
   id: string;
   autoId: boolean;
+  demo: boolean;
   title: string;
   description: string;
   priority: number;
@@ -213,7 +214,7 @@ interface TicketDraft {
 }
 
 const emptyDraft = (id = "AGENT-0001", autoId = true): TicketDraft => ({
-    id, autoId, title: "Describe the work", description: "# Goal\n\nDescribe the desired outcome.\n\n# Acceptance Criteria\n\n- Add an observable acceptance criterion.",
+    id, autoId, demo: false, title: "Describe the work", description: "# Goal\n\nDescribe the desired outcome.\n\n# Acceptance Criteria\n\n- Add an observable acceptance criterion.",
     priority: 0, estimatedHumanDays: null, labels: "",
     repositories: [{ id: "", primary: true }], jira: null, workflowId: "standard-delivery", workflowRevision: "", workflowInputs: {}, stageEnabled: {}, attachmentFiles: [],
 });
@@ -257,7 +258,7 @@ function draftFromTicket(ticket: TicketDetail): TicketDraft {
   const frontmatter = ticket.frontmatter;
   if (!frontmatter) return { ...emptyDraft(), description: ticket.markdown };
   return {
-    id: frontmatter.id, autoId: false, title: frontmatter.title,
+    id: frontmatter.id, autoId: false, demo: frontmatter.demo === true, title: frontmatter.title,
     description: descriptionFromBody(ticket.body),
     priority: frontmatter.priority, estimatedHumanDays: frontmatter.estimated_human_days ?? null, labels: frontmatter.labels.join(", "),
     repositories: frontmatter.repositories.map((repository) => ({ ...repository })), jira: frontmatter.jira,
@@ -366,7 +367,7 @@ function NextActionSummary({ ticket, workflow }: { ticket: TicketFrontmatter; wo
   else if (ticket.status === "waiting_approval" && current.type === "human_gate") {
     const approval = current.choices.find((choice) => choice.id === "approved" || /approve/i.test(choice.label)) ?? current.choices[0];
     parts = ["Waiting for you", current.name, targetFor(approval?.target) ?? "Choose a workflow path"];
-  } else if (ticket.status === "running") parts = [`${ticket.execution?.provider ? humanize(ticket.execution.provider) : "Supervisor"} working`, current.name, "Agent callback selects the next path"];
+  } else if (ticket.status === "running") parts = [ticket.demo ? "Demo simulator working" : `${ticket.execution?.provider ? humanize(ticket.execution.provider) : "Supervisor"} working`, current.name, ticket.demo ? "The configured showcase route runs next" : "Agent callback selects the next path"];
   else if (ticket.status === "ready") parts = ["Waiting for a supervisor", current.name, resolvedWorkflowProvider(ticket, current) ? `Starts with ${humanize(resolvedWorkflowProvider(ticket, current)!)} when capacity is available` : "Runs when capacity is available"];
   else if (ticket.status === "waiting_external") {
     const wait = Object.values(ticket.workflow.wait_states ?? {}).filter((candidate) => candidate.node_id === current.id).sort((left, right) => right.attempt - left.attempt || right.started_at.localeCompare(left.started_at))[0];
@@ -761,7 +762,7 @@ function SupervisorHealthPage({ supervisors, operations, githubObservationEnable
   </main>;
 }
 
-function ConfigurationPage({ config, quota, busy, tab, onTab, onSave, onRestoreDefaults }: { config: TrackerConfig | null; quota: QuotaReport | null; busy: boolean; tab: ConfigurationTab; onTab: (tab: ConfigurationTab) => void; onSave: (update: Pick<TrackerConfig, "providers" | "agent_profiles" | "pricing" | "metrics" | "quality" | "artifacts" | "repositories" | "jira" | "github">) => void; onRestoreDefaults: () => void }) {
+function ConfigurationPage({ config, quota, busy, tab, onTab, onSave, onRestoreDefaults, onClearDemos }: { config: TrackerConfig | null; quota: QuotaReport | null; busy: boolean; tab: ConfigurationTab; onTab: (tab: ConfigurationTab) => void; onSave: (update: Pick<TrackerConfig, "providers" | "agent_profiles" | "pricing" | "metrics" | "quality" | "artifacts" | "repositories" | "jira" | "github" | "demo">) => void; onRestoreDefaults: () => void; onClearDemos: () => void }) {
   const [enabledProviders, setEnabledProviders] = useState<WorkProvider[]>(config?.providers?.enabled ?? ALL_WORK_PROVIDERS);
   const [repositories, setRepositories] = useState<RepositoryConfig[]>(config?.repositories ?? []);
   const [jira, setJira] = useState(config?.jira ?? { enabled: false, site_url: "", project_key: "", issue_type: "Task" });
@@ -770,6 +771,7 @@ function ConfigurationPage({ config, quota, busy, tab, onTab, onSave, onRestoreD
   const [metrics, setMetrics] = useState(config?.metrics ?? { human_day_rate_usd: 1_000, quota_account_aliases: {} });
   const [quality, setQuality] = useState(config?.quality ?? { attributes: [] });
   const [artifacts, setArtifacts] = useState(config?.artifacts ?? { max_total_bytes: 50 * 1024 ** 3, max_ticket_bytes: 5 * 1024 ** 3, orphan_grace_hours: 24, retention_days: 365, auto_gc_enabled: true, gc_interval_minutes: 60 });
+  const [demo, setDemo] = useState(config?.demo ?? { enabled: false, step_duration_seconds: 10 });
   const [agentProfiles, setAgentProfiles] = useState(config?.agent_profiles ?? {
     default: "claude",
     profiles: [
@@ -786,6 +788,7 @@ function ConfigurationPage({ config, quota, busy, tab, onTab, onSave, onRestoreD
     setMetrics(source?.metrics ?? { human_day_rate_usd: 1_000, quota_account_aliases: {} });
     setQuality(source?.quality ?? { attributes: [] });
     setArtifacts(source?.artifacts ?? { max_total_bytes: 50 * 1024 ** 3, max_ticket_bytes: 5 * 1024 ** 3, orphan_grace_hours: 24, retention_days: 365, auto_gc_enabled: true, gc_interval_minutes: 60 });
+    setDemo(source?.demo ?? { enabled: false, step_duration_seconds: 10 });
     setAgentProfiles(source?.agent_profiles ?? { default: "claude", profiles: [{ id: "claude", label: "Claude Opus", provider: "claude", model: "claude-opus-4-8", reasoning: "high" }, { id: "codex", label: "Codex Sol", provider: "codex", model: "gpt-5.6-sol", reasoning: "high" }] });
   };
   useEffect(() => { applyConfig(config); }, [config?.revision]);
@@ -810,6 +813,7 @@ function ConfigurationPage({ config, quota, busy, tab, onTab, onSave, onRestoreD
   if (quality.attributes.some((attribute) => attribute.minimum !== null && attribute.maximum !== null && attribute.minimum > attribute.maximum)) errors.push("Quality attribute minimums cannot exceed maximums.");
   if (!Number.isSafeInteger(artifacts.max_total_bytes) || !Number.isSafeInteger(artifacts.max_ticket_bytes) || artifacts.max_ticket_bytes < 1024 ** 2 || artifacts.max_total_bytes < artifacts.max_ticket_bytes) errors.push("Artifact quotas must be whole bytes, at least 1 MiB, with the total quota no smaller than the per-ticket quota.");
   if (![artifacts.orphan_grace_hours, artifacts.retention_days, artifacts.gc_interval_minutes].every((value) => Number.isSafeInteger(value) && value > 0)) errors.push("Artifact grace, retention, and maintenance intervals must be positive whole numbers.");
+  if (!Number.isInteger(demo.step_duration_seconds) || demo.step_duration_seconds < 1 || demo.step_duration_seconds > 300) errors.push("Demo step duration must be a whole number between 1 and 300 seconds.");
   const update = (index: number, patch: Partial<RepositoryConfig>) => setRepositories((current) => current.map((repository, candidate) => candidate === index ? { ...repository, ...patch } : repository));
   const toggleProvider = (provider: WorkProvider, enabled: boolean) => setEnabledProviders((current) => enabled
     ? ALL_WORK_PROVIDERS.filter((candidate) => candidate === provider || current.includes(candidate))
@@ -827,7 +831,7 @@ function ConfigurationPage({ config, quota, busy, tab, onTab, onSave, onRestoreD
     return { ...current, quota_account_aliases };
   });
   const savePayload = {
-    providers: { enabled: enabledProviders }, agent_profiles: agentProfiles, pricing, metrics, quality, artifacts,
+    providers: { enabled: enabledProviders }, agent_profiles: agentProfiles, pricing, metrics, quality, artifacts, demo,
     repositories: repositories.map((repository) => ({ id: repository.id.trim(), url: repository.url.trim() })),
     jira: { ...jira, site_url: jira.site_url.replace(/\/$/, ""), project_key: jira.project_key.trim(), issue_type: jira.issue_type.trim() }, github,
   };
@@ -836,6 +840,7 @@ function ConfigurationPage({ config, quota, busy, tab, onTab, onSave, onRestoreD
     agent_profiles: config.agent_profiles ?? { default: "claude", profiles: [{ id: "claude", label: "Claude Opus", provider: "claude" as const, model: "claude-opus-4-8", reasoning: "high" }, { id: "codex", label: "Codex Sol", provider: "codex" as const, model: "gpt-5.6-sol", reasoning: "high" }] },
     pricing: config.pricing ?? { estimate_missing_costs: true, models: [] }, metrics: config.metrics ?? { human_day_rate_usd: 1_000, quota_account_aliases: {} }, quality: config.quality ?? { attributes: [] },
     artifacts: config.artifacts ?? { max_total_bytes: 50 * 1024 ** 3, max_ticket_bytes: 5 * 1024 ** 3, orphan_grace_hours: 24, retention_days: 365, auto_gc_enabled: true, gc_interval_minutes: 60 },
+    demo: config.demo ?? { enabled: false, step_duration_seconds: 10 },
     repositories: (config.repositories ?? []).map((repository) => ({ id: repository.id.trim(), url: repository.url.trim() })),
     jira: { ...(config.jira ?? { enabled: false, site_url: "", project_key: "", issue_type: "Task" }), site_url: (config.jira?.site_url ?? "").replace(/\/$/, ""), project_key: (config.jira?.project_key ?? "").trim(), issue_type: (config.jira?.issue_type ?? "Task").trim() },
     github: config.github ?? { observation_enabled: false, observation_interval_minutes: 30, ignored_logins: [] },
@@ -928,6 +933,10 @@ function ConfigurationPage({ config, quota, busy, tab, onTab, onSave, onRestoreD
       <div className="field-row"><label>Interval (minutes)<input aria-label="GitHub observation interval" type="number" min="1" value={github.observation_interval_minutes} onChange={(event) => setGithub({ ...github, observation_interval_minutes: Number(event.target.value) })} /></label><label>Ignored GitHub logins<input aria-label="Ignored GitHub logins" value={github.ignored_logins.join(", ")} onChange={(event) => setGithub({ ...github, ignored_logins: event.target.value.split(",").map((item) => item.trim()).filter(Boolean) })} /></label></div>
       </>}
       {tab === "maintenance" && <>
+      <div className="section-heading"><div><span>Presentation environment</span><h2>Demo mode</h2></div><button className="button-secondary" disabled={busy} onClick={onClearDemos}>Clear demo tickets</button></div>
+      <label className="toggle"><input aria-label="Enable demo mode" type="checkbox" checked={demo.enabled} onChange={(event) => setDemo({ ...demo, enabled: event.target.checked })} /><span><strong>Enable tracker-only demo tickets</strong><small>DEMO-xxxx tickets exist only in this tracker process, never invoke providers or integrations, and are excluded from factory metrics.</small></span></label>
+      <div className="field-row"><label>Simulated work duration (seconds)<input aria-label="Demo step duration" type="number" min="1" max="300" step="1" value={demo.step_duration_seconds} onChange={(event) => setDemo({ ...demo, step_duration_seconds: Number(event.target.value) })} /></label></div>
+      <p className="config-help">Agent, Script, Checkpoint, and Restore nodes use this delay. Human gates always wait for a real operator choice. Disabling demo mode immediately clears all in-memory demo tickets.</p>
       <div className="section-heading"><div><span>Built-in artifacts</span><h2>Restore defaults</h2></div><button className="button-danger" disabled={busy} onClick={onRestoreDefaults}>Restore prompts & workflows</button></div><p className="config-help">Custom artifacts are preserved. Built-in prompts and workflows return to their shipped content revision; tickets pinned to other revisions do not change.</p>
       <div className="maintenance-note"><strong>Credentials are not stored here</strong><p>JIRA_EMAIL, JIRA_API_TOKEN, and GITHUB_TOKEN remain environment variables.</p></div>
       </>}
@@ -1172,21 +1181,21 @@ function TicketEditor({ draft, setDraft, existing, busy, onSave, onCancel, onRea
     action();
   };
   return <div className="editor-page">
-    <div className="issue-heading"><div><span className="issue-key">{existing ? draft.id : "New ticket"}</span><h1>{existing ? "Edit work ticket" : "Create work ticket"}</h1><p>Core fields are editable while pending. A live ticket's description can still be updated with guidance or a workflow restart.</p></div></div>
+    <div className="issue-heading"><div><span className="issue-key">{existing ? draft.id : draft.demo ? "New demo ticket" : "New ticket"}</span><h1>{existing ? "Edit work ticket" : draft.demo ? "Create tracker-only demo" : "Create work ticket"}</h1><p>{draft.demo ? "This ticket runs only in tracker memory. It will not invoke agents, scripts, repositories, integrations, or metrics." : "Core fields are editable while pending. A live ticket's description can still be updated with guidance or a workflow restart."}</p></div></div>
     {showValidation && validationErrors.length > 0 && <div className="draft-validation" role="alert"><strong>Finish these fields before saving</strong><ul>{validationErrors.map((validationError) => <li key={validationError}>{validationError}</li>)}</ul></div>}
     <div className="form-grid">
       <section className="form-card form-main">
         <label>Title<input aria-label="Title" value={draft.title} onChange={(event) => update("title", event.target.value)} /></label>
         <label>Ticket ID <span>{existing ? "Ticket IDs cannot be changed after creation" : draft.jira ? "Imported from Jira" : draft.autoId ? "Suggested automatically; edit to use a custom ID" : "Custom ticket ID"}</span><input aria-label="Ticket ID" disabled={existing || draft.jira !== null} value={draft.id} onChange={(event) => setDraft((current) => ({ ...current, id: event.target.value, autoId: false }))} /></label>
         <label>Description <span>Markdown supported</span><textarea className="description-editor" aria-label="Description" value={draft.description} onChange={(event) => update("description", event.target.value)} /></label>
-        <div className="ticket-attachments-editor">
+        {!draft.demo && <div className="ticket-attachments-editor">
           <div><strong>Attachments</strong><span>Images, documents, logs, and other supporting files · 25 MB each</span></div>
           <label className="attachment-picker"><input aria-label="Ticket attachments" type="file" multiple onChange={(event) => { const files = Array.from(event.target.files ?? []); update("attachmentFiles", [...draft.attachmentFiles, ...files]); event.target.value = ""; }} /><span>＋ Choose files</span></label>
           {(existingAttachments.length > 0 || draft.attachmentFiles.length > 0) && <div className="attachment-edit-list">
             {existingAttachments.map((attachment) => <div key={attachment.id}><span><strong>{attachment.filename}</strong><small>{fileSize(attachment.size_bytes)}</small></span>{onRemoveAttachment && <button type="button" className="icon-button" aria-label={`Remove ${attachment.filename}`} disabled={busy} onClick={() => onRemoveAttachment(attachment.id)}>×</button>}</div>)}
             {draft.attachmentFiles.map((file, index) => <div key={`${file.name}-${file.lastModified}-${index}`}><span><strong>{file.name}</strong><small>{fileSize(file.size)} · uploads when saved</small></span><button type="button" className="icon-button" aria-label={`Remove queued ${file.name}`} onClick={() => update("attachmentFiles", draft.attachmentFiles.filter((_, candidate) => candidate !== index))}>×</button></div>)}
           </div>}
-        </div>
+        </div>}
       </section>
       <aside className="form-card form-properties">
         <h2>Work settings</h2>
@@ -1211,7 +1220,7 @@ function TicketEditor({ draft, setDraft, existing, busy, onSave, onCancel, onRea
         <datalist id="configured-repositories">{repositories?.map((repository) => <option key={repository.id} value={repository.id}>{repository.url}</option>)}</datalist>
       </section>
     </div>
-    <div className="sticky-actions"><button className="button-secondary" onClick={onCancel}>Cancel</button>{existing && onCustomizeWorkflow && <button className="button-secondary" disabled={busy || readyDisabled} onClick={onCustomizeWorkflow}>Customize workflow</button>}{existing && onMigrateWorkflow && <button className="button-secondary" disabled={busy || readyDisabled} onClick={onMigrateWorkflow}>Pin workflow revision</button>}<button className="button-secondary" disabled={busy} onClick={() => attempt(onSave)}>{existing ? "Save ticket" : "Create ticket"}</button>{existing && onReady && <button className="button-primary" title={readyDisabled ? "Save changes before marking ready" : undefined} disabled={busy || readyDisabled} onClick={() => attempt(onReady)}>Mark ready</button>}</div>
+    <div className="sticky-actions"><button className="button-secondary" onClick={onCancel}>Cancel</button>{existing && onCustomizeWorkflow && <button className="button-secondary" disabled={busy || readyDisabled} onClick={onCustomizeWorkflow}>Customize workflow</button>}{existing && onMigrateWorkflow && <button className="button-secondary" disabled={busy || readyDisabled} onClick={onMigrateWorkflow}>Pin workflow revision</button>}<button className="button-secondary" disabled={busy} onClick={() => attempt(onSave)}>{existing ? "Save ticket" : draft.demo ? "Create demo" : "Create ticket"}</button>{existing && onReady && <button className="button-primary" title={readyDisabled ? "Save changes before marking ready" : undefined} disabled={busy || readyDisabled} onClick={() => attempt(onReady)}>Mark ready</button>}</div>
   </div>;
 }
 
@@ -1418,8 +1427,13 @@ function ExecutionRecap({ ticket, workflow, now }: { ticket: TicketFrontmatter; 
     <div className="section-heading"><div><span>Completed workflow</span><h2>Execution recap</h2><p>A compact summary derived from the immutable node-run ledger and ticket artifacts.</p></div><StatusPill value={productionResult === "unassessed" ? "pending" : productionResult} /></div>
     <div className="recap-metrics"><div><span>Elapsed</span><strong>{duration(elapsed)}</strong></div><div><span>Uncached input</span><strong>{tokenCount(usage?.input_tokens)}</strong><small>{tokenRuns.length}/{agentRuns.length} executed agent runs</small></div><div><span>Cached input</span><strong>{tokenCount(usage?.cached_input_tokens)}</strong></div><div><span>Cache write</span><strong>{tokenCount(usage?.cache_write_input_tokens)}</strong></div><div><span>Output tokens</span><strong>{tokenCount(usage?.output_tokens)}</strong></div><div><span>Reasoning output</span><strong>{tokenCount(usage?.reasoning_output_tokens)}</strong></div><div><span>{costLabel(costRuns.map((run) => run.telemetry!.latest.cost.kind))}</span><strong>{costRuns.length ? usd(cost) : "Unavailable"}</strong><small>{costRuns.length}/{agentRuns.length} executed agent runs</small></div><div><span>Provenance coverage</span><strong>{provenanceAgentRuns}/{agentRuns.length}</strong><small>Native {nativeAgentRuns.size}/{agentRuns.length} · Herdr {herdrAgentRuns.size}/{agentRuns.length}</small></div><div><span>Interventions</span><strong>{interventions}</strong><small>{ticket.questions.length} questions · {humanGates} gates · {operationalInterventions} operational</small></div></div>
     <div className="recap-path"><span>Path taken</span><div>{runs.map((run, index) => <React.Fragment key={run.id}><span className={`recap-node recap-${run.status}`}>{nodeName(run.node_id)}<small>{run.outcome ? humanize(run.outcome) : humanize(run.status)}</small></span>{index < runs.length - 1 && <i aria-hidden="true">→</i>}</React.Fragment>)}</div></div>
-    <div className="recap-columns"><div><span>Pull requests</span>{ticket.pull_requests.length ? ticket.pull_requests.map((pr) => <a href={pr.url} target="_blank" rel="noreferrer" key={pr.url}>{pr.repository} · {pr.phase ? humanize(pr.phase) : "PR"} ↗</a>) : <small>No PRs were reported.</small>}</div><div><span>Important evidence</span>{importantArtifacts.length ? importantArtifacts.map((artifact) => <a href={api.artifactUrl(ticket.id, artifact.id)} target="_blank" rel="noreferrer" key={artifact.id}>{artifactTitle(artifact)} ↗</a>) : <small>No review artifacts were published.</small>}</div><div><span>Production</span><strong>{humanize(productionResult)}</strong>{ticket.production_assessment_note && <small>{ticket.production_assessment_note}</small>}</div></div>
+    <div className="recap-columns"><div><span>Pull requests</span>{ticket.pull_requests.length ? ticket.pull_requests.map((pr) => <PullRequestLink key={pr.url} pullRequest={pr} demo={ticket.demo === true}>{pr.repository} · {pr.phase ? humanize(pr.phase) : "PR"}</PullRequestLink>) : <small>No PRs were reported.</small>}</div><div><span>Important evidence</span>{importantArtifacts.length ? importantArtifacts.map((artifact) => <a href={api.artifactUrl(ticket.id, artifact.id)} target="_blank" rel="noreferrer" key={artifact.id}>{artifactTitle(artifact)} ↗</a>) : <small>No review artifacts were published.</small>}</div><div><span>Production</span><strong>{humanize(productionResult)}</strong>{ticket.production_assessment_note && <small>{ticket.production_assessment_note}</small>}</div></div>
   </section>;
+}
+
+function PullRequestLink({ pullRequest, demo, children }: { pullRequest: TicketFrontmatter["pull_requests"][number]; demo: boolean; children: React.ReactNode }) {
+  if (demo) return <span className="simulated-pr-link" role="link" aria-disabled="true" title="Simulated demo pull request; no GitHub resource was created.">{children}<em>Demo</em></span>;
+  return <a href={pullRequest.url} target="_blank" rel="noreferrer">{children} ↗</a>;
 }
 
 function RuntimePanel({ execution, now }: { execution: Execution; now: number }) {
@@ -1490,16 +1504,18 @@ function ThemeSelector({ theme, onChange }: { theme: Theme; onChange: (theme: Th
   ><span aria-hidden="true">{option.mark}</span></button>)}</div>;
 }
 
-function TopNavigation({ view, attentionCount, onlineSupervisors, jiraEnabled, busy, theme, onView, onQueue, onNewTicket, onImportJira, onTheme }: {
+function TopNavigation({ view, attentionCount, onlineSupervisors, jiraEnabled, demoEnabled, busy, theme, onView, onQueue, onNewTicket, onNewDemoTicket, onImportJira, onTheme }: {
   view: AppView;
   attentionCount: number;
   onlineSupervisors: number;
   jiraEnabled: boolean;
+  demoEnabled: boolean;
   busy: boolean;
   theme: Theme;
   onView: (view: AppView) => void;
   onQueue: () => void;
   onNewTicket: () => void;
+  onNewDemoTicket: () => void;
   onImportJira: () => void;
   onTheme: (theme: Theme) => void;
 }) {
@@ -1535,6 +1551,7 @@ function TopNavigation({ view, attentionCount, onlineSupervisors, jiraEnabled, b
     <div className="topbar-actions">
       <ThemeSelector theme={theme} onChange={onTheme} />
       {!compact && jiraEnabled && <button className="button-secondary topbar-jira" disabled={busy} onClick={onImportJira}>Import Jira</button>}
+      {demoEnabled && <button className="button-secondary topbar-demo-ticket" disabled={busy} onClick={onNewDemoTicket}>Demo ticket</button>}
       <button className="button-primary topbar-new-ticket" aria-label="New ticket" onClick={onNewTicket}><span aria-hidden="true">＋</span><strong>New ticket</strong></button>
     </div>
   </header>;
@@ -2838,7 +2855,7 @@ function QueuePage({ tickets, includeArchived, setIncludeArchived, now, onOpen, 
   return <main className="queue-page">
     <div className="health-heading"><div><span>Work management</span><h1>Ticket queue</h1><p>Most recently updated tickets appear first.</p></div><div className="health-summary"><strong>{filtered.length}</strong><span>visible tickets</span></div></div>
     <section className="queue-toolbar"><label>Search<input aria-label="Search tickets" placeholder="ID, title, label, repository…" value={query} onChange={(event) => setQuery(event.target.value)} /></label><label>Status<select aria-label="Queue status" value={status} onChange={(event) => setStatus(event.target.value)}><option value="">All states</option>{["blocked", "failed", "waiting_approval", "running", "waiting_external", "ready", "pending", "completed", "cancelled"].map((value) => <option key={value} value={value}>{humanize(value)}</option>)}</select></label><label className="toggle queue-archive-toggle"><input type="checkbox" checked={includeArchived} onChange={(event) => setIncludeArchived(event.target.checked)} /><span><strong>Archived</strong><small>Include archived tickets</small></span></label></section>
-    <section className="queue-table-card"><table className="queue-table"><thead><tr><th>Ticket</th><th>Ticket state</th><th>Workflow state</th><th>Executor</th><th>Repositories</th><th title="Higher numbers are scheduled first">Priority</th><th>Updated</th></tr></thead><tbody>{filtered.map((ticket) => <tr key={ticket.id} className={!ticket.valid ? "invalid" : ""} onClick={() => onOpen(ticket.id)}><td><button onClick={() => onOpen(ticket.id)}><strong>{ticket.id}</strong><span>{ticket.title}</span></button>{(ticket.claim_blockers ?? []).map((blocker) => <small key={`${blocker.hostname}:${blocker.ticket_id}`}>{blocker.repositories.join(", ")} blocked by {blocker.ticket_id} on {blocker.hostname}</small>)}</td><td><StatusPill value={ticket.valid ? ticket.status : "invalid"} subtle />{ticket.archived_at && <small>Archived</small>}</td><td><strong>{ticket.workflow_stage_name ?? humanize(ticket.phase)}</strong><small>{ticket.workflow_node_name ?? "Workflow unavailable"}</small></td><td><span>{ticket.provider ? humanize(ticket.provider) : "—"}</span><small>{ticket.assigned_supervisor ?? "Unassigned"}</small></td><td>{(ticket.repositories ?? []).join(", ") || "—"}</td><td title="Higher numbers are scheduled first">Priority {ticket.priority}</td><td>{timeAgo(ticket.updated_at || ticket.created_at, now)}</td></tr>)}</tbody></table>{!filtered.length && (tickets.length === 0 && !normalizedQuery && !status ? <div className="queue-empty-state"><h2>No tickets yet</h2><p>Create the first work ticket to begin.</p><button className="button-primary" onClick={onCreate}>＋ Create ticket</button></div> : <div className="queue-empty-state"><h2>No tickets match this view</h2><p>Clear the search or status filter, or include archived tickets.</p></div>)}</section>
+    <section className="queue-table-card"><table className="queue-table"><thead><tr><th>Ticket</th><th>Ticket state</th><th>Workflow state</th><th>Executor</th><th>Repositories</th><th title="Higher numbers are scheduled first">Priority</th><th>Updated</th></tr></thead><tbody>{filtered.map((ticket) => <tr key={ticket.id} className={!ticket.valid ? "invalid" : ticket.demo ? "demo-ticket-row" : ""} onClick={() => onOpen(ticket.id)}><td><button onClick={() => onOpen(ticket.id)}><strong>{ticket.id}{ticket.demo && <em className="demo-chip">Demo</em>}</strong><span>{ticket.title}</span></button>{(ticket.claim_blockers ?? []).map((blocker) => <small key={`${blocker.hostname}:${blocker.ticket_id}`}>{blocker.repositories.join(", ")} blocked by {blocker.ticket_id} on {blocker.hostname}</small>)}</td><td><StatusPill value={ticket.valid ? ticket.status : "invalid"} subtle />{ticket.archived_at && <small>Archived</small>}</td><td><strong>{ticket.workflow_stage_name ?? humanize(ticket.phase)}</strong><small>{ticket.workflow_node_name ?? "Workflow unavailable"}</small></td><td><span>{ticket.demo ? "Simulator" : ticket.provider ? humanize(ticket.provider) : "—"}</span><small>{ticket.demo ? "No execution" : ticket.assigned_supervisor ?? "Unassigned"}</small></td><td>{(ticket.repositories ?? []).join(", ") || "—"}</td><td title="Higher numbers are scheduled first">Priority {ticket.priority}</td><td>{timeAgo(ticket.updated_at || ticket.created_at, now)}</td></tr>)}</tbody></table>{!filtered.length && (tickets.length === 0 && !normalizedQuery && !status ? <div className="queue-empty-state"><h2>No tickets yet</h2><p>Create the first work ticket to begin.</p><button className="button-primary" onClick={onCreate}>＋ Create ticket</button></div> : <div className="queue-empty-state"><h2>No tickets match this view</h2><p>Clear the search or status filter, or include archived tickets.</p></div>)}</section>
   </main>;
 }
 
@@ -2955,7 +2972,7 @@ function AppContent() {
       next = creating
         ? await api.create(ticketMarkdown(draft), draft.autoId, draft.workflowId, draft.workflowRevision || undefined, draft.workflowInputs, draft.stageEnabled)
         : await api.edit(selected!, selected!.valid ? ticketMarkdown(draft, selected!) : rawDraft);
-      for (const file of draft.attachmentFiles) { next = await api.uploadAttachment(next, file); uploadedFiles += 1; }
+      for (const file of draft.demo ? [] : draft.attachmentFiles) { next = await api.uploadAttachment(next, file); uploadedFiles += 1; }
       setSelected(next); setDraft(draftFromTicket(next)); setRawDraft(next.markdown); setDirty(false); setComposer(null); setCreating(false);
       navigate(ticketPath(next.id), { replace: creating });
       await refresh();
@@ -3057,10 +3074,13 @@ function AppContent() {
     void run(() => api.action(selected, "decide", { decision: choice.id, ...comment }));
   };
 
-  const saveConfig = async (update: Pick<TrackerConfig, "providers" | "agent_profiles" | "pricing" | "metrics" | "quality" | "artifacts" | "repositories" | "jira" | "github">) => {
+  const saveConfig = async (update: Pick<TrackerConfig, "providers" | "agent_profiles" | "pricing" | "metrics" | "quality" | "artifacts" | "repositories" | "jira" | "github" | "demo">) => {
     if (!config) return;
     setBusy(true); setError(null);
-    try { const updated = await api.updateConfig(config, update); setConfig(updated.config); setQuotaReport(updated.quota ?? null); }
+    try {
+      const updated = await api.updateConfig(config, update); setConfig(updated.config); setQuotaReport(updated.quota ?? null);
+      if (!updated.config.demo.enabled && selected?.frontmatter?.demo) showQueue();
+    }
     catch (caught) { setError((caught as Error).message); }
     finally { setBusy(false); }
   };
@@ -3071,6 +3091,18 @@ function AppContent() {
     try {
       const restored = await api.restoreDefaults({ prompts: true, workflows: true });
       setPrompts(restored.prompts); setWorkflows(restored.workflows); await refresh();
+    } catch (caught) { setError((caught as Error).message); }
+    finally { setBusy(false); }
+  };
+
+  const clearDemoTickets = async () => {
+    if (!window.confirm("Clear every in-memory demo ticket? This does not affect durable tickets.")) return;
+    setBusy(true); setError(null);
+    try {
+      const result = await api.clearDemoTickets();
+      if (selected?.frontmatter?.demo) showQueue();
+      await refresh();
+      window.alert(`Cleared ${result.cleared} demo ticket${result.cleared === 1 ? "" : "s"}.`);
     } catch (caught) { setError((caught as Error).message); }
     finally { setBusy(false); }
   };
@@ -3088,6 +3120,22 @@ function AppContent() {
         stageEnabled: Object.fromEntries(release?.definition.stages.map((stage) => [stage.id, stage.skippable ? stage.default_enabled : true]) ?? []),
       }); setDirty(false);
     } catch (caught) { setError((caught as Error).message); }
+  };
+
+  const beginDemoTicket = async () => {
+    setError(null);
+    setCreating(true); setSelected(null);
+    navigate("/tickets/new");
+    try {
+      const next = await api.nextDemoId();
+      const initial = { ...emptyDraft(next.id, false), demo: true };
+      const workflowId = workflowReleases?.catalog.default_workflow_id ?? initial.workflowId;
+      const release = workflowReleases?.releases.find((item) => item.workflow_id === workflowId && item.is_default);
+      setDraft({ ...initial, workflowId, workflowRevision: release?.revision ?? "",
+        workflowInputs: Object.fromEntries(release?.definition.inputs.map((input) => [input.id, input.default]) ?? []),
+        stageEnabled: Object.fromEntries(release?.definition.stages.map((stage) => [stage.id, stage.skippable ? stage.default_enabled : true]) ?? []),
+      }); setDirty(false);
+    } catch (caught) { setCreating(false); setError((caught as Error).message); }
   };
 
   const beginJiraTicket = async () => {
@@ -3144,10 +3192,11 @@ function AppContent() {
     navigate("/queue"); setSelected(null); setCreating(false);
   };
   return <div className="app-shell">
-    <TopNavigation view={view} attentionCount={attentionCount} onlineSupervisors={supervisors.filter((item) => item.status === "online").length} jiraEnabled={Boolean(config?.jira?.enabled)} busy={busy} theme={theme} onView={(target) => navigate(viewPath(target))} onQueue={showQueue} onNewTicket={() => void beginLocalTicket()} onImportJira={() => void beginJiraTicket()} onTheme={setTheme} />
+    <TopNavigation view={view} attentionCount={attentionCount} onlineSupervisors={supervisors.filter((item) => item.status === "online").length} jiraEnabled={Boolean(config?.jira?.enabled)} demoEnabled={Boolean(config?.demo?.enabled)} busy={busy} theme={theme} onView={(target) => navigate(viewPath(target))} onQueue={showQueue} onNewTicket={() => void beginLocalTicket()} onNewDemoTicket={() => void beginDemoTicket()} onImportJira={() => void beginJiraTicket()} onTheme={setTheme} />
     {view === "tickets" && <AgentFleet agents={runtime} now={now} onOpen={(id) => void open(id)} />}
+    {config?.demo?.enabled && <div className="demo-mode-banner"><strong>Demo mode enabled</strong><span>DEMO-xxxx tickets are in-memory UI simulations and are excluded from metrics and external execution.</span></div>}
     {error && <div className="error" role="alert"><strong>Something needs attention</strong><span>{error}</span><button onClick={() => setError(null)}>×</button></div>}
-    {view === "attention" ? <AttentionPage tickets={tickets} now={now} onOpen={(id) => void open(id)} onChanged={refresh} onError={setError} /> : view === "intake" ? <IntakePage repositories={config?.repositories ?? []} workflows={workflows} onOpenTicket={(id) => void open(id)} onError={setError} /> : view === "metrics" ? <MetricsPage releases={workflowReleases} tab={route.metricsTab ?? "overview"} onTab={(tab) => navigate(`/metrics/${tab}`)} onError={setError} /> : view === "workflows" ? <WorkflowEditorPage workflows={workflows} releases={workflowReleases} prompts={prompts} agentProfiles={config?.agent_profiles} {...(route.workflowId ? { selectedWorkflowId: route.workflowId } : {})} onSelectWorkflow={(id) => navigate(`/workflows/${encodeURIComponent(id)}`)} onChanged={setWorkflows} onPromptsChanged={setPrompts} onReleasesChanged={setWorkflowReleases} onError={setError} /> : view === "prompts" ? <PromptEditorPage prompts={prompts} {...(route.promptName ? { selectedPromptName: route.promptName } : {})} onSelectPrompt={(name) => navigate(`/prompts/${encodeURIComponent(name)}`)} onUpdated={(prompt) => setPrompts((current) => [...current.filter((item) => item.name !== prompt.name), prompt])} onError={setError} /> : view === "configuration" ? <ConfigurationPage config={config} quota={quotaReport} busy={busy} tab={route.configurationTab ?? "general"} onTab={(tab) => navigate(`/configuration/${tab}`)} onSave={(update) => void saveConfig(update)} onRestoreDefaults={() => void restoreDefaults()} /> : view === "supervisors" ? <SupervisorHealthPage supervisors={supervisors} operations={operations} githubObservationEnabled={Boolean(config?.github?.observation_enabled)} now={now} onOpenTicket={(id) => void open(id)} /> : !selected && !creating ? <QueuePage tickets={tickets} includeArchived={includeArchived} setIncludeArchived={setIncludeArchived} now={now} onOpen={(id) => void open(id)} onCreate={() => void beginLocalTicket()} /> : <main className="dashboard-layout detail-only">
+    {view === "attention" ? <AttentionPage tickets={tickets} now={now} onOpen={(id) => void open(id)} onChanged={refresh} onError={setError} /> : view === "intake" ? <IntakePage repositories={config?.repositories ?? []} workflows={workflows} onOpenTicket={(id) => void open(id)} onError={setError} /> : view === "metrics" ? <MetricsPage releases={workflowReleases} tab={route.metricsTab ?? "overview"} onTab={(tab) => navigate(`/metrics/${tab}`)} onError={setError} /> : view === "workflows" ? <WorkflowEditorPage workflows={workflows} releases={workflowReleases} prompts={prompts} agentProfiles={config?.agent_profiles} {...(route.workflowId ? { selectedWorkflowId: route.workflowId } : {})} onSelectWorkflow={(id) => navigate(`/workflows/${encodeURIComponent(id)}`)} onChanged={setWorkflows} onPromptsChanged={setPrompts} onReleasesChanged={setWorkflowReleases} onError={setError} /> : view === "prompts" ? <PromptEditorPage prompts={prompts} {...(route.promptName ? { selectedPromptName: route.promptName } : {})} onSelectPrompt={(name) => navigate(`/prompts/${encodeURIComponent(name)}`)} onUpdated={(prompt) => setPrompts((current) => [...current.filter((item) => item.name !== prompt.name), prompt])} onError={setError} /> : view === "configuration" ? <ConfigurationPage config={config} quota={quotaReport} busy={busy} tab={route.configurationTab ?? "general"} onTab={(tab) => navigate(`/configuration/${tab}`)} onSave={(update) => void saveConfig(update)} onRestoreDefaults={() => void restoreDefaults()} onClearDemos={() => void clearDemoTickets()} /> : view === "supervisors" ? <SupervisorHealthPage supervisors={supervisors} operations={operations} githubObservationEnabled={Boolean(config?.github?.observation_enabled)} now={now} onOpenTicket={(id) => void open(id)} /> : !selected && !creating ? <QueuePage tickets={tickets} includeArchived={includeArchived} setIncludeArchived={setIncludeArchived} now={now} onOpen={(id) => void open(id)} onCreate={() => void beginLocalTicket()} /> : <main className="dashboard-layout detail-only">
       <section className="ticket-workspace">
         {creating ? <TicketEditor draft={draft} setDraft={(value) => { setDirty(true); setDraft(value); }} existing={false} busy={busy} repositories={config?.repositories ?? []} workflows={workflows} {...(workflowReleases ? { workflowReleases } : {})} onSave={() => void save()} onCancel={showQueue} /> : selected ? !selected.valid ? <div className="invalid-editor">
           <div className="issue-heading"><div><span className="issue-key">Recovery editor</span><h1>{selected.relative_path}</h1><p>Repair the invalid Markdown before this ticket can be scheduled.</p></div></div>
@@ -3155,11 +3204,11 @@ function AppContent() {
           <textarea aria-label="Raw ticket Markdown" value={rawDraft} onChange={(event) => { setRawDraft(event.target.value); setDirty(true); }} />
           <div className="sticky-actions"><button className="button-primary" disabled={busy} onClick={() => void save()}>Save repaired ticket</button></div>
         </div> : frontmatter?.status === "pending" ? <TicketEditor draft={draft} setDraft={(value) => { setDirty(true); setDraft(value); }} existing busy={busy} repositories={config?.repositories ?? []} workflows={workflows} {...(workflowReleases ? { workflowReleases } : {})} existingAttachments={frontmatter.attachments} onRemoveAttachment={(id) => void removeAttachment(id)} onSave={() => void save()} onCancel={() => { setDraft(draftFromTicket(selected)); setDirty(false); }} onCustomizeWorkflow={() => void run(() => api.action(selected, "workflow/clone"))} onMigrateWorkflow={() => void migrateWorkflow()} onReady={() => void run(() => api.action(selected, "ready"))} readyDisabled={dirty} /> : frontmatter ? <div className="issue-page">
-          <div className="issue-heading"><div><span className="issue-key">{frontmatter.id} · {selected.relative_path}</span><h1>{frontmatter.title}</h1><div className="issue-chips"><span className="state-layer"><small>Ticket state</small><StatusPill value={frontmatter.status} label={`Ticket ${humanize(frontmatter.status)}`} /></span>{frontmatter.labels.map((label) => <span className="label-chip" key={label}>{label}</span>)}</div></div>
-            <div className="issue-actions">
+          <div className="issue-heading"><div><span className="issue-key">{frontmatter.id} · {selected.relative_path}</span><h1>{frontmatter.title}</h1><div className="issue-chips"><span className="state-layer"><small>Ticket state</small><StatusPill value={frontmatter.status} label={`Ticket ${humanize(frontmatter.status)}`} /></span>{frontmatter.demo && <span className="demo-chip">Tracker-only demo</span>}{frontmatter.labels.map((label) => <span className="label-chip" key={label}>{label}</span>)}</div></div>
+            {!frontmatter.demo && <div className="issue-actions">
               <ActionButton onClick={() => setComposer({ kind: "comment", text: "" })}>Add comment</ActionButton>
               <ActionButton primary onClick={() => setComposer({ kind: "guidance", text: "" })}>Guide agent</ActionButton>
-            </div>
+            </div>}
           </div>
           <WorkflowMap ticket={frontmatter} workflow={selectedWorkflow} />
           {costLimitPause && <section className="attention-banner cost-limit-pause"><strong>Node cost limit reached</strong><span>{currentWorkflowNode?.name} accumulated {usd(costLimitPause.observed_usd ?? currentNodeKnownCost)} against its {usd(costLimitPause.limit_usd ?? currentWorkflowNode?.max_cost_usd ?? 50)} limit. Publish a workflow revision with a higher limit, then migrate this ticket to that revision before continuing.</span></section>}
@@ -3183,22 +3232,24 @@ function AppContent() {
                   <div className="live-edit-actions"><button className="button-secondary" onClick={() => setDescriptionEdit(null)}>Cancel</button><button className="button-secondary" disabled={busy || !descriptionEdit.text.trim() || Boolean(frontmatter.execution?.interrupt_request)} onClick={() => void saveLiveDescription(false)}>Save and continue</button><button className="button-primary" disabled={busy || !descriptionEdit.text.trim() || Boolean(frontmatter.execution?.interrupt_request)} onClick={() => void saveLiveDescription(true)}>Save and restart</button></div>
                 </div> : <MarkdownContent markdown={descriptionFromBody(selected.body)} />}
               </section>
-              <TicketEvidence key={selected.id} ticket={selected} {...(selectedWorkflow ? { workflow: selectedWorkflow } : {})} busy={busy} now={now} onUpload={(files) => void uploadAttachments(files)} onRemoveAttachment={(id) => void removeAttachment(id)} onCreateCheckpoint={(nodeId) => void run(() => api.checkpointAction(selected, "create", nodeId))} onRestoreCheckpoint={(nodeId, checkpointId) => void run(() => api.checkpointAction(selected, "restore", nodeId, checkpointId))} />
+              {!frontmatter.demo && <TicketEvidence key={selected.id} ticket={selected} {...(selectedWorkflow ? { workflow: selectedWorkflow } : {})} busy={busy} now={now} onUpload={(files) => void uploadAttachments(files)} onRemoveAttachment={(id) => void removeAttachment(id)} onCreateCheckpoint={(nodeId) => void run(() => api.checkpointAction(selected, "create", nodeId))} onRestoreCheckpoint={(nodeId, checkpointId) => void run(() => api.checkpointAction(selected, "restore", nodeId, checkpointId))} />}
               <Timeline body={selected.body} />
             </div>
             <aside className="issue-sidebar">
               {frontmatter.execution && <RuntimePanel execution={frontmatter.execution} now={now} />}
-              <TicketUsage ticket={frontmatter} now={now} humanDayRate={config?.metrics?.human_day_rate_usd ?? 1_000} />
-              <TicketQuality ticket={frontmatter} />
-              {frontmatter.phase === "done" && frontmatter.status === "completed" && <ProductionAssessment ticket={frontmatter} busy={busy} onSave={(production_result, production_assessment_note) => void run(() => api.action(selected, "production-assessment", { production_result, production_assessment_note }))} onArchive={(production_result, production_assessment_note) => void run(() => api.action(selected, "archive", { production_result, production_assessment_note }))} />}
+              {frontmatter.demo ? <section className="side-card"><div className="section-heading"><div><span>Simulation</span><h2>No factory accounting</h2></div></div><p className="config-help">This tracker-only run records no tokens, cost, quality reports, artifacts, or provider runtime.</p></section> : <>
+                <TicketUsage ticket={frontmatter} now={now} humanDayRate={config?.metrics?.human_day_rate_usd ?? 1_000} />
+                <TicketQuality ticket={frontmatter} />
+              </>}
+              {!frontmatter.demo && frontmatter.phase === "done" && frontmatter.status === "completed" && <ProductionAssessment ticket={frontmatter} busy={busy} onSave={(production_result, production_assessment_note) => void run(() => api.action(selected, "production-assessment", { production_result, production_assessment_note }))} onArchive={(production_result, production_assessment_note) => void run(() => api.action(selected, "archive", { production_result, production_assessment_note }))} />}
               <section className="side-card"><div className="section-heading"><div><span>Ticket</span><h2>Details</h2></div></div><dl className="details-list">
                 <DetailRow label="Ticket state">{humanize(frontmatter.status)}</DetailRow>
                 {currentWorkflowNode ? <><DetailRow label="Current workflow node">{currentWorkflowNode.name}</DetailRow><DetailRow label="Workflow stage">{currentWorkflowStage?.name ?? humanize(currentWorkflowNode.stage)}</DetailRow><DetailRow label="Node type">{humanize(currentWorkflowNode.type)}</DetailRow><DetailRow label="Resolved agent provider">{currentProvider ? humanize(currentProvider) : "Not an agent node"}</DetailRow></> : <DetailRow label="Workflow state">Unavailable</DetailRow>}
                 {frontmatter.workflow_assignment && <DetailRow label="Workflow revision">{assignedRelease ? releaseDisplayLabel(assignedRelease) : `Revision v${frontmatter.workflow_assignment.version}`} · {humanize(frontmatter.workflow_assignment.selection)}</DetailRow>}
                 <DetailRow label="Ticket priority"><PriorityEditor value={frontmatter.priority} busy={busy} onSave={(priority) => void run(() => api.action(selected, "priority", { priority }))} /></DetailRow><DetailRow label="Updated">{timeAgo(frontmatter.updated_at, now)}</DetailRow>
-                <DetailRow label="Estimated human days"><HumanEstimateEditor value={frontmatter.estimated_human_days ?? null} busy={busy} onSave={(estimated_human_days) => void run(() => api.action(selected, "human-estimate", { estimated_human_days }))} /></DetailRow>
-                <DetailRow label="Supervisor">{frontmatter.assigned_supervisor ?? "Unassigned"}</DetailRow>
-                <DetailRow label="Supervisor host">{frontmatter.assigned_supervisor_host ?? "Unassigned"}</DetailRow>
+                <DetailRow label="Estimated human days">{frontmatter.demo ? "Not applicable" : <HumanEstimateEditor value={frontmatter.estimated_human_days ?? null} busy={busy} onSave={(estimated_human_days) => void run(() => api.action(selected, "human-estimate", { estimated_human_days }))} />}</DetailRow>
+                <DetailRow label="Supervisor">{frontmatter.demo ? "Demo simulator" : frontmatter.assigned_supervisor ?? "Unassigned"}</DetailRow>
+                <DetailRow label="Supervisor host">{frontmatter.demo ? "No external execution" : frontmatter.assigned_supervisor_host ?? "Unassigned"}</DetailRow>
                 {typeof frontmatter.metadata?.["intake.source_id"] === "string" && <DetailRow label="Intake origin">{String(frontmatter.metadata["intake.campaign_id"] ?? "campaign")} · {frontmatter.metadata["intake.source_id"] as string}</DetailRow>}
                 {typeof frontmatter.metadata?.["intake.parent_ticket_id"] === "string" && <DetailRow label="Parent ticket"><button className="link-button" onClick={() => void open(frontmatter.metadata!["intake.parent_ticket_id"] as string)}>{frontmatter.metadata["intake.parent_ticket_id"] as string}</button></DetailRow>}
                 {frontmatter.jira && <DetailRow label="Jira"><a href={frontmatter.jira.url} target="_blank" rel="noreferrer">{frontmatter.jira.key} ↗</a></DetailRow>}
@@ -3207,11 +3258,12 @@ function AppContent() {
               </dl></section>
               <section className="side-card"><div className="section-heading"><div><span>Scope</span><h2>Repositories & PRs</h2></div></div>{frontmatter.repositories.map((repository) => {
                 const prs = frontmatter.pull_requests.filter((candidate) => candidate.repository === repository.id);
-                return <div className="repo-item" key={repository.id}><div><strong>{repository.id}</strong>{repository.primary && <span>Primary</span>}</div>{prs.length ? <div>{prs.map((pr) => <a key={pr.url} href={pr.url} target="_blank" rel="noreferrer">Open {pr.phase ? humanize(pr.phase) : "draft"} PR ↗</a>)}</div> : <small>No PR reported</small>}</div>;
+                return <div className="repo-item" key={repository.id}><div><strong>{repository.id}</strong>{repository.primary && <span>Primary</span>}</div>{prs.length ? <div>{prs.map((pr) => <PullRequestLink key={pr.url} pullRequest={pr} demo={frontmatter.demo === true}>Open {frontmatter.demo ? "simulated " : ""}{pr.phase ? humanize(pr.phase) : "draft"} PR</PullRequestLink>)}</div> : <small>No PR reported</small>}</div>;
               })}</section>
               <AnsweredQuestions questions={frontmatter.questions ?? []} />
-              <AgentSessions ticket={frontmatter} {...(selectedWorkflow ? { workflow: selectedWorkflow } : {})} onReset={(key) => { if (window.confirm(`Reset ${humanize(key)}? The next visit will start a new Herdr conversation.`)) void run(() => api.resetConversation(selected, key)); }} />
-              <section className="side-card action-card"><div className="section-heading"><div><span>Controls</span><h2>State actions</h2></div></div><div className="control-buttons">
+              {!frontmatter.demo && <AgentSessions ticket={frontmatter} {...(selectedWorkflow ? { workflow: selectedWorkflow } : {})} onReset={(key) => { if (window.confirm(`Reset ${humanize(key)}? The next visit will start a new Herdr conversation.`)) void run(() => api.resetConversation(selected, key)); }} />}
+              <section className="side-card action-card"><div className="section-heading"><div><span>Controls</span><h2>State actions</h2></div></div><div className="control-buttons">{frontmatter.demo ?
+                <ActionButton danger onClick={() => void run(() => api.action(selected, "cancel", { message: "Demo cancelled from the operator UI." }))}>Cancel demo</ActionButton> : <>
                 {frontmatter.status === "ready" && <ActionButton onClick={() => void run(() => api.action(selected, "draft"))}>Return to draft</ActionButton>}
                 {(frontmatter.status === "failed" || frontmatter.status === "blocked") && !costLimitPause && <ActionButton primary onClick={() => void run(() => api.action(selected, "retry"))}>Retry node</ActionButton>}
                 {frontmatter.status === "waiting_external" && <ActionButton primary onClick={() => void run(() => api.action(selected, "wake"))}>Check now</ActionButton>}
@@ -3226,6 +3278,7 @@ function AppContent() {
                 {frontmatter.status !== "completed" && frontmatter.status !== "failed" && <ActionButton danger onClick={() => void fail()}>Fail ticket</ActionButton>}
                 {frontmatter.assigned_supervisor && !frontmatter.execution && frontmatter.status !== "completed" && frontmatter.status !== "cancelled" && <ActionButton onClick={() => { if (window.confirm("Release this supervisor? The next eligible supervisor will start new agent conversations for this ticket.")) void run(() => api.action(selected, "release-supervisor")); }}>Release supervisor</ActionButton>}
                 {!frontmatter.archived_at && <ActionButton danger onClick={() => void run(() => api.action(selected, "cancel", { message: "Cancelled from the operator UI." }))}>Cancel ticket</ActionButton>}
+                </>}
               </div></section>
             </aside>
           </div>

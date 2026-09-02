@@ -184,7 +184,7 @@ describe("operator UI", () => {
     prompts = structuredClone(promptFixtures);
     workflows = [structuredClone(workflowFixture)];
     workflowReleases = { catalog: { version: 1, revision: 1, updated_at: "2026-08-14T12:00:00Z", default_workflow_id: "standard-delivery", workflows: { "standard-delivery": { default_revision: "workflow-r1" } } }, releases: [{ workflow_id: "standard-delivery", revision: "workflow-r1", version: 1, label: "Initial release", status: "active", published_at: "2026-08-14T12:00:00Z", parent_revision: null, is_default: true, definition: structuredClone(workflowDefinition) }] };
-    trackerConfig = { version: 1, revision: 2, updated_at: "2026-08-14T12:00:00Z", tickets: { id_prefix: "AGENT", next_number: 1 }, providers: { enabled: ["claude", "codex"] }, agent_profiles: { default: "default", profiles: [{ id: "default", label: "Default", provider: "claude", model: "claude-opus", reasoning: "high" }, { id: "review", label: "Independent review", provider: "codex", model: "gpt-5.6-sol", reasoning: "high" }] }, repositories: [{ id: "demo", url: "git@github.com:example/demo.git" }], jira: { enabled: false, site_url: "", project_key: "", issue_type: "Task" }, github: { observation_enabled: false, observation_interval_minutes: 30, ignored_logins: [] }, pricing: { estimate_missing_costs: true, models: [{ id: "codex-gpt-5.6-sol", provider: "codex", model: "gpt-5.6-sol", input_per_million_usd: 5, cached_input_per_million_usd: 0.5, cache_write_input_per_million_usd: 6.25, output_per_million_usd: 30, source_url: "https://developers.openai.com/api/docs/models/gpt-5.6-sol", effective_at: "2026-08-19" }] }, metrics: { human_day_rate_usd: 1_000, quota_account_aliases: {} } };
+    trackerConfig = { version: 1, revision: 2, updated_at: "2026-08-14T12:00:00Z", tickets: { id_prefix: "AGENT", next_number: 1 }, providers: { enabled: ["claude", "codex"] }, agent_profiles: { default: "default", profiles: [{ id: "default", label: "Default", provider: "claude", model: "claude-opus", reasoning: "high" }, { id: "review", label: "Independent review", provider: "codex", model: "gpt-5.6-sol", reasoning: "high" }] }, repositories: [{ id: "demo", url: "git@github.com:example/demo.git" }], jira: { enabled: false, site_url: "", project_key: "", issue_type: "Task" }, github: { observation_enabled: false, observation_interval_minutes: 30, ignored_logins: [] }, demo: { enabled: false, step_duration_seconds: 10 }, pricing: { estimate_missing_costs: true, models: [{ id: "codex-gpt-5.6-sol", provider: "codex", model: "gpt-5.6-sol", input_per_million_usd: 5, cached_input_per_million_usd: 0.5, cache_write_input_per_million_usd: 6.25, output_per_million_usd: 30, source_url: "https://developers.openai.com/api/docs/models/gpt-5.6-sol", effective_at: "2026-08-19" }] }, metrics: { human_day_rate_usd: 1_000, quota_account_aliases: {} } };
     quotaReport = { generated_at: "2026-08-20T12:00:00Z", accounts: [{
       account_id: "coordinator-vm", supervisor_ids: ["coordinator-vm"], provider: "codex", limit_id: "codex:primary", status: "estimated",
       used_percent: 31, window_minutes: 10_080, resets_at: "2026-08-27T04:25:50Z", observed_at: "2026-08-20T12:00:00Z", plan_types: ["prolite"],
@@ -292,6 +292,7 @@ describe("operator UI", () => {
         return Response.json({ prompt });
       }
       if (path === "/api/tickets/next-id" && !init?.method) return Response.json({ id: "AGENT-0001" });
+      if (path === "/api/demo-tickets/next-id" && !init?.method) return Response.json({ id: "DEMO-0001" });
       if (path === "/api/config" && init?.method === "PUT") {
         const payload = JSON.parse(String(init.body));
         trackerConfig = { ...trackerConfig, ...payload, revision: trackerConfig.revision + 1 };
@@ -351,6 +352,18 @@ describe("operator UI", () => {
         current.frontmatter.questions = current.frontmatter.questions.map((question: any) => question.id === questionId
           ? { ...question, answer: payload.answer, answered_at: "2026-08-14T12:02:00Z" } : question);
         return Response.json(current);
+      }
+      if (path === "/api/tickets" && init?.method === "POST" && String(init.body).includes("DEMO-0001")) {
+        const created = structuredClone(current);
+        created.id = "DEMO-0001";
+        created.path = "memory://demo/DEMO-0001";
+        created.relative_path = "DEMO-0001.md";
+        created.frontmatter = {
+          ...created.frontmatter, id: "DEMO-0001", title: "Describe the work", demo: true,
+          status: "running", assigned_supervisor: null, assigned_supervisor_host: null, execution: null,
+          pull_requests: [{ repository: "demo", phase: "specification", url: "demo://pull-request/DEMO-0001/demo/specification" }],
+        };
+        return Response.json(created, { status: 201 });
       }
       if (path === "/api/tickets" && init?.method === "POST") return Response.json({
         error: "Ticket is invalid", details: ["repositories[0].id must be a non-empty string"],
@@ -961,6 +974,34 @@ describe("operator UI", () => {
     })));
     expect(fetch).toHaveBeenCalledWith("/api/config", expect.objectContaining({ body: expect.stringMatching(/"quality":\{"attributes":\[\{"key":"coverage.line_percent"/) }));
     expect(await screen.findByText("r3")).toBeInTheDocument();
+  });
+
+  it("creates an unmistakably tracker-only demo from the configured default workflow", async () => {
+    // Arrange
+    trackerConfig.demo.enabled = true;
+    render(<App />);
+
+    // Execute
+    fireEvent.click(await screen.findByRole("button", { name: "Demo ticket" }));
+
+    // Verify the draft explains the isolation before it can be started.
+    expect(await screen.findByRole("heading", { name: "Create tracker-only demo" })).toBeInTheDocument();
+    expect(screen.getByLabelText("Ticket ID")).toHaveValue("DEMO-0001");
+    expect(screen.getByText(/will not invoke agents, scripts, repositories, integrations, or metrics/i)).toBeInTheDocument();
+    expect(screen.queryByText("File attachments")).not.toBeInTheDocument();
+
+    fireEvent.change(screen.getByLabelText("Repository 1"), { target: { value: "demo" } });
+    fireEvent.click(screen.getByRole("button", { name: "Create demo" }));
+
+    expect(await screen.findByText("Tracker-only demo")).toBeInTheDocument();
+    expect(screen.getByText("Demo simulator")).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "No factory accounting" })).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: /Open simulated specification PR/i })).toHaveAttribute("aria-disabled", "true");
+    expect(screen.getByRole("link", { name: /Open simulated specification PR/i })).not.toHaveAttribute("href");
+    expect(screen.queryByRole("heading", { name: "Ticket totals" })).not.toBeInTheDocument();
+    expect(fetch).toHaveBeenCalledWith("/api/tickets", expect.objectContaining({
+      method: "POST", body: expect.stringContaining("id: DEMO-0001"),
+    }));
   });
 
   it("keeps focus while editing model configuration identifiers", async () => {

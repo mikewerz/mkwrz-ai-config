@@ -121,6 +121,42 @@ describe("health endpoint", () => {
 });
 
 describe("tracker API", () => {
+  it("keeps demo tickets in memory, outside metrics and worker scheduling", async () => {
+    // Arrange
+    const configs = new TrackerConfigStore(root);
+    const current = await configs.read();
+    await configs.update({ ...current, demo: { enabled: true, step_duration_seconds: 1 } }, current.revision);
+    const app = createApp(store, join(root, "missing-client"));
+
+    // Act
+    const created = await request(app).post("/api/tickets").send({
+      markdown: ticketMarkdown({ id: "DEMO-0001" }), auto_id: false, workflow_id: "standard-delivery",
+    }).expect(201);
+    const queue = await request(app).get("/api/tickets").expect(200);
+    const metrics = await request(app).get("/api/metrics").expect(200);
+
+    // Assert
+    expect(created.body.frontmatter).toMatchObject({ id: "DEMO-0001", demo: true, status: "running", execution: null });
+    expect(queue.body.tickets).toContainEqual(expect.objectContaining({ id: "DEMO-0001", demo: true }));
+    expect(metrics.body.totals.tickets).toBe(0);
+    expect(await store.list()).toEqual([]);
+
+    await new Promise((resolve) => setTimeout(resolve, 1_100));
+    const gated = await request(app).get("/api/tickets/DEMO-0001").expect(200);
+    expect(gated.body.frontmatter).toMatchObject({ status: "waiting_approval", workflow: { current_node: "specification-approval" } });
+    expect(gated.body.frontmatter.pull_requests).toEqual([{
+      repository: "demo", phase: "specification", url: "demo://pull-request/DEMO-0001/demo/specification",
+    }]);
+    await request(app).post("/api/tickets/DEMO-0001/decide").send({
+      expected_revision: gated.body.frontmatter.revision, decision: "approved",
+    }).expect(200).expect((response) => {
+      expect(response.body.frontmatter).toMatchObject({ status: "running", workflow: { current_node: "implementation" } });
+    });
+
+    await request(app).delete("/api/demo-tickets").expect(200, { cleared: 1 });
+    await request(app).get("/api/tickets/DEMO-0001").expect(404);
+  }, 10_000);
+
   it("admits external intake candidates as ordinary workflow tickets with durable origin metadata", async () => {
     // Arrange
     const app = createApp(store, join(root, "missing-client"));

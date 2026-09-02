@@ -338,6 +338,23 @@ Herdr lifecycle state is observational. A pane becoming idle or done never advan
 
 Agent startup and prompt submission are also outside the workflow graph. A claim remains `starting` while the supervisor waits for Herdr to report that the provider is interactively ready and launch is no longer pending, through a short stable-settle interval, and until prompt delivery is confirmed. Herdr's stalled-prompt signal and wait timeout are both ambiguous, so neither is delivery proof. The supervisor does not paste the bootstrap twice: it accepts only a semantic transition from settled `idle`/`done` to `working`, or reads the pane and sends only `Enter` when it sees either the assignment's unique durable path or Claude's collapsed `[Pasted text #N +M lines]` composer token. Pane repaint revisions, late native-session discovery, and unknown/blocked startup transitions are not delivery proof. Ticket history distinguishes direct confirmation from working-transition or staged-composer recovery. If Herdr cannot become ready, start, or expose staged input within the bounded recovery windows, the supervisor clears any potentially hidden composer with `Ctrl+C` before the tracker records an operational `delivery_failed` attempt and retries the same node without emitting any declared outcome or transition context. Workflow authors should not add failure edges for provider startup races; reserve declared failure outcomes for work the agent actually began and evaluated.
 
+## Rehearse a workflow with Demo mode
+
+Demo mode is an operator-facing presentation aid, not an execution environment or test harness. Enable it under Configuration → Maintenance, choose the simulated work duration, and use the separate **Demo ticket** action. A `DEMO-nnnn` ticket uses the selected published workflow without requiring any edits to that workflow.
+
+The tracker advances automatic nodes using this precedence:
+
+1. Use the route when exactly one route has `metric_class: success`.
+2. For Script, Checkpoint, and Restore nodes, prefer the route containing exit code `0`.
+3. For a child Workflow node, prefer the route containing status code `0`.
+4. Otherwise, use the first route declared on the node.
+
+Human Gates are never auto-approved. They pause and show the workflow's real choices so the presenter can demonstrate approval or rejection. Agent, Script, Checkpoint, and Restore nodes wait for the configured interval and record generic simulated summaries; Read, Write, Fan Out, Fan In, Wait, and child Workflow control flow is traversed in memory. Stage-disable bypasses and nested workflow return paths still use the workflow definition.
+
+When a simulated work node completes in the Specification, Implementation, or Review phase, the tracker adds one in-memory demo PR for each ticket repository and phase. These appear as clearly marked, non-navigating links in the repository sidebar and completion recap. They are representative approval data only: no GitHub repository, pull request, observation, or external request exists behind them.
+
+No provider, supervisor, script, repository, attachment, artifact, intake source, Jira/GitHub integration, or production callback is involved. Demo tickets are excluded from runtime, quality, token, cost, and workflow metrics. They have no durable Markdown or run-ledger record and disappear on clear, disable, or tracker restart. Use real tickets or the system-test harness when validating behavior; a successful demo only proves the graph can be presented through its selected route.
+
 ## Choose the right data channel
 
 Do not force all state through prompt text. Use the narrowest durable channel that matches the data.

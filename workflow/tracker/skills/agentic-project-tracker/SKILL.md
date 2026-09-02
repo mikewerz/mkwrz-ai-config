@@ -54,6 +54,7 @@ Prefer `--message-file` and `--answer-file` for multiline text. Pass `-` as a fi
 - Never create or update prompts, workflows, workflow release defaults, or tracker configuration with this skill. Configuration, workflow, release, and metrics commands are read-only aids.
 - Intake definitions are also read-only. The skill may inspect intake and submit candidates to an already configured source, but it cannot create, edit, enable, schedule, or manually run a source or campaign.
 - Ticket creation uses a workflow family's default revision unless `--workflow-revision` explicitly selects an active trial. Existing tickets remain pinned to their recorded assignment.
+- Treat the `DEMO-nnnn` namespace as an operator-UI simulation facility. This skill does not enable, create, clear, or drive demo tickets; use ordinary durable ticket IDs for outside-agent work.
 - Treat `frontmatter.workflow_assignment` as the original experiment/release cohort and `frontmatter.workflow` as current execution. An explicit migration may make them differ; never rewrite assignment provenance.
 - Never call `/api/work/*`, register/unregister supervisors, send heartbeats, execute Script nodes, or fabricate lease callbacks with this skill.
 - Never use the script to merge pull requests or interpret Herdr lifecycle state as task completion.

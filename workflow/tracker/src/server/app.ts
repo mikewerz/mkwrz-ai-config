@@ -3,7 +3,7 @@ import { existsSync } from "node:fs";
 import { resolve } from "node:path";
 import express, { type NextFunction, type Request, type Response } from "express";
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
-import { ACTIVITY_CAPABILITIES, HttpError, PRODUCTION_RESULTS, PROVIDERS, isProgressed, type ActivityCapability, type ArtifactKind, type ExecutionTraceEvent, type HarnessTelemetrySnapshot, type JsonValue, type Phase, type ProductionResult, type PullRequestRef, type ResolvedAgentProfile, type TicketFrontmatter } from "./domain.js";
+import { ACTIVITY_CAPABILITIES, HttpError, PRODUCTION_RESULTS, PROVIDERS, isProgressed, type ActivityCapability, type ArtifactKind, type ExecutionTraceEvent, type HarnessTelemetrySnapshot, type JsonValue, type LoadedTicket, type Phase, type ProductionResult, type PullRequestRef, type ResolvedAgentProfile, type TicketFrontmatter } from "./domain.js";
 import { MAX_ARTIFACT_BYTES, MAX_ATTACHMENT_BYTES, TicketStore, mergePullRequests } from "./ticket-store.js";
 import { SupervisorRegistry, type SupervisorPresenceInput } from "./supervisor-registry.js";
 import { TrackerConfigStore, type RepositoryConfig } from "./config-store.js";
@@ -21,6 +21,7 @@ import { OperationalMonitor } from "./operations.js";
 import { IntakeStore } from "./intake-store.js";
 import { buildQuotaReport } from "./quota-estimator.js";
 import { exportWorkflowBundle, importWorkflowBundle } from "./workflow-bundle.js";
+import { DEMO_TICKET_ID, DemoTicketStore } from "./demo-ticket-store.js";
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
@@ -78,7 +79,7 @@ function yamlArtifactId(content: string, kind: string): string {
   }
 }
 
-function ticketJson(loaded: Awaited<ReturnType<TicketStore["get"]>>) {
+function ticketJson(loaded: LoadedTicket) {
   return {
     id: loaded.frontmatter?.id || loaded.relativePath,
     path: loaded.path,
@@ -206,6 +207,7 @@ export function createApp(
   store.setWorkflowLibrary(workflowLibrary);
   githubObserver.setWorkflowLibrary(workflowLibrary);
   const app = express();
+  const demoStore = new DemoTicketStore(workflowLibrary, (id) => store.emit("changed", { type: "demo.changed", ...(id ? { id } : {}) }));
   app.use((request, response, next) => {
     const requestId = request.headers["x-request-id"]?.toString() || randomUUID();
     const startedAt = Date.now();
@@ -226,7 +228,7 @@ export function createApp(
   app.disable("x-powered-by");
   app.use(express.json({ limit: "2mb" }));
 
-  const workJson = async (loaded: Awaited<ReturnType<TicketStore["get"]>>) => {
+  const workJson = async (loaded: LoadedTicket) => {
     const ticket = loaded.frontmatter;
     if (!ticket?.workflow) return ticketJson(loaded);
     const identity = activeWorkflowIdentity(ticket);
@@ -245,6 +247,7 @@ export function createApp(
 
   const configurationJson = async (providedConfig?: Awaited<ReturnType<TrackerConfigStore["read"]>>) => {
     const config = providedConfig ?? await configStore.read();
+    demoStore.configure(config.demo);
     const tickets = (await store.list()).flatMap((loaded) => loaded.valid && loaded.frontmatter ? [loaded.frontmatter] : []);
     return { config, quota: buildQuotaReport(tickets, registry.list(tickets), config.metrics) };
   };
@@ -483,7 +486,9 @@ export function createApp(
       metrics: isRecord(request.body.metrics) ? request.body.metrics as never : current.metrics,
       quality: isRecord(request.body.quality) ? request.body.quality as never : current.quality,
       artifacts: isRecord(request.body.artifacts) ? request.body.artifacts as never : current.artifacts,
+      demo: isRecord(request.body.demo) ? request.body.demo as never : current.demo,
     }, Number(request.body.expected_revision));
+    demoStore.configure(config.demo);
     store.emit("changed", { type: "config.changed", revision: config.revision });
     response.json(await configurationJson(config));
   });
@@ -581,7 +586,9 @@ export function createApp(
     response.json({ prompts, workflows });
   });
   app.get("/api/tickets", async (request, response) => {
-    const tickets = await store.summaries(request.query.include_archived === "true");
+    const config = await configStore.read();
+    demoStore.configure(config.demo);
+    const tickets = [...await store.summaries(request.query.include_archived === "true"), ...await demoStore.summaries()];
     // Keep malformed files repairable, but omit valid pre-workflow tickets from
     // the V3 operator queue. Direct ticket APIs remain available for recovery.
     response.json({ tickets: tickets.filter((ticket) => !ticket.valid || ticket.workflow_id !== null) });
@@ -683,6 +690,14 @@ export function createApp(
     const ids = (await store.list()).flatMap((item) => item.frontmatter ? [item.frontmatter.id] : []);
     response.json({ id: await configStore.previewTicketId(ids) });
   });
+  app.get("/api/demo-tickets/next-id", async (_request, response) => {
+    const config = await configStore.read();
+    demoStore.configure(config.demo);
+    if (!config.demo.enabled) throw new HttpError(409, "Demo mode is disabled", undefined, "DEMO_MODE_DISABLED");
+    const ids = (await store.list()).flatMap((item) => item.frontmatter ? [item.frontmatter.id] : []);
+    response.json({ id: demoStore.nextId(ids) });
+  });
+  app.delete("/api/demo-tickets", async (_request, response) => response.json({ cleared: demoStore.clear() }));
   app.post("/api/tickets", async (request, response) => {
     let markdown = message(request.body?.markdown, "markdown");
     if (request.body?.auto_id === true) {
@@ -710,6 +725,23 @@ export function createApp(
       });
       markdown = serializeDocument(normalized.ticket, document.body);
     }
+    const prepared = parseDocument(markdown);
+    const preparedId = typeof prepared.frontmatter.id === "string" ? prepared.frontmatter.id : "";
+    if (preparedId.startsWith("DEMO-") && !DEMO_TICKET_ID.test(preparedId)) {
+      throw new HttpError(422, "Demo ticket IDs must match DEMO-xxxx", undefined, "DEMO_ID_INVALID");
+    }
+    if (DEMO_TICKET_ID.test(preparedId)) {
+      const config = await configStore.read();
+      demoStore.configure(config.demo);
+      const normalized = normalizeTicket(prepared.frontmatter);
+      if (normalized.errors.length) throw new HttpError(422, "Ticket is invalid", normalized.errors);
+      if (!normalized.ticket.workflow) throw new HttpError(409, "Demo ticket does not have a workflow");
+      const identity = activeWorkflowIdentity(normalized.ticket);
+      const workflow = await workflowLibrary.get(identity.id, identity.revision);
+      const created = await demoStore.create(normalized.ticket, prepared.body, workflow);
+      response.status(201).json(await workJson(created));
+      return;
+    }
     const created = await store.create(markdown, typeof request.body?.filename === "string" ? request.body.filename : undefined);
     response.status(201).json(ticketJson(created));
   });
@@ -719,6 +751,7 @@ export function createApp(
   });
   app.get("/api/tickets/:id", async (request, response) => {
     const id = String(request.params.id);
+    if (demoStore.has(id)) { response.json(await workJson(await demoStore.get(id))); return; }
     let loaded = await store.get(id);
     if (loaded.valid && loaded.frontmatter?.jira && loaded.frontmatter.status === "pending" && !isProgressed(loaded.frontmatter)) {
       try {
@@ -923,6 +956,12 @@ export function createApp(
 
   app.post("/api/tickets/:id/decide", async (request, response) => {
     const id = String(request.params.id);
+    if (demoStore.has(id)) {
+      const decision = message(request.body?.decision, "decision");
+      const note = typeof request.body?.message === "string" ? request.body.message.trim() : "";
+      response.json(await workJson(await demoStore.decide(id, decision, note, expectedRevision(request))));
+      return;
+    }
     const loaded = await store.get(id);
     if (!loaded.valid || !loaded.frontmatter?.workflow) throw new HttpError(409, "Ticket does not have a V3 workflow");
     const definition = (await workflowLibrary.get(activeWorkflowIdentity(loaded.frontmatter).id, activeWorkflowIdentity(loaded.frontmatter).revision)).definition;
@@ -1234,6 +1273,10 @@ export function createApp(
     app.post(`/api/tickets/:id/${action}`, async (request, response) => {
       const pastTense = action === "cancel" ? "cancelled" : "failed";
       const reason = typeof request.body?.message === "string" ? request.body.message.trim() : `Ticket ${pastTense} by operator.`;
+      if (demoStore.has(String(request.params.id))) {
+        response.json(await workJson(await demoStore.terminate(String(request.params.id), pastTense, reason || `Ticket ${pastTense} by operator.`, expectedRevision(request))));
+        return;
+      }
       const current = await store.get(String(request.params.id));
       const interruptionRequired = Boolean(current.frontmatter?.execution);
       response.json(ticketJson(await store.command(

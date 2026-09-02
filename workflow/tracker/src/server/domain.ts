@@ -378,6 +378,7 @@ export interface CallbackReceipt {
 
 export interface TicketFrontmatter {
   id: string;
+  demo?: boolean;
   title: string;
   phase: Phase;
   status: TicketStatus;
@@ -426,6 +427,7 @@ export interface LoadedTicket {
 
 export interface TicketSummary {
   id: string;
+  demo?: boolean;
   title: string;
   phase: Phase;
   status: TicketStatus;

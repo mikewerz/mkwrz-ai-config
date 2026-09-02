@@ -1,5 +1,6 @@
 export interface TicketSummary {
   id: string;
+  demo?: boolean;
   title: string;
   phase: string;
   status: string;
@@ -158,6 +159,7 @@ export interface TicketCheckpoint { id: string; label: string; kind: "workflow" 
 
 export interface TicketFrontmatter extends Record<string, unknown> {
   id: string;
+  demo?: boolean;
   title: string;
   phase: string;
   status: string;
@@ -299,6 +301,7 @@ export interface TrackerConfig extends Record<string, unknown> {
   repositories: RepositoryConfig[];
   jira: { enabled: boolean; site_url: string; project_key: string; issue_type: string };
   github: { observation_enabled: boolean; observation_interval_minutes: number; ignored_logins: string[] };
+  demo: { enabled: boolean; step_duration_seconds: number };
 }
 
 export interface QuotaEstimate {
@@ -576,10 +579,12 @@ export const api = {
   previewPrompt: (prompt: PromptDocument, content: string, phase: "specification" | "implementation" | "review") => request<{ rendered: string }>(`/api/prompts/${encodeURIComponent(prompt.name)}/preview`, {
     method: "POST", body: JSON.stringify({ content, phase }),
   }),
-  updateConfig: (config: TrackerConfig, update: Pick<TrackerConfig, "providers" | "agent_profiles" | "pricing" | "metrics" | "quality" | "artifacts" | "repositories" | "jira" | "github">) => request<{ config: TrackerConfig; quota: QuotaReport }>("/api/config", {
+  updateConfig: (config: TrackerConfig, update: Pick<TrackerConfig, "providers" | "agent_profiles" | "pricing" | "metrics" | "quality" | "artifacts" | "repositories" | "jira" | "github" | "demo">) => request<{ config: TrackerConfig; quota: QuotaReport }>("/api/config", {
     method: "PUT", body: JSON.stringify({ expected_revision: config.revision, ...update }),
   }),
   nextId: () => request<{ id: string }>("/api/tickets/next-id"),
+  nextDemoId: () => request<{ id: string }>("/api/demo-tickets/next-id"),
+  clearDemoTickets: () => request<{ cleared: number }>("/api/demo-tickets", { method: "DELETE" }),
   get: (id: string) => request<TicketDetail>(`/api/tickets/${encodeURIComponent(id)}`),
   artifactUrl: (ticketId: string, artifactId: string, download = false) => `/api/tickets/${encodeURIComponent(ticketId)}/artifacts/${encodeURIComponent(artifactId)}/content${download ? "?download=true" : ""}`,
   attachmentUrl: (ticketId: string, attachmentId: string, download = false) => `/api/tickets/${encodeURIComponent(ticketId)}/attachments/${encodeURIComponent(attachmentId)}/content${download ? "?download=true" : ""}`,

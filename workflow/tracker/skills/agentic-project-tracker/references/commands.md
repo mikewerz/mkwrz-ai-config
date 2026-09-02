@@ -57,6 +57,8 @@ python3 scripts/tracker.py ticket edit AGENT-0001 --revision 4 --markdown-file /
 
 Workflow input JSON maps declared input IDs to Boolean or string values. Stage-selection JSON maps configurable stage IDs to Booleans. Inspect the selected workflow first and omit both files when its defaults are correct.
 
+Do not place `DEMO-nnnn` in ticket Markdown. That namespace is reserved for the tracker's in-memory operator presentation mode, is intentionally absent from this client, and does not represent durable work.
+
 `ticket edit` requires the complete current Markdown, including tracker-maintained workflow state and interaction-log markers. Begin from `ticket show`, change only operator-authored fields/body, and preserve the rest. Editing retains the active workflow node. When an agent is running, the tracker queues guidance telling it to reread the changed ticket.
 
 ## Intake and follow-on work

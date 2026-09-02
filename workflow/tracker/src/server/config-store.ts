@@ -17,6 +17,7 @@ export interface AgentProfileConfig { id: string; label: string; provider: Provi
 export interface AgentProfilesConfig { default: string; profiles: AgentProfileConfig[] }
 export interface JiraConfig { enabled: boolean; site_url: string; project_key: string; issue_type: string }
 export interface GithubConfig { observation_enabled: boolean; observation_interval_minutes: number; ignored_logins: string[] }
+export interface DemoConfig { enabled: boolean; step_duration_seconds: number }
 export interface ModelPricingConfig {
   id: string;
   provider: Provider;
@@ -116,6 +117,7 @@ export interface TrackerConfig extends Record<string, unknown> {
   repositories: RepositoryConfig[];
   jira: JiraConfig;
   github: GithubConfig;
+  demo: DemoConfig;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -196,6 +198,15 @@ function normalize(raw: unknown): TrackerConfig {
       ? Number(rawGithub.observation_interval_minutes) : 30,
     ignored_logins: Array.isArray(rawGithub.ignored_logins) && rawGithub.ignored_logins.every((item) => typeof item === "string")
       ? [...new Set(rawGithub.ignored_logins.map((item) => item.trim()).filter(Boolean))] : [],
+  };
+  const rawDemo = isRecord(raw.demo) ? raw.demo : {};
+  const demoDuration = rawDemo.step_duration_seconds === undefined ? 10 : rawDemo.step_duration_seconds;
+  if (!Number.isInteger(demoDuration) || Number(demoDuration) < 1 || Number(demoDuration) > 300) {
+    errors.push("demo.step_duration_seconds must be an integer between 1 and 300");
+  }
+  const demo: DemoConfig = {
+    enabled: rawDemo.enabled === true,
+    step_duration_seconds: Number.isInteger(demoDuration) && Number(demoDuration) >= 1 && Number(demoDuration) <= 300 ? Number(demoDuration) : 10,
   };
   const rawPricing = isRecord(raw.pricing) ? raw.pricing : {};
   const previousPricingUnchanged = matchesShippedValue(rawPricing, PREVIOUS_DEFAULT_PRICING);
@@ -284,7 +295,7 @@ function normalize(raw: unknown): TrackerConfig {
   };
   if (artifacts.max_ticket_bytes > artifacts.max_total_bytes) errors.push("artifacts.max_ticket_bytes cannot exceed max_total_bytes");
   if (errors.length) throw new HttpError(422, "Tracker configuration is invalid", errors);
-  return { ...raw, version, revision, updated_at: updatedAt, tickets, providers, agent_profiles, pricing, metrics, quality, artifacts, repositories, jira, github };
+  return { ...raw, version, revision, updated_at: updatedAt, tickets, providers, agent_profiles, pricing, metrics, quality, artifacts, repositories, jira, github, demo };
 }
 
 function serialize(config: TrackerConfig): string {
@@ -330,6 +341,7 @@ export class TrackerConfigStore {
       pricing: structuredClone(DEFAULT_PRICING), metrics: { human_day_rate_usd: 1_000, quota_account_aliases: {} }, quality: { attributes: [] }, artifacts: structuredClone(DEFAULT_ARTIFACT_POLICY),
       jira: { enabled: false, site_url: "", project_key: "", issue_type: "Task" },
       github: { observation_enabled: false, observation_interval_minutes: 30, ignored_logins: [] },
+      demo: { enabled: false, step_duration_seconds: 10 },
     };
     const handle = await open(this.path, "wx", 0o600);
     try { await handle.writeFile(serialize(config)); await handle.sync(); } finally { await handle.close(); }
@@ -337,7 +349,7 @@ export class TrackerConfigStore {
     return config;
   }
 
-  async update(settings: Pick<TrackerConfig, "providers" | "repositories" | "jira" | "github"> & { agent_profiles?: AgentProfilesConfig; pricing?: PricingConfig; metrics?: MetricsConfig; quality?: QualityConfig; artifacts?: ArtifactPolicyConfig }, expectedRevision: number): Promise<TrackerConfig> {
+  async update(settings: Pick<TrackerConfig, "providers" | "repositories" | "jira" | "github"> & { agent_profiles?: AgentProfilesConfig; pricing?: PricingConfig; metrics?: MetricsConfig; quality?: QualityConfig; artifacts?: ArtifactPolicyConfig; demo?: DemoConfig }, expectedRevision: number): Promise<TrackerConfig> {
     return this.serial(async () => {
       const currentBytes = await readFile(this.path, "utf8").catch(async (error: NodeJS.ErrnoException) => {
         if (error.code !== "ENOENT") throw error;
@@ -354,7 +366,7 @@ export class TrackerConfigStore {
 
   async updateRepositories(repositories: RepositoryConfig[], expectedRevision: number): Promise<TrackerConfig> {
     const current = await this.read();
-    return this.update({ providers: current.providers, agent_profiles: current.agent_profiles, pricing: current.pricing, metrics: current.metrics, quality: current.quality, artifacts: current.artifacts, repositories, jira: current.jira, github: current.github }, expectedRevision);
+    return this.update({ providers: current.providers, agent_profiles: current.agent_profiles, pricing: current.pricing, metrics: current.metrics, quality: current.quality, artifacts: current.artifacts, repositories, jira: current.jira, github: current.github, demo: current.demo }, expectedRevision);
   }
 
   async previewTicketId(existingIds: Iterable<string> = []): Promise<string> {

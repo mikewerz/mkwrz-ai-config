@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash, randomUUID } from "node:crypto";
 import { execFile } from "node:child_process";
-import { mkdir, mkdtemp, readFile, stat, utimes, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, stat, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -44,6 +44,7 @@ async function configureTracker(tracker, repositoryUrl, options = {}) {
       }],
     },
     ...(options.artifacts ? { artifacts: options.artifacts } : {}),
+    ...(options.demo ? { demo: options.demo } : {}),
   };
   return (await jsonRequest(tracker.baseUrl, "/api/config", { method: "PUT", body })).body.config;
 }
@@ -117,6 +118,65 @@ test("tracker exposes readiness, its Markdown index, and background operation st
   } finally {
     await stopProcess(tracker?.process);
     await cleanup([tracker?.ticketRoot]);
+  }
+});
+
+test("demo mode traverses a real workflow in tracker memory without scheduling Herdr or affecting metrics", { timeout: 20_000 }, async () => {
+  let tracker;
+  let supervisor;
+  try {
+    // Arrange: keep an online, agent-enabled supervisor present so accidental scheduling is observable.
+    tracker = await startTracker();
+    await configureTracker(tracker, null, { demo: { enabled: true, step_duration_seconds: 1 } });
+    supervisor = await startSupervisor(tracker);
+    const definition = agentWorkflow("system-demo");
+    definition.nodes[0].outcomes[0].target = "approval";
+    definition.nodes.splice(1, 0, {
+      id: "approval", name: "Approve demo", type: "human_gate", phase: "implementation", stage: "work",
+      choices: [
+        { id: "approved", label: "Approve", description: "Complete the demo.", target: "done", metric_class: "success" },
+        { id: "changes_requested", label: "Request changes", description: "Repeat simulated work.", target: "fake-work", metric_class: "neutral", comment_required: true },
+      ],
+    });
+    const workflow = await publishWorkflow(tracker, definition);
+
+    // Execute: create a DEMO ticket directly in the selected shipped workflow.
+    const created = (await jsonRequest(tracker.baseUrl, "/api/tickets", {
+      method: "POST", expected: 201,
+      body: { markdown: ticketMarkdown("DEMO-0001"), workflow_id: workflow.definition.id },
+    })).body;
+    assert.equal(created.frontmatter.demo, true);
+    assert.equal(created.frontmatter.status, "running");
+
+    const gated = await waitFor("demo ticket to reach its human gate", async () => {
+      const ticket = (await jsonRequest(tracker.baseUrl, "/api/tickets/DEMO-0001")).body;
+      return ticket.frontmatter.status === "waiting_approval" ? ticket : null;
+    }, { timeoutMs: 5_000 });
+
+    // Verify: the real gate is interactive, but every external/durable accounting surface remains untouched.
+    assert.equal(gated.workflow_node.type, "human_gate");
+    assert.ok(gated.workflow_node.choices.length > 0);
+    assert.deepEqual(gated.frontmatter.pull_requests, [{
+      repository: "fixture-repo", phase: "implementation", url: "demo://pull-request/DEMO-0001/fixture-repo/implementation",
+    }]);
+    assert.deepEqual((await jsonRequest(tracker.baseUrl, "/api/runtime")).body.agents, []);
+    assert.equal((await jsonRequest(tracker.baseUrl, "/api/metrics")).body.totals.tickets, 0);
+    assert.equal((await readHerdrInvocations(supervisor)).length, 0);
+    assert.ok(!(await readdir(tracker.ticketRoot)).some((name) => name === "DEMO-0001.md"));
+
+    const decision = gated.workflow_node.choices[0].id;
+    const advanced = (await jsonRequest(tracker.baseUrl, "/api/tickets/DEMO-0001/decide", {
+      method: "POST", body: { expected_revision: gated.frontmatter.revision, decision },
+    })).body;
+    assert.notEqual(advanced.frontmatter.workflow.current_node, gated.frontmatter.workflow.current_node);
+
+    const cleared = (await jsonRequest(tracker.baseUrl, "/api/demo-tickets", { method: "DELETE" })).body;
+    assert.equal(cleared.cleared, 1);
+    await jsonRequest(tracker.baseUrl, "/api/tickets/DEMO-0001", { expected: 404 });
+  } finally {
+    await stopProcess(supervisor?.process);
+    await stopProcess(tracker?.process);
+    await cleanup([supervisor?.projectRoot, supervisor?.assignmentRoot, tracker?.ticketRoot]);
   }
 });
 
